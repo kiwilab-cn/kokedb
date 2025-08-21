@@ -1,0 +1,12 @@
+[package]
+name = "kokedb-sql-macro"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+syn = "2.0.106"
+quote = "1.0.40"
+proc-macro2 = "1.0.101"
+
+[lib]
+proc-macro = true

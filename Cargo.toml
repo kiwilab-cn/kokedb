@@ -1,6 +1,18 @@
-[package]
+[workspace.package]
 name = "kokedb"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
-[dependencies]
+[workspace]
+resolver = "3"
+members = ["src/query", "src/sql-macro", "src/sql-parser"]
+
+
+[workspace.dependencies]
+kokedb-query = {path = "src/query"}
+kokedb-sql-macro = {path = "src/sql-macro"}
+kokedb-sql-parser = {path = "src/sql-parser"}
+
+
+
+tokio = { version = "1.47.1", features = ["full"] }
