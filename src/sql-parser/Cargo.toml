@@ -4,3 +4,16 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+kokedb-sql-macro.workspace = true
+
+chumsky = { version = "0.10.1", default-features = false, features = ["pratt"] }
+phf = { version = "0.12.1", features = ["macros"]}
+either = "1.15.0"
+paste = "1.0.15"
+logos = "0.14.1"
+
+[build-dependencies]
+prettyplease = "0.2.36"
+
+syn.workspace = true
+quote.workspace = true

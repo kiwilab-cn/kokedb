@@ -16,3 +16,7 @@ kokedb-sql-parser = {path = "src/sql-parser"}
 
 
 tokio = { version = "1.47.1", features = ["full"] }
+
+syn = "2.0.106"
+quote = "1.0.40"
+proc-macro2 = "1.0.101"
