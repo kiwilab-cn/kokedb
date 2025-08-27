@@ -1,0 +1,18 @@
+[package]
+name = "kokedb-sql-analyzer"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kokedb_common.workspace = true
+kokedb_sql_parser.workspace = true
+
+thiserror.workspace = true
+regex.workspace = true
+lazy_static.workspace = true
+chrono.workspace = true
+chumsky.workspace = true
+either.workspace = true
