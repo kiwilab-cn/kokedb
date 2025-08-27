@@ -1,5 +1,5 @@
 [package]
-name = "kokedb-sql-analyzer"
+name = "kokedb_sql_analyzer"
 version.workspace = true
 edition.workspace = true
 

@@ -5,7 +5,7 @@ use chumsky::pratt::{infix, left};
 use chumsky::prelude::choice;
 use chumsky::Parser;
 use either::Either;
-use sail_sql_macro::TreeParser;
+use kokedb_sql_macro::TreeParser;
 
 use crate::ast::expression::{
     DuplicateTreatment, Expr, FunctionArgument, GroupingExpr, OrderByExpr, WindowSpec,

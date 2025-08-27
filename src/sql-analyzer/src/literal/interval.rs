@@ -5,9 +5,9 @@ use chrono;
 use chrono::TimeDelta;
 use lazy_static::lazy_static;
 use regex::Regex;
-use sail_common::spec;
-use sail_sql_parser::ast::data_type::{IntervalDayTimeUnit, IntervalYearMonthUnit};
-use sail_sql_parser::ast::expression::{
+use kokedb_common::spec;
+use kokedb_sql_parser::ast::data_type::{IntervalDayTimeUnit, IntervalYearMonthUnit};
+use kokedb_sql_parser::ast::expression::{
     Expr, IntervalExpr, IntervalLiteral, IntervalQualifier, IntervalUnit, IntervalValueWithUnit,
 };
 

@@ -1,10 +1,10 @@
 use either::Either;
-use sail_common::spec;
-use sail_sql_parser::ast::expression::{AtomExpr, DuplicateTreatment, Expr, OrderByExpr};
-use sail_sql_parser::ast::identifier::{Ident, ObjectName};
-use sail_sql_parser::ast::literal::IntegerLiteral;
-use sail_sql_parser::ast::operator::Comma;
-use sail_sql_parser::ast::query::{
+use kokedb_common::spec;
+use kokedb_sql_parser::ast::expression::{AtomExpr, DuplicateTreatment, Expr, OrderByExpr};
+use kokedb_sql_parser::ast::identifier::{Ident, ObjectName};
+use kokedb_sql_parser::ast::literal::IntegerLiteral;
+use kokedb_sql_parser::ast::operator::Comma;
+use kokedb_sql_parser::ast::query::{
     AliasClause, ClusterByClause, DistributeByClause, FromClause, GroupByClause, GroupByModifier,
     HavingClause, IdentList, JoinCriteria, JoinOperator, LateralViewClause, LimitClause,
     LimitValue, NamedExpr, NamedExprList, NamedQuery, NamedWindow, OffsetClause, OrderByClause,
@@ -14,7 +14,7 @@ use sail_sql_parser::ast::query::{
     UnpivotClause, UnpivotColumns, UnpivotNulls, ValuesClause, WhereClause, WindowClause,
     WithClause,
 };
-use sail_sql_parser::common::Sequence;
+use kokedb_sql_parser::common::Sequence;
 
 use crate::error::{SqlError, SqlResult};
 use crate::expression::{

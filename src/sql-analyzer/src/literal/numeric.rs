@@ -1,7 +1,7 @@
 use lazy_static::lazy_static;
 use regex::Regex;
-use sail_common::spec;
-use sail_common::spec::{
+use kokedb_common::spec;
+use kokedb_common::spec::{
     i256, ARROW_DECIMAL128_MAX_PRECISION, ARROW_DECIMAL256_MAX_PRECISION,
     ARROW_DECIMAL256_MAX_SCALE,
 };
@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn test_parse_decimal128() -> SqlResult<()> {
-        use sail_common::spec::Literal;
+        use kokedb_common::spec::Literal;
         let parse = |x: &str| -> SqlResult<Literal> { parse_decimal_128_string(x) };
         assert_eq!(
             parse("123.45")?,
@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn test_parse_decimal256() -> SqlResult<()> {
-        use sail_common::spec::Literal;
+        use kokedb_common::spec::Literal;
         let parse = |x: &str| -> SqlResult<Literal> { parse_decimal_256_string(x) };
         assert!(parse(".").is_err());
         assert!(parse("123.456.789").is_err());

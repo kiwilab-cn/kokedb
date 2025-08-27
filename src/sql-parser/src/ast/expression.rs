@@ -5,7 +5,7 @@ use chumsky::pratt::{infix, left, postfix, prefix, Operator};
 use chumsky::prelude::{any, choice};
 use chumsky::Parser;
 use either::Either;
-use sail_sql_macro::TreeParser;
+use kokedb_sql_macro::TreeParser;
 
 use crate::ast::data_type::{DataType, IntervalDayTimeUnit, IntervalYearMonthUnit};
 use crate::ast::identifier::{Ident, ObjectName, Variable};

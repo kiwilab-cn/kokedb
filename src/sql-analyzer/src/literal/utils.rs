@@ -1,8 +1,8 @@
 use std::ops::Neg;
 use std::str::FromStr;
 
-use sail_sql_parser::ast::expression::{AtomExpr, Expr, UnaryOperator};
-use sail_sql_parser::ast::literal::NumberLiteral;
+use kokedb_sql_parser::ast::expression::{AtomExpr, Expr, UnaryOperator};
+use kokedb_sql_parser::ast::literal::NumberLiteral;
 
 use crate::error::{SqlError, SqlResult};
 use crate::value::from_ast_string;

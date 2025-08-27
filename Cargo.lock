@@ -619,7 +619,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kokedb-common"
+name = "kokedb_common"
 version = "0.1.0"
 dependencies = [
  "arrow",
@@ -639,21 +639,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "kokedb-sql-analyzer"
+name = "kokedb_sql_analyzer"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "chumsky",
  "either",
- "kokedb-common",
- "kokedb-sql-parser",
+ "kokedb_common",
+ "kokedb_sql_parser",
  "lazy_static",
  "regex",
  "thiserror",
 ]
 
 [[package]]
-name = "kokedb-sql-macro"
+name = "kokedb_sql_macro"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
@@ -662,12 +662,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "kokedb-sql-parser"
+name = "kokedb_sql_parser"
 version = "0.1.0"
 dependencies = [
  "chumsky",
  "either",
- "kokedb-sql-macro",
+ "kokedb_sql_macro",
  "paste",
  "phf 0.13.1",
  "prettyplease",

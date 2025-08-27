@@ -1,19 +1,19 @@
 use chumsky::input::Input;
 use chumsky::span::SimpleSpan;
 use chumsky::Parser;
-use sail_sql_parser::ast::data_type::DataType;
-use sail_sql_parser::ast::expression::{Expr, IntervalLiteral};
-use sail_sql_parser::ast::identifier::{ObjectName, QualifiedWildcard};
-use sail_sql_parser::ast::query::NamedExpr;
-use sail_sql_parser::ast::statement::Statement;
-use sail_sql_parser::lexer::create_lexer;
-use sail_sql_parser::options::ParserOptions;
-use sail_sql_parser::parser::{
+use kokedb_sql_parser::ast::data_type::DataType;
+use kokedb_sql_parser::ast::expression::{Expr, IntervalLiteral};
+use kokedb_sql_parser::ast::identifier::{ObjectName, QualifiedWildcard};
+use kokedb_sql_parser::ast::query::NamedExpr;
+use kokedb_sql_parser::ast::statement::Statement;
+use kokedb_sql_parser::lexer::create_lexer;
+use kokedb_sql_parser::options::ParserOptions;
+use kokedb_sql_parser::parser::{
     create_data_type_parser, create_expression_parser, create_interval_literal_parser,
     create_named_expression_parser, create_object_name_parser, create_parser,
     create_qualified_wildcard_parser,
 };
-use sail_sql_parser::token::Token;
+use kokedb_sql_parser::token::Token;
 
 use crate::error::{SqlError, SqlResult};
 use crate::literal::datetime::{
@@ -101,8 +101,8 @@ pub fn parse_timestamp(s: &str) -> SqlResult<TimestampValue<'_>> {
 
 #[cfg(test)]
 mod tests {
-    use sail_sql_parser::ast::query::Query;
-    use sail_sql_parser::ast::statement::Statement;
+    use kokedb_sql_parser::ast::query::Query;
+    use kokedb_sql_parser::ast::statement::Statement;
 
     use crate::error::SqlResult;
     use crate::parser::parse_statements;

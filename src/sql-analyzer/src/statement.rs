@@ -1,13 +1,13 @@
 use either::Either;
-use sail_common::spec;
-use sail_common::spec::QueryPlan;
-use sail_sql_parser::ast::expression::{BooleanLiteral, Expr, OrderDirection};
-use sail_sql_parser::ast::identifier::{Ident, ObjectName};
-use sail_sql_parser::ast::keywords::{Cascade, Global, Overwrite, Restrict, Temp, Temporary};
-use sail_sql_parser::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
-use sail_sql_parser::ast::operator::{Minus, Plus};
-use sail_sql_parser::ast::query::{IdentList, WhereClause};
-use sail_sql_parser::ast::statement::{
+use kokedb_common::spec;
+use kokedb_common::spec::QueryPlan;
+use kokedb_sql_parser::ast::expression::{BooleanLiteral, Expr, OrderDirection};
+use kokedb_sql_parser::ast::identifier::{Ident, ObjectName};
+use kokedb_sql_parser::ast::keywords::{Cascade, Global, Overwrite, Restrict, Temp, Temporary};
+use kokedb_sql_parser::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
+use kokedb_sql_parser::ast::operator::{Minus, Plus};
+use kokedb_sql_parser::ast::query::{IdentList, WhereClause};
+use kokedb_sql_parser::ast::statement::{
     AlterTableOperation, AlterViewOperation, AnalyzeTableModifier, AsQueryClause, Assignment,
     AssignmentList, ColumnAlteration, ColumnAlterationList, ColumnAlterationOption,
     ColumnDefinition, ColumnDefinitionList, ColumnDefinitionOption, ColumnPosition,

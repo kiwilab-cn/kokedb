@@ -1,5 +1,5 @@
 [package]
-name = "kokedb-sql-parser"
+name = "kokedb_sql_parser"
 version.workspace = true
 edition.workspace = true
 

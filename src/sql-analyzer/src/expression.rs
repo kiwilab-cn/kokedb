@@ -1,15 +1,15 @@
 use std::iter::once;
 
-use sail_common::spec;
-use sail_sql_parser::ast::expression::{
+use kokedb_common::spec;
+use kokedb_sql_parser::ast::expression::{
     AtomExpr, BinaryOperator, CaseElse, CaseWhen, DuplicateTreatment, Expr, FilterClause,
     FunctionArgument, FunctionArgumentList, FunctionExpr, GroupingExpr, GroupingSet,
     LambdaFunctionParameters, NullTreatment, OrderByExpr, OrderDirection, OrderNulls, OverClause,
     PatternEscape, PatternQuantifier, TableExpr, TrimExpr, UnaryOperator, WindowFrame,
     WindowFrameBound, WindowModifier, WindowSpec, WithinGroupClause,
 };
-use sail_sql_parser::ast::identifier::{ObjectName, QualifiedWildcard};
-use sail_sql_parser::ast::query::{
+use kokedb_sql_parser::ast::identifier::{ObjectName, QualifiedWildcard};
+use kokedb_sql_parser::ast::query::{
     ClusterByClause, DistributeByClause, IdentList, NamedExpr, OrderByClause, PartitionByClause,
     SortByClause,
 };

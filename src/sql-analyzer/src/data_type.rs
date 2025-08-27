@@ -1,10 +1,10 @@
-use sail_common::spec;
-use sail_common::spec::ARROW_DECIMAL128_MAX_PRECISION;
-use sail_sql_parser::ast::data_type::{
+use kokedb_common::spec;
+use kokedb_common::spec::ARROW_DECIMAL128_MAX_PRECISION;
+use kokedb_sql_parser::ast::data_type::{
     DataType, IntervalDayTimeUnit, IntervalType, IntervalYearMonthUnit, StructField, TimezoneType,
 };
-use sail_sql_parser::ast::literal::IntegerLiteral;
-use sail_sql_parser::ast::operator::{LeftParenthesis, RightParenthesis};
+use kokedb_sql_parser::ast::literal::IntegerLiteral;
+use kokedb_sql_parser::ast::operator::{LeftParenthesis, RightParenthesis};
 
 use crate::error::{SqlError, SqlResult};
 use crate::value::from_ast_string;

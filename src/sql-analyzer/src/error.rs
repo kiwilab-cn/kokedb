@@ -1,6 +1,8 @@
 use std::fmt;
 
 use chumsky::error::{Rich, RichReason};
+use kokedb_common::error::CommonError;
+use kokedb_sql_parser::span::TokenSpan;
 use thiserror::Error;
 
 pub type SqlResult<T> = Result<T, SqlError>;

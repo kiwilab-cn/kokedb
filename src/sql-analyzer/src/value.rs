@@ -1,7 +1,7 @@
-use sail_common::spec;
-use sail_sql_parser::ast::expression::BooleanLiteral;
-use sail_sql_parser::ast::literal::{NumberLiteral, NumberSuffix, StringLiteral};
-use sail_sql_parser::string::StringValue;
+use kokedb_common::spec;
+use kokedb_sql_parser::ast::expression::BooleanLiteral;
+use kokedb_sql_parser::ast::literal::{NumberLiteral, NumberSuffix, StringLiteral};
+use kokedb_sql_parser::string::StringValue;
 
 use crate::error::{SqlError, SqlResult};
 use crate::literal::binary::BinaryValue;

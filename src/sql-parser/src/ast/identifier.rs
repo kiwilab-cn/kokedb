@@ -3,7 +3,7 @@ use chumsky::input::{Input, InputRef, ValueInput};
 use chumsky::label::LabelError;
 use chumsky::prelude::custom;
 use chumsky::Parser;
-use sail_sql_macro::TreeParser;
+use kokedb_sql_macro::TreeParser;
 
 use crate::ast::operator::{Asterisk, Period};
 use crate::combinator::sequence;

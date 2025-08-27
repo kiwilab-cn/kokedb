@@ -1,5 +1,5 @@
 [package]
-name = "kokedb-common"
+name = "kokedb_common"
 version.workspace = true
 edition.workspace = true
 
