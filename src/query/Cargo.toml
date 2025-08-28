@@ -1,6 +1,16 @@
 [package]
-name = "query"
+name = "kokedb-query"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
+kokedb-common.workspace = true
+kokedb-sql-analyzer.workspace = true
+
+datafusion = { version = "49.0.0", features = ["serde", "avro"] }
+datafusion-common = { version = "49.0.0", features = ["object_store", "avro"] }
+datafusion-expr = { version = "49.0.0" }
+datafusion-expr-common = { version = "49.0.0" }
+datafusion-functions = { version = "49.0.0" }
+datafusion-functions-nested = { version = "49.0.0" }
+datafusion-physical-expr = { version = "49.0.0" }

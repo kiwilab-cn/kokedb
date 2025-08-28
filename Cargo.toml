@@ -29,11 +29,11 @@ expect_used = "deny"
 panic = "deny"
 
 [workspace.dependencies]
-kokedb_common = { path = "src/common" }
-kokedb_sql_macro = {path = "sql-macro"}
-kokedb_sql_parser = {path = "src/sql-parser"}
-kokedb_sql_analyzer = {path = "src/sql-analyzer"}
-kokedb_query = {path = "src/query"}
+kokedb-common = { path = "src/common" }
+kokedb-sql-macro = {path = "sql-macro"}
+kokedb-sql-parser = {path = "src/sql-parser"}
+kokedb-sql-analyzer = {path = "src/sql-analyzer"}
+kokedb-query = {path = "src/query"}
 
 
 tokio = { version = "1.47.1", features = ["full"] }

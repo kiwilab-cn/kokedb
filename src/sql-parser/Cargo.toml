@@ -1,5 +1,5 @@
 [package]
-name = "kokedb_sql_parser"
+name = "kokedb-sql-parser"
 version.workspace = true
 edition.workspace = true
 
@@ -7,7 +7,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-kokedb_sql_macro.workspace = true
+kokedb-sql-macro.workspace = true
 
 chumsky.workspace = true
 phf.workspace = true

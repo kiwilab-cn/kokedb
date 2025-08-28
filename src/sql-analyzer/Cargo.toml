@@ -1,5 +1,5 @@
 [package]
-name = "kokedb_sql_analyzer"
+name = "kokedb-sql-analyzer"
 version.workspace = true
 edition.workspace = true
 
@@ -7,8 +7,8 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-kokedb_common.workspace = true
-kokedb_sql_parser.workspace = true
+kokedb-common.workspace = true
+kokedb-sql-parser.workspace = true
 
 thiserror.workspace = true
 regex.workspace = true
