@@ -16,6 +16,7 @@ members = [
   "src/catalog",
   "src/plan",
   "src/python-udf",
+  "src/data-source",
 ]
 default-members = ["src/server/mysql"]
 
@@ -42,6 +43,7 @@ kokedb-common-datafusion = {path = "src/common-datafusion"}
 kokedb-catalog = {path = "src/catalog"}
 kokedb-plan = {path = "src/plan"}
 kokedb-python-udf = {path = "src/python-udf"}
+kokedb-data-source = {path = "src/data-source"}
 
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-stream = "0.1.17"
