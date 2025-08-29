@@ -595,6 +595,20 @@ name = "bytemuck"
 version = "1.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3995eaeebcdf32f91f980d360f78732ddc061097ab4e39991ae7a6ace9194677"
+dependencies = [
+ "bytemuck_derive",
+]
+
+[[package]]
+name = "bytemuck_derive"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f154e572231cb6ba2bd1176980827e3d5dc04cc183a75dea38109fbdd672d29"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.106",
+]
 
 [[package]]
 name = "byteorder"
@@ -1880,6 +1894,7 @@ version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "459196ed295495a68f7d7fe1d84f6c4b7ff0e21fe3017b2f283c6fac3ad803c9"
 dependencies = [
+ "bytemuck",
  "cfg-if",
  "crunchy",
  "num-traits",
@@ -2161,6 +2176,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kokedb-catalog"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "datafusion",
+ "datafusion-common",
+ "datafusion-expr",
+ "kokedb-common",
+ "kokedb-common-datafusion",
+ "lazy_static",
+ "regex",
+ "serde",
+ "serde_arrow",
+ "thiserror 2.0.16",
+]
+
+[[package]]
 name = "kokedb-common"
 version = "0.1.0"
 dependencies = [
@@ -2178,6 +2210,23 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.16",
  "tokio",
+]
+
+[[package]]
+name = "kokedb-common-datafusion"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "datafusion",
+ "datafusion-common",
+ "datafusion-expr",
+ "futures",
+ "kokedb-common",
+ "lexical-core",
+ "ryu",
+ "serde",
+ "thiserror 2.0.16",
 ]
 
 [[package]]
@@ -2430,6 +2479,21 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
+]
+
+[[package]]
+name = "marrow"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64369333feea08a4c974cc5d7bad82197999624d0c9508bec4b97ea9fc0e3f63"
+dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
+ "arrow-schema",
+ "bytemuck",
+ "half",
+ "serde",
 ]
 
 [[package]]
@@ -3361,6 +3425,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f0e2c6ed6606019b4e29e69dbaba95b11854410e5347d525002456dbbb786b6"
 dependencies = [
  "serde_derive",
+]
+
+[[package]]
+name = "serde_arrow"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55af245b3a27a1fed12634542d4e193b98b40aa69a7956c23cd9f8902c408463"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "bytemuck",
+ "chrono",
+ "half",
+ "marrow",
+ "serde",
 ]
 
 [[package]]

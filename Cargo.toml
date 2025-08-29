@@ -12,6 +12,10 @@ members = [
   "src/common",
   "src/sql-analyzer",
   "src/server/mysql",
+  "src/common-datafusion",
+  "src/catalog",
+  "src/plan",
+  "src/python-udf",
 ]
 default-members = ["src/server/mysql"]
 
@@ -36,9 +40,11 @@ kokedb-sql-analyzer = {path = "src/sql-analyzer"}
 kokedb-query = {path = "src/query"}
 kokedb-common-datafusion = {path = "src/common-datafusion"}
 kokedb-catalog = {path = "src/catalog"}
-
+kokedb-plan = {path = "src/plan"}
+kokedb-python-udf = {path = "src/python-udf"}
 
 tokio = { version = "1.47.1", features = ["full"] }
+tokio-stream = "0.1.17"
 
 syn = "2.0.106"
 quote = "1.0.40"
@@ -90,5 +96,8 @@ datafusion-physical-expr = { version = "49.0.0" }
 ryu = "1.0.20"
 lexical-core = { version = "1.0.5", default-features = false, features = ["write-integers", "write-floats", "parse-integers", "parse-floats"] }
 futures = "0.3.31"
+pyo3 = { version = "0.24.2", features = ["auto-initialize", "serde"] }
+md-5 = "0.10.6"
+num-bigint = "0.4.6"
 
 
