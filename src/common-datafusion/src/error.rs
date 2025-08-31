@@ -3,7 +3,6 @@ use std::collections::HashSet;
 use datafusion::arrow::error::ArrowError;
 use datafusion_common::DataFusionError;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
