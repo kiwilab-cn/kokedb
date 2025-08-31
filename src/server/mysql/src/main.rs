@@ -9,12 +9,9 @@ use kokedb_query::binder::*;
 use opensrv_mysql::*;
 use tokio::{io::AsyncWrite, net::TcpListener};
 
-use datafusion::arrow::array::{
-    Array, Float64Array, Int32Array, StringArray, TimestampMicrosecondArray,
-};
+use datafusion::arrow::array::Array;
 use datafusion::arrow::datatypes::DataType;
-use datafusion::arrow::record_batch::RecordBatch;
-use opensrv_mysql::{Column, ColumnType, Value};
+use opensrv_mysql::{Column, ColumnType};
 
 #[derive(Clone)]
 struct Backend {
