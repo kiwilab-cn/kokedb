@@ -14,3 +14,5 @@ datafusion-expr-common.workspace = true
 datafusion-functions.workspace = true
 datafusion-functions-nested.workspace = true
 datafusion-physical-expr.workspace = true
+
+sqlx = { version = "0.8.6", features = [ "runtime-tokio", "postgres" ] }
