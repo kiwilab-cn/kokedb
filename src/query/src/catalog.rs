@@ -258,22 +258,15 @@ impl SchemaProvider for PostgreSQLSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        if !self.table_cache.is_empty() {
-            return self
-                .table_cache
-                .iter()
-                .map(|entry| entry.key().clone())
-                .collect();
-        }
-
-        let runtime = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = runtime {
-            if let Ok(names) = handle.block_on(self.get_table_names()) {
-                return names;
-            }
-        }
-
-        Vec::new()
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                if let Ok(names) = self.get_table_names().await {
+                    names
+                } else {
+                    Vec::new()
+                }
+            })
+        })
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
@@ -322,8 +315,14 @@ mod tests {
                 println!("Found catalogs: {:?}", catalog_names);
                 let catalog_name = catalog_names.first().unwrap();
                 let catalog = catalog_list.catalog(&catalog_name).unwrap();
-                let schema = catalog.schema_names();
-                println!("===================>>>{:?}", schema);
+                let schemas = catalog.schema_names();
+                println!("Found schemas: {:?}", schemas);
+
+                for schema_name in schemas {
+                    let schema = catalog.schema(&schema_name).unwrap();
+                    let table_names = schema.table_names();
+                    println!("{:?}: {:?}", &schema_name, table_names);
+                }
             }
             Err(e) => {
                 eprintln!("Error creating catalog list: {}", e);
