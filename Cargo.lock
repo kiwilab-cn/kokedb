@@ -2936,6 +2936,8 @@ dependencies = [
 name = "kokedb-query"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "dashmap",
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
@@ -2946,6 +2948,7 @@ dependencies = [
  "kokedb-common",
  "kokedb-sql-analyzer",
  "sqlx",
+ "tokio",
 ]
 
 [[package]]

@@ -16,3 +16,6 @@ datafusion-functions-nested.workspace = true
 datafusion-physical-expr.workspace = true
 
 sqlx = { version = "0.8.6", features = [ "runtime-tokio", "postgres" ] }
+tokio.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true

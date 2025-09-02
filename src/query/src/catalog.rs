@@ -1,102 +1,348 @@
-use std::{any::Any, sync::Arc};
+use std::any::Any;
+use std::sync::Arc;
 
-use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider, TableProvider};
-use datafusion_common::DataFusionError;
-use sqlx::PgPool;
+use async_trait::async_trait;
+use dashmap::DashMap;
+use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
+use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
+use datafusion::datasource::TableProvider;
+use datafusion::error::{DataFusionError, Result};
+use sqlx::{PgPool, Row};
 
-#[derive(Debug)]
-pub struct MetaCatalogProviderList {
-    pub store: Arc<PgPool>,
+#[derive(Debug, Clone)]
+pub struct CatalogInfo {
+    pub name: String,
+    pub dsn: String,
+    pub password: String,
 }
 
-const DEFAULT_CATALOG: &str = "kokedb";
+#[derive(Debug)]
+pub struct PostgreSQLMetaCatalogProviderList {
+    local_pool: PgPool,
+    catalog_cache: DashMap<String, Arc<dyn CatalogProvider>>,
+}
 
-impl CatalogProviderList for MetaCatalogProviderList {
-    fn as_any(&self) -> &dyn std::any::Any {
+impl PostgreSQLMetaCatalogProviderList {
+    pub async fn new(local_dsn: &str) -> Result<Self> {
+        let local_pool = PgPool::connect(local_dsn)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(Self {
+            local_pool,
+            catalog_cache: DashMap::new(),
+        })
+    }
+
+    async fn load_catalog_info(&self) -> Result<Vec<CatalogInfo>> {
+        let query = "SELECT name, dsn, password FROM system.catalog";
+
+        let rows = sqlx::query(query)
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let mut catalogs = Vec::new();
+        for row in rows {
+            let catalog_info = CatalogInfo {
+                name: row.get("name"),
+                dsn: row.get("dsn"),
+                password: row.get("password"),
+            };
+            catalogs.push(catalog_info);
+        }
+
+        Ok(catalogs)
+    }
+}
+
+impl CatalogProviderList for PostgreSQLMetaCatalogProviderList {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn register_catalog(
         &self,
-        _name: String,
-        _catalog: Arc<dyn datafusion::catalog::CatalogProvider>,
-    ) -> Option<Arc<dyn datafusion::catalog::CatalogProvider>> {
-        None
+        name: String,
+        catalog: Arc<dyn CatalogProvider>,
+    ) -> Option<Arc<dyn CatalogProvider>> {
+        self.catalog_cache.insert(name, catalog)
     }
 
     fn catalog_names(&self) -> Vec<String> {
-        let pool = self.store.clone();
+        if !self.catalog_cache.is_empty() {
+            return self
+                .catalog_cache
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect();
+        }
+
+        let runtime = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = runtime {
+            if let Ok(catalogs) = handle.block_on(self.load_catalog_info()) {
+                return catalogs.into_iter().map(|c| c.name).collect();
+            }
+        }
+
+        Vec::new()
     }
 
-    fn catalog(&self, name: &str) -> Option<Arc<dyn datafusion::catalog::CatalogProvider>> {
-        Some(Arc::new(MetaCatalogProvider {
-            store: self.store.clone(),
-            catalog: name.to_string(),
-        }))
-    }
-}
+    fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
+        if let Some(catalog) = self.catalog_cache.get(name) {
+            return Some(Arc::clone(&catalog));
+        }
 
-#[derive(Debug, Clone)]
-struct MetaCatalogProvider {
-    pub store: Arc<PgPool>,
-    pub catalog: String,
-}
+        let runtime = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = runtime {
+            if let Ok(catalogs) = handle.block_on(self.load_catalog_info()) {
+                for catalog_info in catalogs {
+                    if catalog_info.name == name {
+                        if let Ok(remote_pool) = handle.block_on(PgPool::connect(&catalog_info.dsn))
+                        {
+                            let provider: Arc<dyn CatalogProvider> =
+                                Arc::new(PostgreSQLCatalogProvider::new(catalog_info, remote_pool));
 
-impl CatalogProvider for MetaCatalogProvider {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
+                            self.catalog_cache
+                                .insert(name.to_string(), Arc::clone(&provider));
 
-    fn schema_names(&self) -> Vec<String> {
-        todo!()
-    }
+                            return Some(provider);
+                        }
+                    }
+                }
+            }
+        }
 
-    fn schema(&self, name: &str) -> Option<Arc<dyn datafusion::catalog::SchemaProvider>> {
-        todo!()
+        None
     }
 }
 
 #[derive(Debug)]
-struct MetaSchemaProvider {
-    pub store: Arc<PgPool>,
-    pub catalog: String,
-    pub schema: String,
+pub struct PostgreSQLCatalogProvider {
+    catalog_info: CatalogInfo,
+    remote_pool: PgPool,
+    schema_cache: DashMap<String, Arc<dyn SchemaProvider>>,
 }
 
-impl SchemaProvider for MetaSchemaProvider {
+impl PostgreSQLCatalogProvider {
+    fn new(catalog_info: CatalogInfo, remote_pool: PgPool) -> Self {
+        Self {
+            catalog_info,
+            remote_pool,
+            schema_cache: DashMap::new(),
+        }
+    }
+
+    async fn get_schema_names(&self) -> Result<Vec<String>> {
+        let query = "SELECT schema_name FROM information_schema.schemata 
+                     WHERE schema_name NOT IN ('information_schema', 'pg_catalog', 'pg_toast')";
+
+        let rows = sqlx::query(query)
+            .fetch_all(&self.remote_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let schema_names = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("schema_name"))
+            .collect();
+
+        Ok(schema_names)
+    }
+}
+
+impl CatalogProvider for PostgreSQLCatalogProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema_names(&self) -> Vec<String> {
+        if !self.schema_cache.is_empty() {
+            return self
+                .schema_cache
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect();
+        }
+
+        let runtime = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = runtime {
+            if let Ok(names) = handle.block_on(self.get_schema_names()) {
+                return names;
+            }
+        }
+
+        Vec::new()
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        if let Some(schema) = self.schema_cache.get(name) {
+            return Some(Arc::clone(&schema));
+        }
+
+        let provider: Arc<dyn SchemaProvider> = Arc::new(PostgreSQLSchemaProvider::new(
+            self.catalog_info.clone(),
+            name.to_string(),
+            self.remote_pool.clone(),
+        ));
+
+        self.schema_cache
+            .insert(name.to_string(), Arc::clone(&provider));
+
+        Some(provider)
+    }
+
+    fn register_schema(
+        &self,
+        name: &str,
+        schema: Arc<dyn SchemaProvider>,
+    ) -> Result<Option<Arc<dyn SchemaProvider>>> {
+        Ok(self.schema_cache.insert(name.to_string(), schema))
+    }
+
+    fn deregister_schema(
+        &self,
+        name: &str,
+        _cascade: bool,
+    ) -> Result<Option<Arc<dyn SchemaProvider>>> {
+        Ok(self.schema_cache.remove(name).map(|(_, v)| v))
+    }
+}
+
+#[derive(Debug)]
+pub struct PostgreSQLSchemaProvider {
+    catalog_info: CatalogInfo,
+    schema_name: String,
+    remote_pool: PgPool,
+    table_cache: DashMap<String, Arc<dyn TableProvider>>,
+}
+
+impl PostgreSQLSchemaProvider {
+    fn new(catalog_info: CatalogInfo, schema_name: String, remote_pool: PgPool) -> Self {
+        Self {
+            catalog_info,
+            schema_name,
+            remote_pool,
+            table_cache: DashMap::new(),
+        }
+    }
+
+    async fn get_table_names(&self) -> Result<Vec<String>> {
+        let query = "SELECT table_name FROM information_schema.tables 
+                     WHERE table_schema = $1 AND table_type = 'BASE TABLE'";
+
+        let rows = sqlx::query(query)
+            .bind(&self.schema_name)
+            .fetch_all(&self.remote_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let table_names = rows
+            .into_iter()
+            .map(|row| row.get::<String, _>("table_name"))
+            .collect();
+
+        Ok(table_names)
+    }
+
+    async fn create_listing_table(&self, table_name: &str) -> Result<Arc<dyn TableProvider>> {
+        let table_path = format!(
+            "/tmp/{}/{}/{}",
+            self.catalog_info.name, self.schema_name, table_name
+        );
+
+        let file_format: Arc<dyn datafusion::datasource::file_format::FileFormat> =
+            Arc::new(CsvFormat::default());
+
+        let listing_options = ListingOptions::new(file_format);
+
+        let table_url = ListingTableUrl::parse(&table_path)
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let config = ListingTableConfig::new(table_url).with_listing_options(listing_options);
+
+        let listing_table = ListingTable::try_new(config)?;
+
+        Ok(Arc::new(listing_table))
+    }
+}
+
+#[async_trait]
+impl SchemaProvider for PostgreSQLSchemaProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn table_names(&self) -> Vec<String> {
-        todo!()
+        if !self.table_cache.is_empty() {
+            return self
+                .table_cache
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect();
+        }
+
+        let runtime = tokio::runtime::Handle::try_current();
+        if let Ok(handle) = runtime {
+            if let Ok(names) = handle.block_on(self.get_table_names()) {
+                return names;
+            }
+        }
+
+        Vec::new()
     }
 
-    // TODO: improve code for result handling
-    async fn table(&self, _name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        todo!()
+    async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
+        if let Some(table) = self.table_cache.get(name) {
+            return Ok(Some(Arc::clone(&table)));
+        }
+
+        match self.create_listing_table(name).await {
+            Ok(table) => {
+                self.table_cache
+                    .insert(name.to_string(), Arc::clone(&table));
+                Ok(Some(table))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn register_table(
         &self,
-        _name: String,
-        _table: Arc<dyn TableProvider>,
-    ) -> datafusion::error::Result<Option<Arc<dyn TableProvider>>> {
-        Err(DataFusionError::NotImplemented(
-            "Please use meta client to create table".to_string(),
-        ))
+        name: String,
+        table: Arc<dyn TableProvider>,
+    ) -> Result<Option<Arc<dyn TableProvider>>> {
+        Ok(self.table_cache.insert(name, table))
     }
 
-    fn deregister_table(
-        &self,
-        _name: &str,
-    ) -> datafusion::error::Result<Option<Arc<dyn TableProvider>>> {
-        Err(DataFusionError::NotImplemented(
-            "Please use meta client to delete table".to_string(),
-        ))
+    fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
+        Ok(self.table_cache.remove(name).map(|(_, v)| v))
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        todo!()
+        self.table_cache.contains_key(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_catalog_provider_list() {
+        let local_dsn = "postgresql://user:password@localhost/kokedb";
+
+        match PostgreSQLMetaCatalogProviderList::new(local_dsn).await {
+            Ok(catalog_list) => {
+                let catalog_names = catalog_list.catalog_names();
+                println!("Found catalogs: {:?}", catalog_names);
+            }
+            Err(e) => {
+                eprintln!("Error creating catalog list: {}", e);
+            }
+        }
     }
 }
