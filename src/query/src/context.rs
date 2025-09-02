@@ -1,13 +1,18 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use datafusion::{
     execution::{runtime_env::RuntimeEnv, SessionStateBuilder},
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_common::plan_datafusion_err;
-use kokedb_catalog::manager::CatalogManager;
+use kokedb_catalog::{
+    manager::{CatalogManager, CatalogManagerOptions},
+    provider::{CatalogProvider, Namespace},
+};
 
-use crate::catalog::PostgreSQLMetaCatalogProviderList;
+use crate::{
+    datafusion_catalog::PostgreSQLMetaCatalogProviderList, mem_catalog::MemoryCatalogProvider,
+};
 
 pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::error::Error>> {
     let local_dsn = std::env::var("PG_META_DSN")
@@ -19,21 +24,32 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
     );
 
     let runtime = Arc::new(RuntimeEnv::default());
+    let default_catalog = "kokedb".to_string();
+    let default_database = vec!["public".to_string()];
+    let default_global_database = vec!["global".to_string()];
+
+    let provider = MemoryCatalogProvider::new(
+        default_catalog.clone(),
+        default_database.clone().try_into()?,
+        Some("default memory database".to_string()),
+    );
+    let mut catalogs: HashMap<String, Arc<dyn CatalogProvider>> = HashMap::new();
+    catalogs.insert(default_catalog.clone(), Arc::new(provider));
 
     let options = CatalogManagerOptions {
         catalogs,
-        default_catalog: config.catalog.default_catalog.clone(),
-        default_database: config.catalog.default_database.clone(),
-        global_temporary_database: config.catalog.global_temporary_database.clone(),
+        default_catalog: default_catalog.clone(),
+        default_database: default_database.clone(),
+        global_temporary_database: default_global_database,
     };
-    CatalogManager::new(options)
-        .map_err(|e| plan_datafusion_err!("failed to create catalog manager: {e}"));
 
-    let mut session_config = SessionConfig::new()
-        // We do not use the DataFusion catalog and schema since we manage catalogs ourselves.
+    let catalog_manager = CatalogManager::new(options)
+        .map_err(|e| plan_datafusion_err!("failed to create catalog manager: {e}"))?;
+
+    let config = SessionConfig::new()
         .with_create_default_catalog_and_schema(false)
         .with_information_schema(false)
-        .with_extension(Arc::new(create_catalog_manager(&options.config)?));
+        .with_extension(Arc::new(catalog_manager));
 
     let state_builder = SessionStateBuilder::new()
         .with_config(config)
