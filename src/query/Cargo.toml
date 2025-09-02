@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 kokedb-common.workspace = true
 kokedb-sql-analyzer.workspace = true
+kokedb-catalog.workspace = true
 
 datafusion.workspace = true
 datafusion-common.workspace = true
@@ -14,6 +15,7 @@ datafusion-expr-common.workspace = true
 datafusion-functions.workspace = true
 datafusion-functions-nested.workspace = true
 datafusion-physical-expr.workspace = true
+
 
 sqlx = { version = "0.8.6", features = [ "runtime-tokio", "postgres" ] }
 tokio.workspace = true

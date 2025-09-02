@@ -2945,6 +2945,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-functions-nested",
  "datafusion-physical-expr",
+ "kokedb-catalog",
  "kokedb-common",
  "kokedb-sql-analyzer",
  "sqlx",
