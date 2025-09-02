@@ -5,7 +5,7 @@ use datafusion::{
     prelude::SessionContext,
 };
 use kokedb_plan::{config::PlanConfig, resolve_and_execute_plan};
-use kokedb_query::binder::*;
+use kokedb_query::{binder::*, context::create_session_context};
 use opensrv_mysql::*;
 use tokio::{io::AsyncWrite, net::TcpListener};
 
@@ -130,8 +130,8 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("0.0.0.0:3306").await?;
-    let ctx = SessionContext::default();
+    let listener = TcpListener::bind("0.0.0.0:3306").await.unwrap();
+    let ctx = create_session_context().await.unwrap();
 
     loop {
         let (stream, _) = listener.accept().await?;

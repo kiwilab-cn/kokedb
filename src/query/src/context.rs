@@ -7,7 +7,7 @@ use datafusion::{
 use datafusion_common::plan_datafusion_err;
 use kokedb_catalog::{
     manager::{CatalogManager, CatalogManagerOptions},
-    provider::{CatalogProvider, Namespace},
+    provider::CatalogProvider,
 };
 
 use crate::{
