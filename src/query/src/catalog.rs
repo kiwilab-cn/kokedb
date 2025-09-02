@@ -16,7 +16,6 @@ use sqlx::{PgPool, Row};
 pub struct CatalogInfo {
     pub name: String,
     pub dsn: String,
-    pub password: String,
 }
 
 #[derive(Debug)]
@@ -38,7 +37,7 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     async fn load_catalog_info(&self) -> Result<Vec<CatalogInfo>> {
-        let query = "SELECT name, dsn, password FROM system.catalog";
+        let query = "SELECT name, dsn FROM system.catalog";
 
         let rows = sqlx::query(query)
             .fetch_all(&self.local_pool)
@@ -50,7 +49,6 @@ impl PostgreSQLMetaCatalogProviderList {
             let catalog_info = CatalogInfo {
                 name: row.get("name"),
                 dsn: row.get("dsn"),
-                password: row.get("password"),
             };
             catalogs.push(catalog_info);
         }
@@ -69,54 +67,44 @@ impl CatalogProviderList for PostgreSQLMetaCatalogProviderList {
         name: String,
         catalog: Arc<dyn CatalogProvider>,
     ) -> Option<Arc<dyn CatalogProvider>> {
+        //TODO: need store to postgresql.
         self.catalog_cache.insert(name, catalog)
     }
 
     fn catalog_names(&self) -> Vec<String> {
-        if !self.catalog_cache.is_empty() {
-            return self
-                .catalog_cache
-                .iter()
-                .map(|entry| entry.key().clone())
-                .collect();
-        }
-
-        let runtime = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = runtime {
-            if let Ok(catalogs) = handle.block_on(self.load_catalog_info()) {
-                return catalogs.into_iter().map(|c| c.name).collect();
-            }
-        }
-
-        Vec::new()
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                if let Ok(catalogs) = self.load_catalog_info().await {
+                    catalogs.into_iter().map(|c| c.name.clone()).collect()
+                } else {
+                    Vec::new()
+                }
+            })
+        })
     }
 
     fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
-        if let Some(catalog) = self.catalog_cache.get(name) {
-            return Some(Arc::clone(&catalog));
-        }
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                if let Ok(catalogs) = self.load_catalog_info().await {
+                    for catalog_info in catalogs {
+                        if catalog_info.name == name {
+                            if let Ok(remote_pool) = PgPool::connect(&catalog_info.dsn).await {
+                                let provider: Arc<dyn CatalogProvider> = Arc::new(
+                                    PostgreSQLCatalogProvider::new(catalog_info, remote_pool),
+                                );
 
-        let runtime = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = runtime {
-            if let Ok(catalogs) = handle.block_on(self.load_catalog_info()) {
-                for catalog_info in catalogs {
-                    if catalog_info.name == name {
-                        if let Ok(remote_pool) = handle.block_on(PgPool::connect(&catalog_info.dsn))
-                        {
-                            let provider: Arc<dyn CatalogProvider> =
-                                Arc::new(PostgreSQLCatalogProvider::new(catalog_info, remote_pool));
+                                self.catalog_cache
+                                    .insert(name.to_string(), Arc::clone(&provider));
 
-                            self.catalog_cache
-                                .insert(name.to_string(), Arc::clone(&provider));
-
-                            return Some(provider);
+                                return Some(provider);
+                            }
                         }
                     }
                 }
-            }
-        }
-
-        None
+                None
+            })
+        })
     }
 }
 
@@ -160,22 +148,15 @@ impl CatalogProvider for PostgreSQLCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        if !self.schema_cache.is_empty() {
-            return self
-                .schema_cache
-                .iter()
-                .map(|entry| entry.key().clone())
-                .collect();
-        }
-
-        let runtime = tokio::runtime::Handle::try_current();
-        if let Ok(handle) = runtime {
-            if let Ok(names) = handle.block_on(self.get_schema_names()) {
-                return names;
-            }
-        }
-
-        Vec::new()
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                if let Ok(names) = self.get_schema_names().await {
+                    names
+                } else {
+                    Vec::new()
+                }
+            })
+        })
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
@@ -331,14 +312,18 @@ impl SchemaProvider for PostgreSQLSchemaProvider {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn test_catalog_provider_list() {
-        let local_dsn = "postgresql://user:password@localhost/kokedb";
+        let local_dsn = "postgresql://postgres:123456@192.168.0.227:25432/kokedb";
 
         match PostgreSQLMetaCatalogProviderList::new(local_dsn).await {
             Ok(catalog_list) => {
                 let catalog_names = catalog_list.catalog_names();
                 println!("Found catalogs: {:?}", catalog_names);
+                let catalog_name = catalog_names.first().unwrap();
+                let catalog = catalog_list.catalog(&catalog_name).unwrap();
+                let schema = catalog.schema_names();
+                println!("===================>>>{:?}", schema);
             }
             Err(e) => {
                 eprintln!("Error creating catalog list: {}", e);
