@@ -1,6 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use datafusion::{
+    catalog::CatalogProviderList,
     execution::{runtime_env::RuntimeEnv, SessionStateBuilder},
     prelude::{SessionConfig, SessionContext},
 };

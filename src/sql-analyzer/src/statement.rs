@@ -45,6 +45,17 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::ShowCatalogs {
+            show: _,
+            catalogs: _,
+            like,
+        } => {
+            let pattern = like
+                .map(|(_, pattern)| from_ast_string(pattern))
+                .transpose()?;
+            let node = spec::CommandNode::ListCatalogs { pattern };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::UseDatabase {
             r#use: _,
             database: _,
