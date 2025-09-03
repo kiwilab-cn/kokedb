@@ -10,6 +10,8 @@ use datafusion::datasource::listing::{
 };
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
+use kokedb_catalog::error::CatalogError;
+use kokedb_catalog::provider::{DatabaseStatus, TableStatus};
 use sqlx::{PgPool, Row};
 
 #[derive(Debug, Clone)]
@@ -113,6 +115,157 @@ pub struct PostgreSQLCatalogProvider {
     catalog_info: CatalogInfo,
     remote_pool: PgPool,
     schema_cache: DashMap<String, Arc<dyn SchemaProvider>>,
+}
+
+#[async_trait::async_trait]
+impl kokedb_catalog::provider::CatalogProvider for PostgreSQLCatalogProvider {
+    fn get_name(&self) -> &str {
+        &self.catalog_info.name
+    }
+
+    async fn create_database(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+        options: kokedb_catalog::provider::CreateDatabaseOptions,
+    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::DatabaseStatus> {
+        unimplemented!()
+    }
+
+    async fn drop_database(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+        options: kokedb_catalog::provider::DropDatabaseOptions,
+    ) -> kokedb_catalog::error::CatalogResult<()> {
+        unimplemented!()
+    }
+
+    async fn get_database(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::DatabaseStatus> {
+        let name = &database.head;
+        if let Some(_) = self.schema(name) {
+            let database_status = DatabaseStatus {
+                catalog: self.get_name().to_string(),
+                database: vec![name.to_string()],
+                comment: None,
+                location: None,
+                properties: vec![],
+            };
+            Ok(database_status)
+        } else {
+            Err(CatalogError::NotFound("database", database.to_string()))
+        }
+    }
+
+    async fn list_databases(
+        &self,
+        prefix: Option<&kokedb_catalog::provider::Namespace>,
+    ) -> kokedb_catalog::error::CatalogResult<Vec<kokedb_catalog::provider::DatabaseStatus>> {
+        let databases = self.schema_names();
+
+        let mut database_list = vec![];
+        for database in databases.iter() {
+            let item = DatabaseStatus {
+                catalog: self.get_name().to_string(),
+                database: vec![database.to_string()],
+                comment: None,
+                location: None,
+                properties: vec![],
+            };
+            database_list.push(item);
+        }
+        Ok(database_list)
+    }
+
+    async fn create_table(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+        table: &str,
+        options: kokedb_catalog::provider::CreateTableOptions,
+    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::TableStatus> {
+        unimplemented!()
+    }
+
+    async fn get_table(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+        table: &str,
+    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::TableStatus> {
+        let schema_name = database.head;
+        // TODO: remove unwrap.
+        let schema = self.schema(&schema_name).unwrap();
+        if let Some(_) = schema.table(table) {
+            TableStatus {
+                name: table.to_string(),
+                kind: kokedb_catalog::provider::TableKind::Table {
+                    catalog: (),
+                    database: (),
+                    columns: (),
+                    comment: (),
+                    constraints: (),
+                    location: (),
+                    format: (),
+                    partition_by: (),
+                    sort_by: (),
+                    bucket_by: (),
+                    options: (),
+                    properties: (),
+                },
+            }
+        } else {
+            Err(CatalogError::NotFound("table", table.to_string()))
+        }
+    }
+
+    async fn list_tables(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+    ) -> kokedb_catalog::error::CatalogResult<Vec<kokedb_catalog::provider::TableStatus>> {
+        todo!()
+    }
+
+    async fn drop_table(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+        table: &str,
+        options: kokedb_catalog::provider::DropTableOptions,
+    ) -> kokedb_catalog::error::CatalogResult<()> {
+        unimplemented!()
+    }
+
+    async fn create_view(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+        view: &str,
+        options: kokedb_catalog::provider::CreateViewOptions,
+    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::TableStatus> {
+        unimplemented!()
+    }
+
+    async fn get_view(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+        view: &str,
+    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::TableStatus> {
+        todo!()
+    }
+
+    async fn list_views(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+    ) -> kokedb_catalog::error::CatalogResult<Vec<kokedb_catalog::provider::TableStatus>> {
+        todo!()
+    }
+
+    async fn drop_view(
+        &self,
+        database: &kokedb_catalog::provider::Namespace,
+        view: &str,
+        options: kokedb_catalog::provider::DropViewOptions,
+    ) -> kokedb_catalog::error::CatalogResult<()> {
+        unimplemented!()
+    }
 }
 
 impl PostgreSQLCatalogProvider {
