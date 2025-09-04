@@ -11,7 +11,7 @@ use datafusion::datasource::listing::{
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 use kokedb_catalog::error::CatalogError;
-use kokedb_catalog::provider::{DatabaseStatus, TableStatus};
+use kokedb_catalog::provider::{DatabaseStatus, TableColumnStatus, TableStatus};
 use sqlx::{PgPool, Row};
 
 #[derive(Debug, Clone)]
@@ -192,27 +192,47 @@ impl kokedb_catalog::provider::CatalogProvider for PostgreSQLCatalogProvider {
         database: &kokedb_catalog::provider::Namespace,
         table: &str,
     ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::TableStatus> {
-        let schema_name = database.head;
+        let schema_name = database.head.clone();
         // TODO: remove unwrap.
         let schema = self.schema(&schema_name).unwrap();
-        if let Some(_) = schema.table(table) {
-            TableStatus {
+        if let Some(t) = schema.table(table).await.map_err(|x| {
+            CatalogError::Internal(format!("Failed to get table with error: {:?}", x.message()))
+        })? {
+            let columns = t
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| TableColumnStatus {
+                    name: f.name().clone(),
+                    data_type: f.data_type().clone(),
+                    nullable: f.is_nullable(),
+                    comment: None,
+                    default: None,
+                    generated_always_as: None,
+                    is_partition: false,
+                    is_bucket: false,
+                    is_cluster: false,
+                })
+                .collect::<Vec<TableColumnStatus>>();
+
+            let table_status = TableStatus {
                 name: table.to_string(),
                 kind: kokedb_catalog::provider::TableKind::Table {
-                    catalog: (),
-                    database: (),
-                    columns: (),
-                    comment: (),
-                    constraints: (),
-                    location: (),
-                    format: (),
-                    partition_by: (),
-                    sort_by: (),
-                    bucket_by: (),
-                    options: (),
-                    properties: (),
+                    catalog: self.get_name().to_string(),
+                    database: vec![schema_name.to_string()],
+                    columns,
+                    comment: None,
+                    constraints: vec![],
+                    location: None,
+                    format: "parquet".to_string(),
+                    partition_by: vec![],
+                    sort_by: vec![],
+                    bucket_by: None,
+                    options: vec![],
+                    properties: vec![],
                 },
-            }
+            };
+            Ok(table_status)
         } else {
             Err(CatalogError::NotFound("table", table.to_string()))
         }
@@ -248,14 +268,14 @@ impl kokedb_catalog::provider::CatalogProvider for PostgreSQLCatalogProvider {
         database: &kokedb_catalog::provider::Namespace,
         view: &str,
     ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::TableStatus> {
-        todo!()
+        unimplemented!()
     }
 
     async fn list_views(
         &self,
         database: &kokedb_catalog::provider::Namespace,
     ) -> kokedb_catalog::error::CatalogResult<Vec<kokedb_catalog::provider::TableStatus>> {
-        todo!()
+        unimplemented!()
     }
 
     async fn drop_view(
