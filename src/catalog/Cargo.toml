@@ -10,6 +10,10 @@ workspace = true
 kokedb-common.workspace = true
 kokedb-common-datafusion.workspace = true
 
+dashmap.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }

@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use datafusion::catalog::CatalogProviderList;
 use kokedb_common_datafusion::extension::SessionExtension;
 
+use crate::datafusion_catalog::{DataFusionCatalogAdapter, PostgreSQLMetaCatalogProviderList};
 use crate::error::{CatalogError, CatalogResult};
 use crate::provider::{CatalogProvider, Namespace};
 use crate::temp_view::TemporaryViewManager;
@@ -22,6 +24,7 @@ pub struct CatalogManager {
 
 pub(super) struct CatalogManagerState {
     pub(super) catalogs: HashMap<Arc<str>, Arc<dyn CatalogProvider>>,
+    pub(super) dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
     pub(super) default_catalog: Arc<str>,
     pub(super) default_database: Namespace,
     pub(super) global_temporary_database: Namespace,
@@ -29,6 +32,7 @@ pub(super) struct CatalogManagerState {
 
 pub struct CatalogManagerOptions {
     pub catalogs: HashMap<String, Arc<dyn CatalogProvider>>,
+    pub dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
     pub default_catalog: String,
     pub default_database: Vec<String>,
     pub global_temporary_database: Vec<String>,
@@ -55,6 +59,7 @@ impl CatalogManager {
             default_catalog: options.default_catalog.into(),
             default_database: options.default_database.try_into()?,
             global_temporary_database: options.global_temporary_database.try_into()?,
+            dynamic_catalog_list: options.dynamic_catalog_list,
         };
         Ok(CatalogManager {
             state: Arc::new(Mutex::new(state)),
@@ -114,7 +119,7 @@ impl CatalogManagerState {
             [] => Err(CatalogError::InvalidArgument(
                 "empty database reference".to_string(),
             )),
-            [head, tail @ ..] if self.catalogs.contains_key(head.as_ref()) => {
+            [head, tail @ ..] if self.list_catalog().contains_key(head.as_ref()) => {
                 let catalog = head.as_ref().into();
                 let database = tail.try_into()?;
                 Ok((catalog, database))
@@ -136,7 +141,7 @@ impl CatalogManagerState {
                 let catalog = self.default_catalog.clone();
                 Ok((catalog, None))
             }
-            [name] if self.catalogs.contains_key(name.as_ref()) => {
+            [name] if self.list_catalog().contains_key(name.as_ref()) => {
                 let catalog = name.as_ref().into();
                 Ok((catalog, None))
             }
@@ -177,11 +182,32 @@ impl CatalogManagerState {
         }
     }
 
+    pub fn list_catalog(&self) -> HashMap<Arc<str>, Arc<dyn CatalogProvider>> {
+        let mut catalogs: HashMap<String, Arc<dyn CatalogProvider>> = self
+            .catalogs
+            .iter()
+            .map(|(k, v)| (k.to_string(), Arc::clone(v)))
+            .collect();
+
+        let catalog_list = self.dynamic_catalog_list.clone();
+        for catalog_name in catalog_list.catalog_names() {
+            if let Some(catalog) = catalog_list.catalog(&catalog_name) {
+                let catalog_adapter = DataFusionCatalogAdapter::new(catalog, catalog_name.clone());
+                catalogs.insert(catalog_name.clone(), Arc::new(catalog_adapter));
+            }
+        }
+        catalogs
+            .into_iter()
+            .map(|(k, v)| (Arc::from(k), v))
+            .collect()
+    }
+
     pub fn get_catalog(&self, catalog: &str) -> CatalogResult<Arc<dyn CatalogProvider>> {
-        let Some(provider) = self.catalogs.get(catalog) else {
-            return Err(CatalogError::NotFound("catalog", catalog.to_string()));
-        };
-        Ok(Arc::clone(provider))
+        let catalogs = self.list_catalog();
+        catalogs
+            .get(catalog)
+            .map(Arc::clone)
+            .ok_or_else(|| CatalogError::NotFound("catalog", catalog.to_string()))
     }
 }
 

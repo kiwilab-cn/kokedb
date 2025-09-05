@@ -1,20 +1,17 @@
 use std::{collections::HashMap, sync::Arc};
 
 use datafusion::{
-    catalog::CatalogProviderList,
     execution::{runtime_env::RuntimeEnv, SessionStateBuilder},
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_common::plan_datafusion_err;
 use kokedb_catalog::{
+    datafusion_catalog::PostgreSQLMetaCatalogProviderList,
     manager::{CatalogManager, CatalogManagerOptions},
     provider::CatalogProvider,
 };
 
-use crate::{
-    datafusion_catalog::{DataFusionCatalogAdapter, PostgreSQLMetaCatalogProviderList},
-    mem_catalog::MemoryCatalogProvider,
-};
+use crate::mem_catalog::MemoryCatalogProvider;
 
 pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::error::Error>> {
     let runtime = Arc::new(RuntimeEnv::default());
@@ -38,17 +35,12 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
             .unwrap(),
     );
 
-    for catalog_name in catalog_list.catalog_names() {
-        let catalog = catalog_list.catalog(&catalog_name).unwrap();
-        let catalog_adapter = DataFusionCatalogAdapter::new(catalog, catalog_name.clone());
-        catalogs.insert(catalog_name.clone(), Arc::new(catalog_adapter));
-    }
-
     let options = CatalogManagerOptions {
         catalogs,
         default_catalog: default_catalog.clone(),
         default_database: default_database.clone(),
         global_temporary_database: default_global_database,
+        dynamic_catalog_list: catalog_list.clone(),
     };
 
     let catalog_manager = CatalogManager::new(options)
@@ -62,7 +54,7 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
     let state_builder = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime)
-        .with_catalog_list(catalog_list)
+        .with_catalog_list(catalog_list.clone())
         .with_default_features()
         .build();
     let ctx = SessionContext::new_with_state(state_builder);

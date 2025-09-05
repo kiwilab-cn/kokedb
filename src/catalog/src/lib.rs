@@ -1,4 +1,5 @@
 pub mod command;
+pub mod datafusion_catalog;
 pub mod display;
 pub mod error;
 pub mod manager;

@@ -146,3 +146,4 @@ tonic-health = "0.12.3"
 tonic-types = "0.12.3"
 
 dashmap = "6.1.0"
+sqlx = { version = "0.8.6", features = [ "runtime-tokio", "postgres" ] }
