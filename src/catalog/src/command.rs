@@ -13,8 +13,9 @@ use crate::display::{CatalogDisplay, EmptyDisplay, SingleValueDisplay};
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::provider::{
-    CreateDatabaseOptions, CreateTableOptions, CreateTemporaryViewOptions, CreateViewOptions,
-    DropDatabaseOptions, DropTableOptions, DropTemporaryViewOptions, DropViewOptions,
+    CreateCatalogOptions, CreateDatabaseOptions, CreateTableOptions, CreateTemporaryViewOptions,
+    CreateViewOptions, DropDatabaseOptions, DropTableOptions, DropTemporaryViewOptions,
+    DropViewOptions,
 };
 use crate::utils::quote_namespace_if_needed;
 
@@ -23,6 +24,10 @@ pub enum CatalogCommand {
     CurrentCatalog,
     SetCurrentCatalog {
         catalog: String,
+    },
+    CreateCatalog {
+        catalog: String,
+        options: CreateCatalogOptions,
     },
     ListCatalogs {
         pattern: Option<String>,
@@ -132,6 +137,7 @@ impl CatalogCommand {
             CatalogCommand::SetCurrentCatalog { .. } => "SetCurrentCatalog",
             CatalogCommand::ListCatalogs { .. } => "ListCatalogs",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
+            CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
             CatalogCommand::CreateDatabase { .. } => "CreateDatabase",
             CatalogCommand::DatabaseExists { .. } => "DatabaseExists",
@@ -189,6 +195,7 @@ impl CatalogCommand {
             CatalogCommand::DatabaseExists { .. }
             | CatalogCommand::TableExists { .. }
             | CatalogCommand::FunctionExists { .. }
+            | CatalogCommand::CreateCatalog { .. }
             | CatalogCommand::CreateDatabase { .. }
             | CatalogCommand::CreateTable { .. }
             | CatalogCommand::CreateTemporaryView { .. }
@@ -223,6 +230,12 @@ impl CatalogCommand {
             }
             CatalogCommand::SetCurrentCatalog { catalog } => {
                 manager.set_default_catalog(catalog)?;
+                let rows: Vec<EmptyDisplay> = vec![];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::CreateCatalog { catalog, options } => {
+                manager.create_catalog(catalog, options)?;
+
                 let rows: Vec<EmptyDisplay> = vec![];
                 build_record_batch(schema, &rows)
             }

@@ -9,6 +9,7 @@ use crate::provider::{
 };
 use async_trait::async_trait;
 use dashmap::DashMap;
+use datafusion::arrow::array::ArrowNativeTypeOp;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
 use datafusion::datasource::file_format::csv::CsvFormat;
 use datafusion::datasource::listing::{
@@ -60,6 +61,23 @@ impl PostgreSQLMetaCatalogProviderList {
         }
 
         Ok(catalogs)
+    }
+
+    pub fn create_catalog(&self, catalog: &str, dsn: &str) -> Result<bool> {
+        let insert_sql = "INSERT INTO system.catalog (name, dsn) VALUES ($1, $2)";
+
+        let ret = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                sqlx::query(insert_sql)
+                    .bind(catalog)
+                    .bind(dsn)
+                    .execute(&self.local_pool)
+                    .await
+            })
+        })
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(ret.rows_affected().is_eq(1))
     }
 }
 

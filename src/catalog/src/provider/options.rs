@@ -58,6 +58,21 @@ impl From<CatalogTableSort> for expr::Sort {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd)]
+pub enum RemoteDatabaseType {
+    PostgreSQL,
+    Mysql,
+    Oracle,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd)]
+pub struct CreateCatalogOptions {
+    pub db_type: RemoteDatabaseType,
+    pub dsn: String,
+    pub comment: Option<String>,
+    pub properties: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd)]
 pub struct CreateDatabaseOptions {
     pub comment: Option<String>,
     pub location: Option<String>,
