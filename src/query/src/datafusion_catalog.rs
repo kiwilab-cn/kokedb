@@ -10,8 +10,12 @@ use datafusion::datasource::listing::{
 };
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
-use kokedb_catalog::error::CatalogError;
-use kokedb_catalog::provider::{DatabaseStatus, TableColumnStatus, TableStatus};
+use kokedb_catalog::error::{CatalogError, CatalogResult};
+use kokedb_catalog::provider::{
+    CreateDatabaseOptions, CreateTableOptions, CreateViewOptions, DatabaseStatus,
+    DropDatabaseOptions, DropTableOptions, DropViewOptions, Namespace, TableColumnStatus,
+    TableKind, TableStatus,
+};
 use sqlx::{PgPool, Row};
 
 #[derive(Debug, Clone)]
@@ -117,42 +121,103 @@ pub struct PostgreSQLCatalogProvider {
     schema_cache: DashMap<String, Arc<dyn SchemaProvider>>,
 }
 
-#[async_trait::async_trait]
-impl kokedb_catalog::provider::CatalogProvider for PostgreSQLCatalogProvider {
+pub struct DataFusionCatalogAdapter {
+    inner: Arc<dyn CatalogProvider>,
+    catalog_name: String,
+}
+
+impl DataFusionCatalogAdapter {
+    pub fn new(inner: Arc<dyn CatalogProvider>, catalog_name: String) -> Self {
+        Self {
+            inner,
+            catalog_name,
+        }
+    }
+
+    pub fn inner(&self) -> &dyn CatalogProvider {
+        self.inner.as_ref()
+    }
+
+    fn create_database_status(&self, schema_name: &str) -> DatabaseStatus {
+        DatabaseStatus {
+            catalog: self.catalog_name.clone(),
+            database: vec![schema_name.to_string()],
+            comment: None,
+            location: None,
+            properties: vec![],
+        }
+    }
+
+    async fn create_table_status(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        table_provider: Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> TableStatus {
+        let schema = table_provider.schema();
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| TableColumnStatus {
+                name: field.name().clone(),
+                data_type: field.data_type().clone(),
+                nullable: field.is_nullable(),
+                comment: None,
+                default: None,
+                generated_always_as: None,
+                is_partition: false,
+                is_bucket: false,
+                is_cluster: false,
+            })
+            .collect();
+
+        TableStatus {
+            name: table_name.to_string(),
+            kind: TableKind::Table {
+                catalog: self.catalog_name.clone(),
+                database: vec![schema_name.to_string()],
+                columns,
+                comment: None,
+                constraints: vec![],
+                location: None,
+                format: "unknown".to_string(),
+                partition_by: vec![],
+                sort_by: vec![],
+                bucket_by: None,
+                options: vec![],
+                properties: vec![],
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl kokedb_catalog::provider::CatalogProvider for DataFusionCatalogAdapter {
     fn get_name(&self) -> &str {
-        &self.catalog_info.name
+        &self.catalog_name
     }
 
     async fn create_database(
         &self,
-        database: &kokedb_catalog::provider::Namespace,
-        options: kokedb_catalog::provider::CreateDatabaseOptions,
-    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::DatabaseStatus> {
-        unimplemented!()
+        _database: &Namespace,
+        _options: CreateDatabaseOptions,
+    ) -> CatalogResult<DatabaseStatus> {
+        Err(CatalogError::NotSupported("create_database".to_string()))
     }
 
     async fn drop_database(
         &self,
-        database: &kokedb_catalog::provider::Namespace,
-        options: kokedb_catalog::provider::DropDatabaseOptions,
-    ) -> kokedb_catalog::error::CatalogResult<()> {
-        unimplemented!()
+        _database: &Namespace,
+        _options: DropDatabaseOptions,
+    ) -> CatalogResult<()> {
+        Err(CatalogError::NotSupported("drop_database".to_string()))
     }
 
-    async fn get_database(
-        &self,
-        database: &kokedb_catalog::provider::Namespace,
-    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::DatabaseStatus> {
-        let name = &database.head;
-        if let Some(_) = self.schema(name) {
-            let database_status = DatabaseStatus {
-                catalog: self.get_name().to_string(),
-                database: vec![name.to_string()],
-                comment: None,
-                location: None,
-                properties: vec![],
-            };
-            Ok(database_status)
+    async fn get_database(&self, database: &Namespace) -> CatalogResult<DatabaseStatus> {
+        let schema_name = &database.head;
+
+        if self.inner.schema(schema_name).is_some() {
+            Ok(self.create_database_status(schema_name))
         } else {
             Err(CatalogError::NotFound("database", database.to_string()))
         }
@@ -160,131 +225,93 @@ impl kokedb_catalog::provider::CatalogProvider for PostgreSQLCatalogProvider {
 
     async fn list_databases(
         &self,
-        prefix: Option<&kokedb_catalog::provider::Namespace>,
-    ) -> kokedb_catalog::error::CatalogResult<Vec<kokedb_catalog::provider::DatabaseStatus>> {
-        let databases = self.schema_names();
+        _prefix: Option<&Namespace>,
+    ) -> CatalogResult<Vec<DatabaseStatus>> {
+        let schema_names = self.inner.schema_names();
+        let databases = schema_names
+            .into_iter()
+            .map(|name| self.create_database_status(&name))
+            .collect();
 
-        let mut database_list = vec![];
-        for database in databases.iter() {
-            let item = DatabaseStatus {
-                catalog: self.get_name().to_string(),
-                database: vec![database.to_string()],
-                comment: None,
-                location: None,
-                properties: vec![],
-            };
-            database_list.push(item);
-        }
-        Ok(database_list)
+        Ok(databases)
     }
 
     async fn create_table(
         &self,
-        database: &kokedb_catalog::provider::Namespace,
-        table: &str,
-        options: kokedb_catalog::provider::CreateTableOptions,
-    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::TableStatus> {
-        unimplemented!()
+        _database: &Namespace,
+        _table: &str,
+        _options: CreateTableOptions,
+    ) -> CatalogResult<TableStatus> {
+        Err(CatalogError::NotSupported("create_table".to_string()))
     }
 
-    async fn get_table(
-        &self,
-        database: &kokedb_catalog::provider::Namespace,
-        table: &str,
-    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::TableStatus> {
-        let schema_name = database.head.clone();
-        // TODO: remove unwrap.
-        let schema = self.schema(&schema_name).unwrap();
-        if let Some(t) = schema.table(table).await.map_err(|x| {
-            CatalogError::Internal(format!("Failed to get table with error: {:?}", x.message()))
-        })? {
-            let columns = t
-                .schema()
-                .fields()
-                .iter()
-                .map(|f| TableColumnStatus {
-                    name: f.name().clone(),
-                    data_type: f.data_type().clone(),
-                    nullable: f.is_nullable(),
-                    comment: None,
-                    default: None,
-                    generated_always_as: None,
-                    is_partition: false,
-                    is_bucket: false,
-                    is_cluster: false,
-                })
-                .collect::<Vec<TableColumnStatus>>();
+    async fn get_table(&self, database: &Namespace, table: &str) -> CatalogResult<TableStatus> {
+        let schema_name = &database.head;
 
-            let table_status = TableStatus {
-                name: table.to_string(),
-                kind: kokedb_catalog::provider::TableKind::Table {
-                    catalog: self.get_name().to_string(),
-                    database: vec![schema_name.to_string()],
-                    columns,
-                    comment: None,
-                    constraints: vec![],
-                    location: None,
-                    format: "parquet".to_string(),
-                    partition_by: vec![],
-                    sort_by: vec![],
-                    bucket_by: None,
-                    options: vec![],
-                    properties: vec![],
-                },
-            };
-            Ok(table_status)
+        if let Some(schema) = self.inner.schema(schema_name) {
+            if let Some(table_provider) = schema
+                .table(table)
+                .await
+                .map_err(|e| CatalogError::Internal(format!("DataFusion error: {}", e)))?
+            {
+                Ok(self
+                    .create_table_status(schema_name, table, table_provider)
+                    .await)
+            } else {
+                Err(CatalogError::NotFound("table", table.to_string()))
+            }
         } else {
-            Err(CatalogError::NotFound("table", table.to_string()))
+            Err(CatalogError::NotFound("database", schema_name.to_string()))
         }
     }
 
-    async fn list_tables(
-        &self,
-        database: &kokedb_catalog::provider::Namespace,
-    ) -> kokedb_catalog::error::CatalogResult<Vec<kokedb_catalog::provider::TableStatus>> {
-        todo!()
+    async fn list_tables(&self, database: &Namespace) -> CatalogResult<Vec<TableStatus>> {
+        let schema_name = &database.head;
+
+        if let Some(schema) = self.inner.schema(schema_name) {
+            let table_names = schema.table_names();
+            let mut tables = Vec::new();
+
+            for table_name in table_names {
+                if let Ok(table_status) = self.get_table(database, &table_name).await {
+                    tables.push(table_status);
+                }
+            }
+
+            Ok(tables)
+        } else {
+            Err(CatalogError::NotFound("database", schema_name.to_string()))
+        }
     }
 
     async fn drop_table(
         &self,
-        database: &kokedb_catalog::provider::Namespace,
-        table: &str,
-        options: kokedb_catalog::provider::DropTableOptions,
-    ) -> kokedb_catalog::error::CatalogResult<()> {
-        unimplemented!()
+        _database: &Namespace,
+        _table: &str,
+        _options: DropTableOptions,
+    ) -> CatalogResult<()> {
+        Err(CatalogError::NotSupported("drop_table".to_string()))
     }
 
     async fn create_view(
         &self,
-        database: &kokedb_catalog::provider::Namespace,
-        view: &str,
-        options: kokedb_catalog::provider::CreateViewOptions,
-    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::TableStatus> {
-        unimplemented!()
+        _: &Namespace,
+        _: &str,
+        _: CreateViewOptions,
+    ) -> CatalogResult<TableStatus> {
+        Err(CatalogError::NotSupported("create_view".to_string()))
     }
 
-    async fn get_view(
-        &self,
-        database: &kokedb_catalog::provider::Namespace,
-        view: &str,
-    ) -> kokedb_catalog::error::CatalogResult<kokedb_catalog::provider::TableStatus> {
-        unimplemented!()
+    async fn get_view(&self, _: &Namespace, _: &str) -> CatalogResult<TableStatus> {
+        Err(CatalogError::NotSupported("get_view".to_string()))
     }
 
-    async fn list_views(
-        &self,
-        database: &kokedb_catalog::provider::Namespace,
-    ) -> kokedb_catalog::error::CatalogResult<Vec<kokedb_catalog::provider::TableStatus>> {
-        unimplemented!()
+    async fn list_views(&self, _: &Namespace) -> CatalogResult<Vec<TableStatus>> {
+        Ok(vec![])
     }
 
-    async fn drop_view(
-        &self,
-        database: &kokedb_catalog::provider::Namespace,
-        view: &str,
-        options: kokedb_catalog::provider::DropViewOptions,
-    ) -> kokedb_catalog::error::CatalogResult<()> {
-        unimplemented!()
+    async fn drop_view(&self, _: &Namespace, _: &str, _: DropViewOptions) -> CatalogResult<()> {
+        Err(CatalogError::NotSupported("drop_view".to_string()))
     }
 }
 

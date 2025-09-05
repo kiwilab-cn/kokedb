@@ -82,16 +82,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
             })
             .collect();
 
-        // 开始写入结果
         let mut writer = results.start(&columns).await?;
 
-        // 遍历 RecordBatch 并写入行
         for batch in batches {
             for row_idx in 0..batch.num_rows() {
                 let row: Vec<_> = (0..batch.num_columns())
                     .map(|col_idx| {
                         let col = batch.column(col_idx);
-                        // 根据列类型提取值并转换为 MySQL 兼容格式
                         match col.data_type() {
                             DataType::Int32 => col
                                 .as_any()
@@ -113,17 +110,20 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
                                 .downcast_ref::<datafusion::arrow::array::StringArray>()
                                 .map(|arr| arr.value(row_idx).to_string())
                                 .unwrap_or_default(),
-                            _ => String::new(), // 其他类型的默认处理
+                            DataType::LargeUtf8 => col
+                                .as_any()
+                                .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
+                                .map(|arr| arr.value(row_idx).to_string())
+                                .unwrap_or_default(),
+                            _ => String::new(),
                         }
                     })
                     .collect();
 
-                // 写入一行
                 writer.write_row(row.iter().map(|s| s.as_str())).await?;
             }
         }
 
-        // 完成写入并添加额外信息
         writer.finish_with_info("Query executed successfully").await
     }
 }

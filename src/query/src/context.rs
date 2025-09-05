@@ -12,18 +12,11 @@ use kokedb_catalog::{
 };
 
 use crate::{
-    datafusion_catalog::PostgreSQLMetaCatalogProviderList, mem_catalog::MemoryCatalogProvider,
+    datafusion_catalog::{DataFusionCatalogAdapter, PostgreSQLMetaCatalogProviderList},
+    mem_catalog::MemoryCatalogProvider,
 };
 
 pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::error::Error>> {
-    let local_dsn = std::env::var("PG_META_DSN")
-        .unwrap_or("postgresql://postgres:123456@192.168.0.227:25432/kokedb".to_string());
-    let catalog_list = Arc::new(
-        PostgreSQLMetaCatalogProviderList::new(&local_dsn)
-            .await
-            .unwrap(),
-    );
-
     let runtime = Arc::new(RuntimeEnv::default());
     let default_catalog = "kokedb".to_string();
     let default_database = vec!["public".to_string()];
@@ -36,6 +29,20 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
     );
     let mut catalogs: HashMap<String, Arc<dyn CatalogProvider>> = HashMap::new();
     catalogs.insert(default_catalog.clone(), Arc::new(provider));
+
+    let local_dsn = std::env::var("PG_META_DSN")
+        .unwrap_or("postgresql://postgres:123456@192.168.0.227:25432/kokedb".to_string());
+    let catalog_list = Arc::new(
+        PostgreSQLMetaCatalogProviderList::new(&local_dsn)
+            .await
+            .unwrap(),
+    );
+
+    for catalog_name in catalog_list.catalog_names() {
+        let catalog = catalog_list.catalog(&catalog_name).unwrap();
+        let catalog_adapter = DataFusionCatalogAdapter::new(catalog, catalog_name.clone());
+        catalogs.insert(catalog_name.clone(), Arc::new(catalog_adapter));
+    }
 
     let options = CatalogManagerOptions {
         catalogs,
