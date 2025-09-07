@@ -1,7 +1,6 @@
 use either::Either;
 use kokedb_common::spec;
 use kokedb_common::spec::QueryPlan;
-use kokedb_sql_parser::ast::dsn::DatabaseJdbcDsn;
 use kokedb_sql_parser::ast::expression::{BooleanLiteral, Expr, OrderDirection};
 use kokedb_sql_parser::ast::identifier::{Ident, ObjectName};
 use kokedb_sql_parser::ast::keywords::{Cascade, Global, Overwrite, Restrict, Temp, Temporary};

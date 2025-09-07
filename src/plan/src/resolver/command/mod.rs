@@ -9,6 +9,7 @@ use crate::error::{PlanError, PlanResult};
 use crate::extension::logical::CatalogCommandNode;
 use crate::resolver::state::PlanResolverState;
 use crate::resolver::PlanResolver;
+use kokedb_catalog::provider::RemoteDatabaseType;
 
 mod catalog;
 mod explain;
@@ -171,7 +172,7 @@ impl PlanResolver<'_> {
                 definition,
             } => {
                 let options = kokedb_catalog::provider::CreateCatalogOptions {
-                    db_type: kokedb_catalog::provider::RemoteDatabaseType::PostgreSQL,
+                    db_type: RemoteDatabaseType::PostgreSQL,
                     dsn: definition.dsn,
                     comment: definition.comment,
                     properties: definition.properties,
