@@ -1,4 +1,5 @@
 pub mod data_type;
+pub mod dsn;
 pub mod expression;
 pub mod identifier;
 pub mod keywords;

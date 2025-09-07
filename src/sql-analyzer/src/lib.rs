@@ -1,4 +1,5 @@
 pub mod data_type;
+pub mod dsn;
 pub mod error;
 pub mod expression;
 pub mod literal;

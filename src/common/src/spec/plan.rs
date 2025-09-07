@@ -799,7 +799,9 @@ pub struct DatabaseDefinition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogDefinition {
-    pub options: Vec<(String, String)>,
+    pub dsn: String,
+    pub comment: Option<String>,
+    pub properties: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

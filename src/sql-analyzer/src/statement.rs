@@ -1,6 +1,7 @@
 use either::Either;
 use kokedb_common::spec;
 use kokedb_common::spec::QueryPlan;
+use kokedb_sql_parser::ast::dsn::DatabaseJdbcDsn;
 use kokedb_sql_parser::ast::expression::{BooleanLiteral, Expr, OrderDirection};
 use kokedb_sql_parser::ast::identifier::{Ident, ObjectName};
 use kokedb_sql_parser::ast::keywords::{Cascade, Global, Overwrite, Restrict, Temp, Temporary};
@@ -11,15 +12,16 @@ use kokedb_sql_parser::ast::statement::{
     AlterTableOperation, AlterViewOperation, AnalyzeTableModifier, AsQueryClause, Assignment,
     AssignmentList, ColumnAlteration, ColumnAlterationList, ColumnAlterationOption,
     ColumnDefinition, ColumnDefinitionList, ColumnDefinitionOption, ColumnPosition,
-    ColumnTypeDefinition, CommentValue, CreateDatabaseClause, CreateTableClause, CreateViewClause,
-    DeleteTableAlias, DescribeItem, ExplainFormat, FileFormat, InsertDirectoryDestination,
-    MergeSource, PartitionClause, PartitionColumn, PartitionColumnList, PartitionValue,
-    PartitionValueList, PropertyKey, PropertyKeyValue, PropertyList, PropertyValue, RowFormat,
-    RowFormatDelimitedClause, SetClause, SortColumn, SortColumnList, Statement, UpdateTableAlias,
-    ViewColumn,
+    ColumnTypeDefinition, CommentValue, CreateCatalogClause, CreateDatabaseClause,
+    CreateTableClause, CreateViewClause, DeleteTableAlias, DescribeItem, ExplainFormat, FileFormat,
+    InsertDirectoryDestination, MergeSource, PartitionClause, PartitionColumn, PartitionColumnList,
+    PartitionValue, PartitionValueList, PropertyKey, PropertyKeyValue, PropertyList, PropertyValue,
+    RowFormat, RowFormatDelimitedClause, SetClause, SortColumn, SortColumnList, Statement,
+    UpdateTableAlias, ViewColumn,
 };
 
 use crate::data_type::from_ast_data_type;
+use crate::dsn::from_ast_database_jdbc_dsn;
 use crate::error::{SqlError, SqlResult};
 use crate::expression::{from_ast_expression, from_ast_identifier_list, from_ast_object_name};
 use crate::query::from_ast_query;
@@ -54,6 +56,34 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
                 .map(|(_, pattern)| from_ast_string(pattern))
                 .transpose()?;
             let node = spec::CommandNode::ListCatalogs { pattern };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::CreateCatalog {
+            create: _,
+            catalog: _,
+            name,
+            dsn,
+            clauses,
+        } => {
+            let name = match name {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let CreateCatalogClauses {
+                comment,
+                properties,
+            } = clauses.try_into()?;
+            let node = spec::CommandNode::CreateCatalog {
+                catalog: name.into(),
+                definition: spec::CatalogDefinition {
+                    dsn: from_ast_database_jdbc_dsn(dsn)?,
+                    comment: comment.map(from_ast_string).transpose()?,
+                    properties: properties
+                        .map(from_ast_property_list)
+                        .transpose()?
+                        .unwrap_or_default(),
+                },
+            };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
         Statement::UseDatabase {
@@ -1287,6 +1317,38 @@ impl TryFrom<Vec<CreateDatabaseClause>> for CreateDatabaseClauses {
                 }
             }
         }
+        Ok(output)
+    }
+}
+
+#[derive(Default)]
+struct CreateCatalogClauses {
+    comment: Option<StringLiteral>,
+    properties: Option<PropertyList>,
+}
+
+impl TryFrom<Vec<CreateCatalogClause>> for CreateCatalogClauses {
+    type Error = SqlError;
+
+    fn try_from(value: Vec<CreateCatalogClause>) -> Result<Self, Self::Error> {
+        let mut output = Self::default();
+        for clause in value {
+            match clause {
+                CreateCatalogClause::Comment(_, x) => {
+                    if output.comment.replace(x).is_some() {
+                        return Err(SqlError::invalid("duplicate COMMENT clause"));
+                    }
+                }
+                CreateCatalogClause::Properties(_, _, property_list) => {
+                    if output.properties.replace(property_list).is_some() {
+                        return Err(SqlError::invalid(
+                            "duplicate PROPERTIES or DBPROPERTIES clause",
+                        ));
+                    }
+                }
+            }
+        }
+
         Ok(output)
     }
 }

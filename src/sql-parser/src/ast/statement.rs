@@ -3,6 +3,7 @@ use kokedb_sql_macro::TreeParser;
 
 use crate::ast;
 use crate::ast::data_type::DataType;
+use crate::ast::dsn::DatabaseJdbcDsn;
 use crate::ast::expression::{BooleanLiteral, Expr, OrderDirection};
 use crate::ast::identifier::{table_ident, Ident, ObjectName};
 use crate::ast::keywords::{
@@ -42,6 +43,13 @@ pub enum Statement {
         show: Show,
         catalogs: Catalogs,
         like: Option<(Option<Like>, StringLiteral)>,
+    },
+    CreateCatalog {
+        create: Create,
+        catalog: Catalog,
+        name: Either<Ident, StringLiteral>,
+        dsn: DatabaseJdbcDsn,
+        clauses: Vec<CreateCatalogClause>,
     },
     UseDatabase {
         r#use: Use,
@@ -494,6 +502,12 @@ pub struct PartitionValueList {
 pub enum CreateDatabaseClause {
     Comment(Comment, StringLiteral),
     Location(Location, StringLiteral),
+    Properties(With, Either<Dbproperties, Properties>, PropertyList),
+}
+
+#[derive(Debug, Clone, TreeParser)]
+pub enum CreateCatalogClause {
+    Comment(Comment, StringLiteral),
     Properties(With, Either<Dbproperties, Properties>, PropertyList),
 }
 

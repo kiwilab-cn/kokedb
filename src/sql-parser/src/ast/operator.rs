@@ -74,6 +74,9 @@ macro_rules! define_operator {
     };
 }
 
+define_operator!(At, [At]);
+define_operator!(SchemaSeparator, [Colon, Slash, Slash]);
+define_operator!(QuestionMark, [QuestionMark]);
 define_operator!(LeftParenthesis, [LeftParenthesis]);
 define_operator!(RightParenthesis, [RightParenthesis]);
 define_operator!(LeftBracket, [LeftBracket]);
