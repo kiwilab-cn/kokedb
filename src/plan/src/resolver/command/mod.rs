@@ -166,7 +166,19 @@ impl PlanResolver<'_> {
             CommandNode::ListCatalogs { pattern } => {
                 self.resolve_catalog_command(CatalogCommand::ListCatalogs { pattern })
             }
-            CommandNode::CreateCatalog { .. } => Err(PlanError::todo("create catalog")),
+            CommandNode::CreateCatalog {
+                catalog,
+                definition,
+            } => {
+                let options = kokedb_catalog::provider::CreateCatalogOptions {
+                    db_type: kokedb_catalog::provider::RemoteDatabaseType::PostgreSQL,
+                    dsn: definition.dsn,
+                    comment: definition.comment,
+                    properties: definition.properties,
+                };
+                let catalog = String::from(catalog);
+                self.resolve_catalog_command(CatalogCommand::CreateCatalog { catalog, options })
+            }
             CommandNode::CreateDatabase {
                 database,
                 definition,

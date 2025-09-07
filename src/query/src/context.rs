@@ -28,7 +28,7 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
     catalogs.insert(default_catalog.clone(), Arc::new(provider));
 
     let local_dsn = std::env::var("PG_META_DSN")
-        .unwrap_or("postgresql://postgres:123456@192.168.0.227:25432/kokedb".to_string());
+        .unwrap_or("postgresql://postgres:123456@127.0.0.1:25432/kokedb".to_string());
     let catalog_list = Arc::new(
         PostgreSQLMetaCatalogProviderList::new(&local_dsn)
             .await
