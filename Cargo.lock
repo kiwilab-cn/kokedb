@@ -2951,7 +2951,6 @@ dependencies = [
  "kokedb-catalog",
  "kokedb-common",
  "kokedb-sql-analyzer",
- "sqlx",
  "tokio",
 ]
 
