@@ -16,7 +16,6 @@ datafusion-functions.workspace = true
 datafusion-functions-nested.workspace = true
 datafusion-physical-expr.workspace = true
 
-sqlx.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
