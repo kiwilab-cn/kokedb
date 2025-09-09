@@ -119,7 +119,7 @@ impl CatalogManagerState {
             [] => Err(CatalogError::InvalidArgument(
                 "empty database reference".to_string(),
             )),
-            [head, tail @ ..] if self.list_catalog().contains_key(head.as_ref()) => {
+            [head, tail @ ..] if self.catalog_names().contains(&Arc::from(head.as_ref())) => {
                 let catalog = head.as_ref().into();
                 let database = tail.try_into()?;
                 Ok((catalog, database))
@@ -141,7 +141,7 @@ impl CatalogManagerState {
                 let catalog = self.default_catalog.clone();
                 Ok((catalog, None))
             }
-            [name] if self.list_catalog().contains_key(name.as_ref()) => {
+            [name] if self.catalog_names().contains(&Arc::from(name.as_ref())) => {
                 let catalog = name.as_ref().into();
                 Ok((catalog, None))
             }
@@ -182,7 +182,7 @@ impl CatalogManagerState {
         }
     }
 
-    pub fn list_catalog(&self) -> HashMap<Arc<str>, Arc<dyn CatalogProvider>> {
+    pub fn _list_catalog(&self) -> HashMap<Arc<str>, Arc<dyn CatalogProvider>> {
         let mut catalogs: HashMap<String, Arc<dyn CatalogProvider>> = self
             .catalogs
             .iter()
@@ -196,18 +196,41 @@ impl CatalogManagerState {
                 catalogs.insert(catalog_name.clone(), Arc::new(catalog_adapter));
             }
         }
+
         catalogs
             .into_iter()
             .map(|(k, v)| (Arc::from(k), v))
             .collect()
     }
 
-    pub fn get_catalog(&self, catalog: &str) -> CatalogResult<Arc<dyn CatalogProvider>> {
-        let catalogs = self.list_catalog();
-        catalogs
-            .get(catalog)
+    pub fn catalog_names(&self) -> Vec<Arc<str>> {
+        let mut catalog_names = self
+            .catalogs
+            .iter()
+            .map(|(k, _)| k.to_string())
+            .collect::<Vec<String>>();
+
+        let dynamic_catalog_names = self.dynamic_catalog_list.catalog_names();
+
+        catalog_names.extend(dynamic_catalog_names);
+        catalog_names
+            .iter()
+            .map(|x| Arc::from(x.as_str()))
+            .collect::<Vec<Arc<str>>>()
+    }
+
+    pub fn get_catalog(&self, catalog_name: &str) -> CatalogResult<Arc<dyn CatalogProvider>> {
+        let catalog_list = self.dynamic_catalog_list.clone();
+
+        if let Some(catalog) = catalog_list.catalog(catalog_name) {
+            let catalog_adapter = DataFusionCatalogAdapter::new(catalog, catalog_name.to_string());
+            return Ok(Arc::new(catalog_adapter));
+        }
+
+        self.catalogs
+            .get(catalog_name)
             .map(Arc::clone)
-            .ok_or_else(|| CatalogError::NotFound("catalog", catalog.to_string()))
+            .ok_or_else(|| CatalogError::NotFound("catalog", catalog_name.to_string()))
     }
 }
 

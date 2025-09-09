@@ -30,7 +30,7 @@ pub fn from_ast_database_jdbc_dsn(dsn: DatabaseJdbcDsn) -> SqlResult<String> {
         dsn.schema.value,
         dsn.credentials.username.value,
         passwd,
-        host.concat(),
+        host.join("."),
         port,
         dsn.database.value,
     );

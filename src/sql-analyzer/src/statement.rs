@@ -61,6 +61,7 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             create: _,
             catalog: _,
             name,
+            using: _,
             dsn,
             clauses,
         } => {

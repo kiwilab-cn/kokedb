@@ -63,6 +63,22 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(catalogs)
     }
 
+    async fn get_catalog(&self, name: &str) -> Result<CatalogInfo> {
+        let query = format!("SELECT name, dsn FROM system.catalog where name='{}'", name);
+
+        let row = sqlx::query(&query)
+            .fetch_one(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let catalog_info = CatalogInfo {
+            name: row.get("name"),
+            dsn: row.get("dsn"),
+        };
+
+        Ok(catalog_info)
+    }
+
     pub fn create_catalog(&self, catalog: &str, dsn: &str) -> Result<bool> {
         let insert_sql = "INSERT INTO system.catalog (name, dsn) VALUES ($1, $2)";
 
@@ -110,20 +126,15 @@ impl CatalogProviderList for PostgreSQLMetaCatalogProviderList {
     fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                if let Ok(catalogs) = self.load_catalog_info().await {
-                    for catalog_info in catalogs {
-                        if catalog_info.name == name {
-                            if let Ok(remote_pool) = PgPool::connect(&catalog_info.dsn).await {
-                                let provider: Arc<dyn CatalogProvider> = Arc::new(
-                                    PostgreSQLCatalogProvider::new(catalog_info, remote_pool),
-                                );
+                if let Ok(catalog_info) = self.get_catalog(name).await {
+                    if let Ok(remote_pool) = PgPool::connect(&catalog_info.dsn).await {
+                        let provider: Arc<dyn CatalogProvider> =
+                            Arc::new(PostgreSQLCatalogProvider::new(catalog_info, remote_pool));
 
-                                self.catalog_cache
-                                    .insert(name.to_string(), Arc::clone(&provider));
+                        self.catalog_cache
+                            .insert(name.to_string(), Arc::clone(&provider));
 
-                                return Some(provider);
-                            }
-                        }
+                        return Some(provider);
                     }
                 }
                 None

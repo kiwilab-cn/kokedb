@@ -48,6 +48,7 @@ pub enum Statement {
         create: Create,
         catalog: Catalog,
         name: Either<Ident, StringLiteral>,
+        using: Using,
         dsn: DatabaseJdbcDsn,
         clauses: Vec<CreateCatalogClause>,
     },

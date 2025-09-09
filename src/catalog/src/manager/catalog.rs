@@ -15,7 +15,7 @@ impl CatalogManager {
     pub fn set_default_catalog(&self, catalog: impl Into<Arc<str>>) -> CatalogResult<()> {
         let catalog = catalog.into();
         let mut state = self.state()?;
-        if !state.list_catalog().contains_key(&catalog) {
+        if !state.catalog_names().contains(&catalog) {
             return Err(CatalogError::NotFound("catalog", catalog.to_string()));
         }
         state.default_catalog = catalog;
@@ -25,8 +25,8 @@ impl CatalogManager {
     pub fn list_catalogs(&self, pattern: Option<&str>) -> CatalogResult<Vec<Arc<str>>> {
         Ok(self
             .state()?
-            .list_catalog()
-            .keys()
+            .catalog_names()
+            .iter()
             .filter(|name| match_pattern(name.as_ref(), pattern))
             .cloned()
             .collect::<Vec<_>>())
