@@ -2995,7 +2995,14 @@ dependencies = [
 name = "kokedb-task-manager"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "chrono",
+ "dashmap",
+ "datafusion",
+ "serde",
  "thiserror 2.0.16",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

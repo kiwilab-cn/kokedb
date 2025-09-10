@@ -5,9 +5,15 @@ edition.workspace = true
 
 [dependencies]
 
+datafusion.workspace = true
 
 thiserror.workspace = true
-async_trait.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde.workspace = true
 
 
 [lints]

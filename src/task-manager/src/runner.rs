@@ -1,3 +1,5 @@
+use crate::{error::TaskError, task::DataSourceConfig};
+
 #[async_trait::async_trait]
 pub trait TaskExecutor: Send + Sync {
     async fn execute(
@@ -15,6 +17,9 @@ impl TaskExecutor for DataSyncExecutor {
         &self,
         config: DataSourceConfig,
         progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
-    ) -> impl Future<Output = Result<(), TaskError>> {
+    ) -> Result<(), TaskError> {
+        println!("=====>{:?}", config);
+
+        Ok(())
     }
 }

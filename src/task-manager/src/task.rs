@@ -1,5 +1,23 @@
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+use chrono::{DateTime, Utc};
+use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
+use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
+use uuid::Uuid;
+
+use crate::{
+    error::TaskError,
+    runner::{DataSyncExecutor, TaskExecutor},
+};
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TaskPriority {
     Low = 0,
     Normal = 1,
@@ -24,6 +42,46 @@ impl Default for TaskManagerConfig {
             enable_metrics: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum TaskStatus {
+    Pending,
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TaskType {
+    DataSync,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DataSourceConfig {
+    pub dsn: String,
+    pub table_catalog: String,
+    pub batch_size: Option<usize>,
+    pub timeout_seconds: Option<u64>,
+    pub priority: TaskPriority,
+    pub additional_params: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskMetadata {
+    pub id: String,
+    pub task_type: TaskType,
+    pub status: TaskStatus,
+    pub config: DataSourceConfig,
+    pub created_at: DateTime<Utc>,
+    pub queued_at: Option<DateTime<Utc>>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub error_message: Option<String>,
+    pub progress: f32, // 0.0 - 1.0
+    pub retry_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -454,4 +512,11 @@ impl TaskManager {
 
         println!("Task manager shutdown complete");
     }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[tokio::test]
+    async fn test_task_manager_run_task() {}
 }
