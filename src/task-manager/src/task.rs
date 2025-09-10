@@ -9,7 +9,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
+use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
 use crate::{
@@ -107,7 +107,6 @@ pub struct TaskManager {
     config: TaskManagerConfig,
     tasks: Arc<DashMap<String, TaskMetadata>>,
     task_handles: Arc<DashMap<String, JoinHandle<()>>>,
-    runtime_handle: Handle,
     executor: Arc<dyn TaskExecutor>,
     active_tasks: Arc<AtomicUsize>,
     task_queue_tx: mpsc::UnboundedSender<TaskWrapper>,
@@ -118,8 +117,6 @@ pub struct TaskManager {
 
 impl TaskManager {
     pub async fn new(config: TaskManagerConfig) -> Result<Self, TaskError> {
-        let runtime_handle = Handle::current();
-
         let (task_queue_tx, task_queue_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
@@ -127,7 +124,6 @@ impl TaskManager {
             config: config.clone(),
             tasks: Arc::new(DashMap::new()),
             task_handles: Arc::new(DashMap::new()),
-            runtime_handle,
             executor: Arc::new(DataSyncExecutor),
             active_tasks: Arc::new(AtomicUsize::new(0)),
             task_queue_tx,
@@ -540,7 +536,8 @@ mod tests {
 
         task_manager
             .wait_for_all_tasks(Some(tokio::time::Duration::from_secs(3)))
-            .await;
+            .await
+            .unwrap();
 
         let runtime_info = task_manager.get_runtime_info();
         println!("--->>Runtime Info: {:?}", runtime_info);
