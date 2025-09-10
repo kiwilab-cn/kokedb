@@ -18,7 +18,7 @@ impl TaskExecutor for DataSyncExecutor {
         config: DataSourceConfig,
         progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError> {
-        println!("=====>{:?}", config);
+        println!("RUNNING..... =====>{:?}", config);
 
         Ok(())
     }

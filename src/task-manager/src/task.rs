@@ -516,7 +516,36 @@ impl TaskManager {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use crate::task::{DataSourceConfig, TaskManager, TaskManagerConfig};
 
     #[tokio::test]
-    async fn test_task_manager_run_task() {}
+    async fn test_task_manager_run_task() {
+        let config = TaskManagerConfig::default();
+        let task_manager = TaskManager::new(config).await.unwrap();
+        let runtime_info = task_manager.get_runtime_info();
+        println!("Runtime Info: {:?}", runtime_info);
+
+        let task_config = DataSourceConfig {
+            dsn: "postgresql://root:12345@192.168.0.227:25432/postgres".to_string(),
+            table_catalog: "kokedb.public.demo".to_string(),
+            batch_size: Some(1000),
+            timeout_seconds: Some(100),
+            priority: crate::task::TaskPriority::Critical,
+            additional_params: HashMap::new(),
+        };
+
+        task_manager.add_task(task_config).await.unwrap();
+
+        task_manager
+            .wait_for_all_tasks(Some(tokio::time::Duration::from_secs(3)))
+            .await;
+
+        let runtime_info = task_manager.get_runtime_info();
+        println!("--->>Runtime Info: {:?}", runtime_info);
+
+        let ret = task_manager.list_tasks().await;
+        println!("=====ret===>>{:?}", ret);
+    }
 }
