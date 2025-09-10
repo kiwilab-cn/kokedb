@@ -1,0 +1,14 @@
+[package]
+name = "kokedb-task-manager"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+
+
+thiserror.workspace = true
+async_trait.workspace = true
+
+
+[lints]
+workspace = true

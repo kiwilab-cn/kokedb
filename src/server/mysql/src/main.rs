@@ -12,9 +12,6 @@ use kokedb_query::{binder::*, context::create_session_context};
 use opensrv_mysql::*;
 use tokio::{io::AsyncWrite, net::TcpListener};
 
-use datafusion::arrow::array::Array;
-use datafusion::arrow::datatypes::DataType;
-
 use crate::{column::compact_columns, row::compact_rows};
 
 #[derive(Clone)]
