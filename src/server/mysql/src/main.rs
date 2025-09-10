@@ -1,3 +1,6 @@
+pub mod column;
+pub mod row;
+
 use std::{io, sync::Arc};
 
 use datafusion::{
@@ -11,7 +14,8 @@ use tokio::{io::AsyncWrite, net::TcpListener};
 
 use datafusion::arrow::array::Array;
 use datafusion::arrow::datatypes::DataType;
-use opensrv_mysql::{Column, ColumnType};
+
+use crate::{column::compact_columns, row::compact_rows};
 
 #[derive(Clone)]
 struct Backend {
@@ -59,69 +63,14 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
         let batches = collect(batches).await?;
 
         let schema = batches[0].schema();
-        let columns: Vec<Column> = schema
-            .fields()
-            .iter()
-            .map(|field| Column {
-                table: String::new(),
-                column: field.name().to_string(),
-                coltype: match field.data_type() {
-                    DataType::Int8 | DataType::Int16 | DataType::Int32 => {
-                        ColumnType::MYSQL_TYPE_LONG
-                    }
-                    DataType::Int64 => ColumnType::MYSQL_TYPE_LONGLONG,
-                    DataType::Float32 | DataType::Float64 => ColumnType::MYSQL_TYPE_DOUBLE,
-                    DataType::Utf8 => ColumnType::MYSQL_TYPE_STRING,
-                    _ => ColumnType::MYSQL_TYPE_STRING, // 默认使用字符串类型
-                },
-                colflags: if field.is_nullable() {
-                    ColumnFlags::empty()
-                } else {
-                    ColumnFlags::NOT_NULL_FLAG
-                },
-            })
-            .collect();
+
+        let columns = compact_columns(schema)?;
 
         let mut writer = results.start(&columns).await?;
 
-        for batch in batches {
-            for row_idx in 0..batch.num_rows() {
-                let row: Vec<_> = (0..batch.num_columns())
-                    .map(|col_idx| {
-                        let col = batch.column(col_idx);
-                        match col.data_type() {
-                            DataType::Int32 => col
-                                .as_any()
-                                .downcast_ref::<datafusion::arrow::array::Int32Array>()
-                                .map(|arr| arr.value(row_idx).to_string())
-                                .unwrap_or_default(),
-                            DataType::Int64 => col
-                                .as_any()
-                                .downcast_ref::<datafusion::arrow::array::Int64Array>()
-                                .map(|arr| arr.value(row_idx).to_string())
-                                .unwrap_or_default(),
-                            DataType::Float64 => col
-                                .as_any()
-                                .downcast_ref::<datafusion::arrow::array::Float64Array>()
-                                .map(|arr| arr.value(row_idx).to_string())
-                                .unwrap_or_default(),
-                            DataType::Utf8 => col
-                                .as_any()
-                                .downcast_ref::<datafusion::arrow::array::StringArray>()
-                                .map(|arr| arr.value(row_idx).to_string())
-                                .unwrap_or_default(),
-                            DataType::LargeUtf8 => col
-                                .as_any()
-                                .downcast_ref::<datafusion::arrow::array::LargeStringArray>()
-                                .map(|arr| arr.value(row_idx).to_string())
-                                .unwrap_or_default(),
-                            _ => String::new(),
-                        }
-                    })
-                    .collect();
-
-                writer.write_row(row.iter().map(|s| s.as_str())).await?;
-            }
+        let rows: Vec<Vec<String>> = compact_rows(batches)?;
+        for row in rows {
+            writer.write_row(row.iter().map(|s| s.as_str())).await?;
         }
 
         writer.finish_with_info("Query executed successfully").await
