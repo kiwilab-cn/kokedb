@@ -62,7 +62,8 @@ pub enum TaskType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataSourceConfig {
     pub dsn: String,
-    pub table_catalog: String,
+    pub source_table: String,
+    pub local_table: String,
     pub batch_size: Option<usize>,
     pub timeout_seconds: Option<u64>,
     pub priority: TaskPriority,
@@ -525,7 +526,8 @@ mod tests {
 
         let task_config = DataSourceConfig {
             dsn: "postgresql://root:12345@192.168.0.227:25432/postgres".to_string(),
-            table_catalog: "kokedb.public.demo".to_string(),
+            source_table: "public.demo".to_string(),
+            local_table: "kokedb.public.demo".to_string(),
             batch_size: Some(1000),
             timeout_seconds: Some(100),
             priority: crate::task::TaskPriority::Critical,
