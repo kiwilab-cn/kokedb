@@ -7,6 +7,7 @@ use datafusion::{
     physical_plan::{common::collect, execute_stream},
     prelude::SessionContext,
 };
+use kokedb_common::opentelemetry::init_logger;
 use kokedb_plan::{config::PlanConfig, resolve_and_execute_plan};
 use kokedb_query::{binder::*, context::create_session_context};
 use opensrv_mysql::*;
@@ -76,6 +77,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_logger()?;
     let listener = TcpListener::bind("0.0.0.0:3306").await.unwrap();
     let ctx = create_session_context().await.unwrap();
 

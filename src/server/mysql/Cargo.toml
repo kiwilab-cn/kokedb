@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+kokedb-common.workspace = true
 kokedb-query.workspace = true
 kokedb-plan.workspace = true
 
@@ -12,6 +13,8 @@ tokio.workspace = true
 async-trait.workspace = true
 
 datafusion.workspace = true
+log.workspace = true
+
 
 [[bin]]
 path = "src/main.rs"

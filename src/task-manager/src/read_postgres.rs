@@ -1,16 +1,15 @@
 use anyhow::{Context, Result};
 use arrow::{array::*, datatypes::*, record_batch::RecordBatch};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use datafusion::parquet;
-use futures_util::StreamExt;
-use parquet::{
-    arrow::{ArrowWriter, ProjectionMask},
-    file::properties::WriterProperties,
-};
+use futures_util::TryStreamExt;
+use kokedb_common::file::ensure_dir_exists;
+use log::warn;
+use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use rust_decimal::Decimal;
 use sqlx::{
     postgres::{PgPool, PgPoolOptions, PgRow},
-    Column, Row, TypeInfo,
+    Column, Row, TypeInfo, ValueRef,
 };
 use std::fs::File;
 use std::sync::Arc;
@@ -27,8 +26,7 @@ impl PostgresToParquetConverter {
         let pool = PgPoolOptions::new()
             .max_connections(10)
             .connect(dsn)
-            .await
-            .context("Failed to connect to PostgreSQL")?;
+            .await?;
 
         Ok(Self {
             pool,
@@ -47,6 +45,36 @@ impl PostgresToParquetConverter {
         self
     }
 
+    async fn write_parquet_file(
+        &self,
+        output_path: &str,
+        pg_rows: &Vec<PgRow>,
+        props: &WriterProperties,
+        arrow_schema: Arc<Schema>,
+    ) -> Result<()> {
+        if pg_rows.is_empty() {
+            warn!("Found empty pg_rows when write parquet.");
+            return Ok(());
+        }
+
+        let _ = ensure_dir_exists(output_path)?;
+        let random_parquet_name = Uuid::new_v4().to_string()[..8].to_string();
+        let parquet_file_name = format!("{}/{}.parquet", output_path, random_parquet_name);
+
+        let file = File::create(parquet_file_name)?;
+        let batch = self.convert_rows_to_record_batch(pg_rows).await?;
+        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props.clone()))
+            .context("Failed to create Parquet writer")?;
+
+        writer
+            .write(&batch)
+            .context("Failed to write batch to Parquet")?;
+
+        writer.close().context("Failed to close Parquet writer")?;
+
+        Ok(())
+    }
+
     pub async fn convert_table_to_parquet(
         &self,
         table_name: &str,
@@ -55,63 +83,33 @@ impl PostgresToParquetConverter {
         let schema = self.get_table_schema(table_name).await?;
         let arrow_schema = Arc::new(schema);
 
-        let file = File::create(output_path).context("Failed to create output file")?;
-
         let props = WriterProperties::builder()
             .set_compression(self.compression)
             .set_max_row_group_size(self.batch_size)
             .build();
 
-        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props))
-            .context("Failed to create Parquet writer")?;
+        let query = format!("SELECT * FROM {}", table_name);
 
+        let mut rows = sqlx::query(&query).fetch(&self.pool);
+        let mut pg_rows = Vec::with_capacity(self.batch_size);
 
-        
+        while let Some(row) = rows.try_next().await? {
+            pg_rows.push(row);
+            if pg_rows.len() >= self.batch_size {
+                self.write_parquet_file(output_path, &pg_rows, &props, arrow_schema.clone())
+                    .await?;
 
-        let total_count = self.get_table_count(table_name).await?;
-        println!("Total rows to process: {}", total_count);
-
-        let mut offset = 0;
-        let mut processed = 0;
-
-        while offset < total_count {
-            let batch = self.read_batch(table_name, offset, self.batch_size).await?;
-
-            if batch.num_rows() == 0 {
-                break;
+                pg_rows.clear();
             }
-
-            writer
-                .write(&batch)
-                .context("Failed to write batch to Parquet")?;
-
-            processed += batch.num_rows();
-            offset += self.batch_size;
-
-            println!(
-                "Processed: {}/{} rows ({:.1}%)",
-                processed,
-                total_count,
-                (processed as f64 / total_count as f64) * 100.0
-            );
         }
 
-        writer.close().context("Failed to close Parquet writer")?;
+        if !pg_rows.is_empty() {
+            self.write_parquet_file(output_path, &pg_rows, &props, arrow_schema.clone())
+                .await?;
+        }
 
-        println!(
-            "Successfully converted {} rows to {}",
-            processed, output_path
-        );
+        println!("Successfully converted to {}", output_path);
         Ok(())
-    }
-
-    async fn get_table_count(&self, table_name: &str) -> Result<i64> {
-        let query = format!("SELECT COUNT(*) as count FROM {}", table_name);
-        let row: (i64,) = sqlx::query_as(&query)
-            .fetch_one(&self.pool)
-            .await
-            .context("Failed to get table count")?;
-        Ok(row.0)
     }
 
     async fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
@@ -205,29 +203,7 @@ impl PostgresToParquetConverter {
         }
     }
 
-    async fn read_batch(&self, table_name: &str, offset: i64, limit: usize) -> Result<RecordBatch> {
-        let query = format!(
-            "SELECT * FROM {} ORDER BY 1 OFFSET {} LIMIT {}",
-            table_name, offset, limit
-        );
-
-        let mut rows = sqlx::query(&query).fetch(&self.pool);
-        let mut pg_rows = Vec::new();
-
-        while let Some(row) = rows.next().await {
-            let row = row.context("Failed to fetch row")?;
-            pg_rows.push(row);
-        }
-
-        if pg_rows.is_empty() {
-            let schema = self.get_table_schema(table_name).await?;
-            return RecordBatch::new_empty(Arc::new(schema));
-        }
-
-        self.convert_rows_to_record_batch(pg_rows).await
-    }
-
-    async fn convert_rows_to_record_batch(&self, rows: Vec<PgRow>) -> Result<RecordBatch> {
+    async fn convert_rows_to_record_batch(&self, rows: &Vec<PgRow>) -> Result<RecordBatch> {
         if rows.is_empty() {
             return Err(anyhow::anyhow!("No rows to convert"));
         }
@@ -360,7 +336,7 @@ impl PostgresToParquetConverter {
                     .map(|row| {
                         row.try_get::<Option<NaiveDateTime>, _>(column_name)
                             .unwrap_or(None)
-                            .map(|dt| dt.timestamp_micros())
+                            .map(|dt| dt.and_utc().timestamp_micros())
                     })
                     .collect();
                 let array = TimestampMicrosecondArray::from(values);
@@ -402,13 +378,17 @@ impl PostgresToParquetConverter {
                 Ok((Arc::new(array), field))
             }
             "BYTEA" => {
-                let values: Vec<Option<Vec<u8>>> = rows
+                let byte_vecs: Vec<Option<Vec<u8>>> = rows
                     .iter()
                     .map(|row| {
                         row.try_get::<Option<Vec<u8>>, _>(column_name)
                             .unwrap_or(None)
                     })
                     .collect();
+
+                let values: Vec<Option<&[u8]>> =
+                    byte_vecs.iter().map(|opt_vec| opt_vec.as_deref()).collect();
+
                 let array = BinaryArray::from_opt_vec(values);
                 let field = Field::new(column_name, DataType::Binary, true);
                 Ok((Arc::new(array), field))
@@ -416,15 +396,30 @@ impl PostgresToParquetConverter {
             _ => {
                 let values: Vec<Option<String>> = rows
                     .iter()
-                    .map(|row| match row.try_get_raw(column_name) {
-                        Ok(raw_value) => {
-                            if raw_value.is_null() {
+                    .map(|row| {
+                        if let Ok(string_val) = row.try_get::<Option<String>, _>(column_name) {
+                            string_val
+                        } else if let Ok(raw_value) = row.try_get_raw(column_name) {
+                            if raw_value.type_info().name() == "NULL" {
                                 None
                             } else {
-                                Some(format!("{:?}", raw_value))
+                                if let Ok(val) = row.try_get::<Option<i64>, _>(column_name) {
+                                    val.map(|v| v.to_string())
+                                } else if let Ok(val) = row.try_get::<Option<f64>, _>(column_name) {
+                                    val.map(|v| v.to_string())
+                                } else if let Ok(val) = row.try_get::<Option<bool>, _>(column_name)
+                                {
+                                    val.map(|v| v.to_string())
+                                } else {
+                                    Some(format!(
+                                        "Unsupported type: {}",
+                                        raw_value.type_info().name()
+                                    ))
+                                }
                             }
+                        } else {
+                            None
                         }
-                        Err(_) => None,
                     })
                     .collect();
                 let array = StringArray::from(values);
@@ -448,13 +443,15 @@ pub async fn convert_postgres_to_parquet(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     #[tokio::test]
     async fn test_conversion() -> Result<()> {
-        let dsn = "postgresql://username:password@localhost:5432/testdb";
-        let table_name = "public.demo";
-        let output_path = "output.parquet";
+        let dsn = "postgresql://postgres:123456@192.168.0.227:25432/postgres";
+        let table_name = "public.test1";
+        let output_path = "/tmp/test1/";
 
         convert_postgres_to_parquet(dsn, table_name, output_path).await?;
 

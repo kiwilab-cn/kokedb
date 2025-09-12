@@ -1,7 +1,9 @@
 pub mod datetime;
 pub mod debug;
 pub mod error;
+pub mod file;
 pub mod object;
+pub mod opentelemetry;
 pub mod spec;
 pub mod string;
 pub mod tests;
