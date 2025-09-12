@@ -104,6 +104,7 @@ struct TaskWrapper {
     retry_count: usize,
 }
 
+#[derive(Clone)]
 pub struct TaskManager {
     config: TaskManagerConfig,
     tasks: Arc<DashMap<String, TaskMetadata>>,
@@ -117,7 +118,12 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
-    pub async fn new(config: TaskManagerConfig) -> Result<Self, TaskError> {
+    pub async fn new() -> Result<Self, TaskError> {
+        let config: TaskManagerConfig = TaskManagerConfig::default();
+        Self::new_with(config).await
+    }
+
+    pub async fn new_with(config: TaskManagerConfig) -> Result<Self, TaskError> {
         let (task_queue_tx, task_queue_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
@@ -520,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn test_task_manager_run_task() {
         let config = TaskManagerConfig::default();
-        let task_manager = TaskManager::new(config).await.unwrap();
+        let task_manager = TaskManager::new_with(config).await.unwrap();
         let runtime_info = task_manager.get_runtime_info();
         println!("Runtime Info: {:?}", runtime_info);
 

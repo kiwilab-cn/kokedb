@@ -3014,6 +3014,7 @@ dependencies = [
  "kokedb-common",
  "kokedb-plan",
  "kokedb-query",
+ "kokedb-task-manager",
  "log",
  "opensrv-mysql",
  "tokio",

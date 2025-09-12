@@ -10,18 +10,19 @@ use datafusion::{
 use kokedb_common::opentelemetry::init_logger;
 use kokedb_plan::{config::PlanConfig, resolve_and_execute_plan};
 use kokedb_query::{binder::*, context::create_session_context};
+use kokedb_task_manager::task::TaskManager;
 use opensrv_mysql::*;
 use tokio::{io::AsyncWrite, net::TcpListener};
 
 use crate::{column::compact_columns, row::compact_rows};
 
 #[derive(Clone)]
-struct Backend {
+struct CoreContex {
     ctx: Arc<SessionContext>,
 }
 
 #[async_trait::async_trait]
-impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
+impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
     type Error = io::Error;
 
     async fn on_prepare<'a>(
@@ -85,6 +86,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (stream, _) = listener.accept().await?;
         let (r, w) = stream.into_split();
         let ctx = Arc::new(ctx.clone());
-        tokio::spawn(async move { AsyncMysqlIntermediary::run_on(Backend { ctx }, r, w).await });
+        tokio::spawn(async move { AsyncMysqlIntermediary::run_on(CoreContex { ctx }, r, w).await });
     }
 }

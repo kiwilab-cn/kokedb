@@ -7,6 +7,7 @@ edition.workspace = true
 kokedb-common.workspace = true
 kokedb-query.workspace = true
 kokedb-plan.workspace = true
+kokedb-task-manager.workspace = true
 
 opensrv-mysql = "0.7.0"
 tokio.workspace = true
