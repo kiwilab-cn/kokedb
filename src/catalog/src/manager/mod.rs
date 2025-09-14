@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use datafusion::catalog::CatalogProviderList;
 use kokedb_common_datafusion::extension::SessionExtension;
+use kokedb_task_manager::task::TaskManager;
 
 use crate::datafusion_catalog::{DataFusionCatalogAdapter, PostgreSQLMetaCatalogProviderList};
 use crate::error::{CatalogError, CatalogResult};
@@ -25,6 +26,7 @@ pub struct CatalogManager {
 pub(super) struct CatalogManagerState {
     pub(super) catalogs: HashMap<Arc<str>, Arc<dyn CatalogProvider>>,
     pub(super) dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
+    pub(super) catalog_task_manager: Arc<TaskManager>,
     pub(super) default_catalog: Arc<str>,
     pub(super) default_database: Namespace,
     pub(super) global_temporary_database: Namespace,
@@ -33,6 +35,7 @@ pub(super) struct CatalogManagerState {
 pub struct CatalogManagerOptions {
     pub catalogs: HashMap<String, Arc<dyn CatalogProvider>>,
     pub dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
+    pub catalog_task_manager: Arc<TaskManager>,
     pub default_catalog: String,
     pub default_database: Vec<String>,
     pub global_temporary_database: Vec<String>,
@@ -60,6 +63,7 @@ impl CatalogManager {
             default_database: options.default_database.try_into()?,
             global_temporary_database: options.global_temporary_database.try_into()?,
             dynamic_catalog_list: options.dynamic_catalog_list,
+            catalog_task_manager: options.catalog_task_manager.clone(),
         };
         Ok(CatalogManager {
             state: Arc::new(Mutex::new(state)),

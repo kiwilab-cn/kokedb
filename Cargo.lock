@@ -2928,7 +2928,9 @@ dependencies = [
  "datafusion-expr",
  "kokedb-common",
  "kokedb-common-datafusion",
+ "kokedb-task-manager",
  "lazy_static",
+ "log",
  "regex",
  "serde",
  "serde_arrow",
@@ -3109,6 +3111,7 @@ dependencies = [
  "kokedb-catalog",
  "kokedb-common",
  "kokedb-sql-analyzer",
+ "kokedb-task-manager",
  "tokio",
 ]
 

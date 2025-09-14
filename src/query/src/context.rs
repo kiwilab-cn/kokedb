@@ -10,6 +10,7 @@ use kokedb_catalog::{
     manager::{CatalogManager, CatalogManagerOptions},
     provider::CatalogProvider,
 };
+use kokedb_task_manager::task::{TaskManager, TaskManagerConfig};
 
 use crate::mem_catalog::MemoryCatalogProvider;
 
@@ -35,12 +36,16 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
             .unwrap(),
     );
 
+    let task_manager_config = TaskManagerConfig::default();
+    let task_manager = TaskManager::new().await?;
+
     let options = CatalogManagerOptions {
         catalogs,
         default_catalog: default_catalog.clone(),
         default_database: default_database.clone(),
         global_temporary_database: default_global_database,
         dynamic_catalog_list: catalog_list.clone(),
+        catalog_task_manager: Arc::new(task_manager),
     };
 
     let catalog_manager = CatalogManager::new(options)

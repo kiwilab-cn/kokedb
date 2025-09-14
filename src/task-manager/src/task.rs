@@ -8,6 +8,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use kokedb_common::env::get_env_as;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
@@ -60,14 +61,36 @@ pub enum TaskType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DataSourceConfig {
+pub struct CacheTableTaskConfig {
     pub dsn: String,
     pub source_table: String,
     pub local_table: String,
+    pub catalog_name: String,
     pub batch_size: Option<usize>,
-    pub timeout_seconds: Option<u64>,
+    pub timeout_seconds: Option<usize>,
     pub priority: TaskPriority,
     pub additional_params: HashMap<String, String>,
+}
+
+impl CacheTableTaskConfig {
+    //TODO: change to &str
+    pub fn new(
+        catalog_name: String,
+        dsn: String,
+        source_table: String,
+        local_table: String,
+    ) -> Self {
+        Self {
+            catalog_name,
+            dsn,
+            source_table,
+            local_table,
+            batch_size: Some(get_env_as("KOKEDB_READ_TABLE_BATCH_SIZE", 300000usize)),
+            timeout_seconds: Some(get_env_as("KOKEDB_READ_TABLE_TIMEOUT", 3600usize)),
+            priority: TaskPriority::Critical,
+            additional_params: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +98,7 @@ pub struct TaskMetadata {
     pub id: String,
     pub task_type: TaskType,
     pub status: TaskStatus,
-    pub config: DataSourceConfig,
+    pub config: CacheTableTaskConfig,
     pub created_at: DateTime<Utc>,
     pub queued_at: Option<DateTime<Utc>>,
     pub started_at: Option<DateTime<Utc>>,
@@ -99,9 +122,7 @@ pub struct TaskManagerStats {
 
 struct TaskWrapper {
     id: String,
-    config: DataSourceConfig,
-    created_at: DateTime<Utc>,
-    retry_count: usize,
+    config: CacheTableTaskConfig,
 }
 
 #[derive(Clone)]
@@ -236,7 +257,7 @@ impl TaskManager {
         self
     }
 
-    pub async fn add_task(&self, mut config: DataSourceConfig) -> Result<String, TaskError> {
+    pub async fn add_task(&self, config: CacheTableTaskConfig) -> Result<String, TaskError> {
         if self.is_shutting_down.load(Ordering::Relaxed) {
             return Err(TaskError::ExecutionFailed(
                 "Task manager is shutting down".to_string(),
@@ -266,8 +287,6 @@ impl TaskManager {
         let task_wrapper = TaskWrapper {
             id: task_id.clone(),
             config,
-            created_at: Utc::now(),
-            retry_count: 0,
         };
 
         if let Err(_) = self.task_queue_tx.send(task_wrapper) {
@@ -284,7 +303,7 @@ impl TaskManager {
 
     pub async fn add_tasks_batch(
         &self,
-        configs: Vec<DataSourceConfig>,
+        configs: Vec<CacheTableTaskConfig>,
     ) -> Result<Vec<String>, TaskError> {
         let mut task_ids = Vec::with_capacity(configs.len());
 
@@ -521,7 +540,7 @@ impl TaskManager {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::task::{DataSourceConfig, TaskManager, TaskManagerConfig};
+    use crate::task::{CacheTableTaskConfig, TaskManager, TaskManagerConfig};
 
     #[tokio::test]
     async fn test_task_manager_run_task() {
@@ -530,7 +549,7 @@ mod tests {
         let runtime_info = task_manager.get_runtime_info();
         println!("Runtime Info: {:?}", runtime_info);
 
-        let task_config = DataSourceConfig {
+        let task_config = CacheTableTaskConfig {
             dsn: "postgresql://root:12345@192.168.0.227:25432/postgres".to_string(),
             source_table: "public.demo".to_string(),
             local_table: "kokedb.public.demo".to_string(),

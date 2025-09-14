@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum TaskError {
+    #[error("Interval error: {0}")]
+    Internal(String),
     #[error("Task not found: {0}")]
     TaskNotFound(String),
     #[error("Task execution failed: {0}")]

@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+use kokedb_task_manager::error::TaskError;
+use kokedb_task_manager::postgres_table_analyzer::get_postgres_top_tables;
+use kokedb_task_manager::task::CacheTableTaskConfig;
+use log::warn;
+
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::provider::CreateCatalogOptions;
@@ -52,6 +57,44 @@ impl CatalogManager {
                 ret.err()
             )));
         }
+
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let dsn = dsn.clone();
+                let postgres_topk_table = get_postgres_top_tables(&dsn, 10).await?;
+
+                for table in postgres_topk_table {
+                    let config = CacheTableTaskConfig::new(
+                        catalog.to_string(),
+                        dsn.clone(),
+                        table.clone(),
+                        table.clone(),
+                    );
+
+                    let state = self
+                        .state()
+                        .map_err(|e| TaskError::Internal(e.to_string()))?;
+
+                    let ret = state.catalog_task_manager.add_task(config).await;
+                    if ret.is_err() {
+                        warn!(
+                            "Failed to add cache dsn: {} table: {} task with error: {:?}",
+                            &dsn,
+                            &table,
+                            ret.err()
+                        );
+                    }
+                }
+                Ok(())
+            })
+        })
+        .map_err(|e: TaskError| {
+            CatalogError::External(format!(
+                "Failed to create cache table task withe error:{}",
+                e
+            ))
+        })?;
+
         Ok(catalog)
     }
 }

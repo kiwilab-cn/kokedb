@@ -7,6 +7,7 @@ edition.workspace = true
 kokedb-common.workspace = true
 kokedb-sql-analyzer.workspace = true
 kokedb-catalog.workspace = true
+kokedb-task-manager.workspace = true
 
 datafusion.workspace = true
 datafusion-common.workspace = true
