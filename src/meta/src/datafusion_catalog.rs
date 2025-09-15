@@ -37,11 +37,96 @@ impl PostgreSQLMetaCatalogProviderList {
         let local_pool = PgPool::connect(&local_dsn)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
+        Self::init_db(&local_pool).await?;
         Ok(Self {
             local_pool,
             catalog_cache: DashMap::new(),
         })
+    }
+
+    async fn init_db(local_pool: &PgPool) -> Result<()> {
+        let init_meta_tables_sql =
+            r#"
+            -- 创建 schema
+            CREATE SCHEMA IF NOT EXISTS system;
+
+            -- 创建触发器函数
+            CREATE OR REPLACE FUNCTION system.update_modified_column()
+            RETURNS TRIGGER AS $$
+            BEGIN
+                NEW.updated_at = CURRENT_TIMESTAMP;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+
+            -- 创建 table_arrow_schema 表
+            CREATE TABLE IF NOT EXISTS system.table_arrow_schema (
+                id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
+                catalog_name varchar,
+                schema_name varchar,
+                created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
+                updated_at timestamp DEFAULT CURRENT_TIMESTAMP,
+                table_name varchar,
+                local_path varchar,
+                table_stats jsonb,
+                description text,
+                partition_info jsonb,
+                arrow_schema bytea,
+                CONSTRAINT unique_catalog_schema_table UNIQUE (catalog_name, schema_name, table_name)
+            );
+
+            -- 创建 table_arrow_schema 表的触发器
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_trigger
+                    WHERE tgname = 'update_table_arrow_schema_modtime'
+                    AND tgrelid = 'system.table_arrow_schema'::regclass
+                ) THEN
+                    CREATE TRIGGER update_table_arrow_schema_modtime
+                    BEFORE UPDATE ON system.table_arrow_schema
+                    FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
+                END IF;
+            END $$;
+
+            -- 创建索引
+            CREATE INDEX IF NOT EXISTS idx_table_arrow_schema_partition_info_gin
+            ON system.table_arrow_schema USING gin (partition_info);
+
+            CREATE INDEX IF NOT EXISTS idx_table_arrow_schema_table_stats_gin
+            ON system.table_arrow_schema USING gin (table_stats);
+
+            -- 创建 catalog 表
+            CREATE TABLE IF NOT EXISTS system.catalog (
+                id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
+                name varchar,
+                dsn varchar,
+                created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
+                updated_at timestamp DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- 创建触发器
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_trigger
+                    WHERE tgname = 'update_catalog_modtime'
+                    AND tgrelid = 'system.catalog'::regclass
+                ) THEN
+                    CREATE TRIGGER update_catalog_modtime
+                    BEFORE UPDATE ON system.catalog
+                    FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
+                END IF;
+            END $$;
+            "#.to_string();
+        sqlx::query(&init_meta_tables_sql)
+            .execute(local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(())
     }
 
     async fn load_catalog_info(&self) -> Result<Vec<CatalogInfo>> {
