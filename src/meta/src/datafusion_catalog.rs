@@ -46,10 +46,10 @@ impl PostgreSQLMetaCatalogProviderList {
     pub async fn init_db(&self) -> Result<()> {
         let init_meta_tables_sql =
             r#"
-            -- 创建 schema
+            -- create schema
             CREATE SCHEMA IF NOT EXISTS system;
 
-            -- 创建触发器函数
+            -- create trigger function.
             CREATE OR REPLACE FUNCTION system.update_modified_column()
             RETURNS TRIGGER AS $$
             BEGIN
@@ -58,7 +58,7 @@ impl PostgreSQLMetaCatalogProviderList {
             END;
             $$ LANGUAGE plpgsql;
 
-            -- 创建 table_arrow_schema 表
+            -- create table table_arrow_schema
             CREATE TABLE IF NOT EXISTS system.table_arrow_schema (
                 id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
                 catalog_name varchar,
@@ -74,7 +74,7 @@ impl PostgreSQLMetaCatalogProviderList {
                 CONSTRAINT unique_catalog_schema_table UNIQUE (catalog_name, schema_name, table_name)
             );
 
-            -- 创建 table_arrow_schema 表的触发器
+            -- create table_arrow_schema table's trigger
             DO $$
             BEGIN
                 IF NOT EXISTS (
@@ -89,14 +89,14 @@ impl PostgreSQLMetaCatalogProviderList {
                 END IF;
             END $$;
 
-            -- 创建索引
+            -- create index
             CREATE INDEX IF NOT EXISTS idx_table_arrow_schema_partition_info_gin
             ON system.table_arrow_schema USING gin (partition_info);
 
             CREATE INDEX IF NOT EXISTS idx_table_arrow_schema_table_stats_gin
             ON system.table_arrow_schema USING gin (table_stats);
 
-            -- 创建 catalog 表
+            -- create table catalog
             CREATE TABLE IF NOT EXISTS system.catalog (
                 id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
                 name varchar,
@@ -105,7 +105,7 @@ impl PostgreSQLMetaCatalogProviderList {
                 updated_at timestamp DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- 创建触发器
+            -- create catalog table trigger
             DO $$
             BEGIN
                 IF NOT EXISTS (
