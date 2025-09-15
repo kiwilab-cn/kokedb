@@ -37,14 +37,13 @@ impl PostgreSQLMetaCatalogProviderList {
         let local_pool = PgPool::connect(&local_dsn)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Self::init_db(&local_pool).await?;
         Ok(Self {
             local_pool,
             catalog_cache: DashMap::new(),
         })
     }
 
-    async fn init_db(local_pool: &PgPool) -> Result<()> {
+    pub async fn init_db(&self) -> Result<()> {
         let init_meta_tables_sql =
             r#"
             -- 创建 schema
@@ -122,7 +121,7 @@ impl PostgreSQLMetaCatalogProviderList {
             END $$;
             "#.to_string();
         sqlx::query(&init_meta_tables_sql)
-            .execute(local_pool)
+            .execute(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 

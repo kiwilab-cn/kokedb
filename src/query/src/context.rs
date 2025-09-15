@@ -10,7 +10,7 @@ use kokedb_catalog::{
     provider::CatalogProvider,
 };
 use kokedb_meta::datafusion_catalog::PostgreSQLMetaCatalogProviderList;
-use kokedb_task_manager::task::{TaskManager, TaskManagerConfig};
+use kokedb_task_manager::task::TaskManager;
 
 use crate::mem_catalog::MemoryCatalogProvider;
 
@@ -29,8 +29,8 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
     catalogs.insert(default_catalog.clone(), Arc::new(provider));
 
     let catalog_list = Arc::new(PostgreSQLMetaCatalogProviderList::new().await.unwrap());
+    catalog_list.init_db().await?;
 
-    let task_manager_config = TaskManagerConfig::default();
     let task_manager = TaskManager::new().await?;
 
     let options = CatalogManagerOptions {
