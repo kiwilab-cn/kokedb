@@ -3,9 +3,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use datafusion::catalog::CatalogProviderList;
 use kokedb_common_datafusion::extension::SessionExtension;
+use kokedb_meta::datafusion_catalog::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::task::TaskManager;
 
-use crate::datafusion_catalog::{DataFusionCatalogAdapter, PostgreSQLMetaCatalogProviderList};
+use crate::datafusion_catalog_adapter::DataFusionCatalogAdapter;
 use crate::error::{CatalogError, CatalogResult};
 use crate::provider::{CatalogProvider, Namespace};
 use crate::temp_view::TemporaryViewManager;

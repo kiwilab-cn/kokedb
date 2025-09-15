@@ -1,3 +1,4 @@
+use kokedb_meta::{datafusion_catalog::PostgreSQLMetaCatalogProviderList, schema::SchemaTable};
 use log::info;
 
 use crate::{
@@ -24,13 +25,18 @@ impl TaskExecutor for DataSyncExecutor {
     ) -> Result<(), TaskError> {
         info!("Received task: {:?}", &config);
         let dsn = config.dsn;
-        let catalog = config.catalog_name;
-        let source_table = config.source_table;
-        let local_table = config.local_table;
+        let catalog = &config.catalog_name;
+        let source_table = &config.source_table;
+        let local_table = &config.local_table;
 
         let local_path = format!("{}/{}/{}", "/tmp", catalog, local_table.replace('.', "/"));
 
-        convert_postgres_to_parquet(&dsn, &source_table, &local_path)
+        let (schema, table) = local_table
+            .split_once('.')
+            .map(|(s, t)| (s.to_string(), t.to_string()))
+            .unwrap_or(("public".to_string(), local_table.to_string()));
+
+        let arrow_schema = convert_postgres_to_parquet(&dsn, &source_table, &local_path)
             .await
             .map_err(|x| {
                 TaskError::ExecutionFailed(format!(
@@ -39,6 +45,27 @@ impl TaskExecutor for DataSyncExecutor {
                 ))
             })?;
 
+        let postgresql_catalog = PostgreSQLMetaCatalogProviderList::new()
+            .await
+            .map_err(|_x| {
+                TaskError::DatabaseError("Failed to connect meta postgresql server.".to_string())
+            })?;
+
+        let schema_info = SchemaTable {
+            catalog: catalog.as_str(),
+            schema: schema.as_str(),
+            table: table.as_str(),
+            arrow_schema: arrow_schema.clone(),
+            local_path: &local_path,
+        };
+
+        postgresql_catalog
+            .save_table_schema(&schema_info)
+            .map_err(|_x| {
+                TaskError::DatabaseError(
+                    "Failed to save table schema to meta postgresql server.".to_string(),
+                )
+            })?;
         Ok(())
     }
 }

@@ -50,7 +50,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         results: QueryResultWriter<'a, W>,
     ) -> io::Result<()> {
         println!("sql: {}", sql);
-
+        // TODO: remove unwrap.
         let plan = plan_sql(sql).unwrap();
         let ctx = self.ctx.clone();
         let default_plan_config = PlanConfig::default();

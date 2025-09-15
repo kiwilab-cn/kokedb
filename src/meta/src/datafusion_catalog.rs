@@ -1,23 +1,21 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::error::{CatalogError, CatalogResult};
-use crate::provider::{
-    CreateDatabaseOptions, CreateTableOptions, CreateViewOptions, DatabaseStatus,
-    DropDatabaseOptions, DropTableOptions, DropViewOptions, Namespace, TableColumnStatus,
-    TableKind, TableStatus,
-};
+use arrow_schema::Schema;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use datafusion::arrow::array::ArrowNativeTypeOp;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList, SchemaProvider};
-use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
+
 use sqlx::{PgPool, Row};
+
+use crate::schema::{binary_to_schema, schema_to_binary, SchemaTable};
 
 #[derive(Debug, Clone)]
 pub struct CatalogInfo {
@@ -31,9 +29,12 @@ pub struct PostgreSQLMetaCatalogProviderList {
     catalog_cache: DashMap<String, Arc<dyn CatalogProvider>>,
 }
 
+// TODO: maybe support sqlite/tikv, so read/write data must change to interface.
 impl PostgreSQLMetaCatalogProviderList {
-    pub async fn new(local_dsn: &str) -> Result<Self> {
-        let local_pool = PgPool::connect(local_dsn)
+    pub async fn new() -> Result<Self> {
+        let local_dsn = std::env::var("PG_META_DSN")
+            .unwrap_or("postgresql://postgres:123456@127.0.0.1:25432/kokedb".to_string());
+        let local_pool = PgPool::connect(&local_dsn)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
@@ -95,6 +96,66 @@ impl PostgreSQLMetaCatalogProviderList {
 
         Ok(ret.rows_affected().is_eq(1))
     }
+
+    pub fn save_table_schema(&self, schema_info: &SchemaTable) -> Result<bool> {
+        let catalog = schema_info.catalog;
+        let schema = schema_info.schema;
+        let table = schema_info.table;
+        let arrow_schema = schema_info.arrow_schema.clone();
+        let arrow_schema_bin =
+            schema_to_binary(arrow_schema).map_err(|x| DataFusionError::External(Box::new(x)))?;
+        let local_path = schema_info.local_path;
+
+        let upsert_sql = r#"
+                    INSERT INTO system.table_arrow_schema (
+                        catalog_name, 
+                        schema_name, 
+                        table_name, 
+                        arrow_schema, 
+                        local_path
+                    ) VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (catalog_name, schema_name, table_name) 
+                    DO UPDATE SET 
+                        arrow_schema = EXCLUDED.arrow_schema,
+                        local_path = EXCLUDED.local_path
+                    RETURNING id
+                    "#;
+        let _ret = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                sqlx::query(upsert_sql)
+                    .bind(catalog)
+                    .bind(schema)
+                    .bind(table)
+                    .bind(arrow_schema_bin)
+                    .bind(local_path)
+                    .execute(&self.local_pool)
+                    .await
+            })
+        })
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(true)
+    }
+
+    pub fn get_table_schema(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Arc<Schema>> {
+        let sql = format!("select arrow_schema from system.table_arrow_schema where catalog_name = '{}' and schema_name='{}' and table_name='{}'", catalog, schema, table);
+
+        let row = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { sqlx::query(&sql).fetch_one(&self.local_pool).await })
+        })
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let arrow_schema: Vec<u8> = row.get("arrow_schema");
+        let schema = binary_to_schema(&arrow_schema)?;
+
+        Ok(schema)
+    }
 }
 
 impl CatalogProviderList for PostgreSQLMetaCatalogProviderList {
@@ -148,200 +209,6 @@ pub struct PostgreSQLCatalogProvider {
     catalog_info: CatalogInfo,
     remote_pool: PgPool,
     schema_cache: DashMap<String, Arc<dyn SchemaProvider>>,
-}
-
-pub struct DataFusionCatalogAdapter {
-    inner: Arc<dyn CatalogProvider>,
-    catalog_name: String,
-}
-
-impl DataFusionCatalogAdapter {
-    pub fn new(inner: Arc<dyn CatalogProvider>, catalog_name: String) -> Self {
-        Self {
-            inner,
-            catalog_name,
-        }
-    }
-
-    pub fn inner(&self) -> &dyn CatalogProvider {
-        self.inner.as_ref()
-    }
-
-    fn create_database_status(&self, schema_name: &str) -> DatabaseStatus {
-        DatabaseStatus {
-            catalog: self.catalog_name.clone(),
-            database: vec![schema_name.to_string()],
-            comment: None,
-            location: None,
-            properties: vec![],
-        }
-    }
-
-    async fn create_table_status(
-        &self,
-        schema_name: &str,
-        table_name: &str,
-        table_provider: Arc<dyn datafusion::datasource::TableProvider>,
-    ) -> TableStatus {
-        let schema = table_provider.schema();
-        let columns = schema
-            .fields()
-            .iter()
-            .map(|field| TableColumnStatus {
-                name: field.name().clone(),
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-                comment: None,
-                default: None,
-                generated_always_as: None,
-                is_partition: false,
-                is_bucket: false,
-                is_cluster: false,
-            })
-            .collect();
-
-        TableStatus {
-            name: table_name.to_string(),
-            kind: TableKind::Table {
-                catalog: self.catalog_name.clone(),
-                database: vec![schema_name.to_string()],
-                columns,
-                comment: None,
-                constraints: vec![],
-                location: None,
-                format: "unknown".to_string(),
-                partition_by: vec![],
-                sort_by: vec![],
-                bucket_by: None,
-                options: vec![],
-                properties: vec![],
-            },
-        }
-    }
-}
-
-#[async_trait]
-impl crate::provider::CatalogProvider for DataFusionCatalogAdapter {
-    fn get_name(&self) -> &str {
-        &self.catalog_name
-    }
-
-    async fn create_database(
-        &self,
-        _database: &Namespace,
-        _options: CreateDatabaseOptions,
-    ) -> CatalogResult<DatabaseStatus> {
-        Err(CatalogError::NotSupported("create_database".to_string()))
-    }
-
-    async fn drop_database(
-        &self,
-        _database: &Namespace,
-        _options: DropDatabaseOptions,
-    ) -> CatalogResult<()> {
-        Err(CatalogError::NotSupported("drop_database".to_string()))
-    }
-
-    async fn get_database(&self, database: &Namespace) -> CatalogResult<DatabaseStatus> {
-        let schema_name = &database.head;
-
-        if self.inner.schema(schema_name).is_some() {
-            Ok(self.create_database_status(schema_name))
-        } else {
-            Err(CatalogError::NotFound("database", database.to_string()))
-        }
-    }
-
-    async fn list_databases(
-        &self,
-        _prefix: Option<&Namespace>,
-    ) -> CatalogResult<Vec<DatabaseStatus>> {
-        let schema_names = self.inner.schema_names();
-        let databases = schema_names
-            .into_iter()
-            .map(|name| self.create_database_status(&name))
-            .collect();
-
-        Ok(databases)
-    }
-
-    async fn create_table(
-        &self,
-        _database: &Namespace,
-        _table: &str,
-        _options: CreateTableOptions,
-    ) -> CatalogResult<TableStatus> {
-        Err(CatalogError::NotSupported("create_table".to_string()))
-    }
-
-    async fn get_table(&self, database: &Namespace, table: &str) -> CatalogResult<TableStatus> {
-        let schema_name = &database.head;
-
-        if let Some(schema) = self.inner.schema(schema_name) {
-            if let Some(table_provider) = schema
-                .table(table)
-                .await
-                .map_err(|e| CatalogError::Internal(format!("DataFusion error: {}", e)))?
-            {
-                Ok(self
-                    .create_table_status(schema_name, table, table_provider)
-                    .await)
-            } else {
-                Err(CatalogError::NotFound("table", table.to_string()))
-            }
-        } else {
-            Err(CatalogError::NotFound("database", schema_name.to_string()))
-        }
-    }
-
-    async fn list_tables(&self, database: &Namespace) -> CatalogResult<Vec<TableStatus>> {
-        let schema_name = &database.head;
-
-        if let Some(schema) = self.inner.schema(schema_name) {
-            let table_names = schema.table_names();
-            let mut tables = Vec::new();
-
-            for table_name in table_names {
-                if let Ok(table_status) = self.get_table(database, &table_name).await {
-                    tables.push(table_status);
-                }
-            }
-
-            Ok(tables)
-        } else {
-            Err(CatalogError::NotFound("database", schema_name.to_string()))
-        }
-    }
-
-    async fn drop_table(
-        &self,
-        _database: &Namespace,
-        _table: &str,
-        _options: DropTableOptions,
-    ) -> CatalogResult<()> {
-        Err(CatalogError::NotSupported("drop_table".to_string()))
-    }
-
-    async fn create_view(
-        &self,
-        _: &Namespace,
-        _: &str,
-        _: CreateViewOptions,
-    ) -> CatalogResult<TableStatus> {
-        Err(CatalogError::NotSupported("create_view".to_string()))
-    }
-
-    async fn get_view(&self, _: &Namespace, _: &str) -> CatalogResult<TableStatus> {
-        Err(CatalogError::NotSupported("get_view".to_string()))
-    }
-
-    async fn list_views(&self, _: &Namespace) -> CatalogResult<Vec<TableStatus>> {
-        Ok(vec![])
-    }
-
-    async fn drop_view(&self, _: &Namespace, _: &str, _: DropViewOptions) -> CatalogResult<()> {
-        Err(CatalogError::NotSupported("drop_view".to_string()))
-    }
 }
 
 impl PostgreSQLCatalogProvider {
@@ -460,22 +327,26 @@ impl PostgreSQLSchemaProvider {
 
     async fn create_listing_table(&self, table_name: &str) -> Result<Arc<dyn TableProvider>> {
         let table_path = format!(
-            "/tmp/{}/{}/{}",
+            "file:///tmp/{}/{}/{}",
             self.catalog_info.name, self.schema_name, table_name
         );
 
+        let meta_client = PostgreSQLMetaCatalogProviderList::new().await?;
+        let schema =
+            meta_client.get_table_schema(&self.catalog_info.name, &self.schema_name, table_name)?;
+
         let file_format: Arc<dyn datafusion::datasource::file_format::FileFormat> =
-            Arc::new(CsvFormat::default());
+            Arc::new(ParquetFormat::default());
 
         let listing_options = ListingOptions::new(file_format);
 
         let table_url = ListingTableUrl::parse(&table_path)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let config = ListingTableConfig::new(table_url).with_listing_options(listing_options);
-
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(listing_options)
+            .with_schema(schema);
         let listing_table = ListingTable::try_new(config)?;
-
         Ok(Arc::new(listing_table))
     }
 }
@@ -536,9 +407,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
     async fn test_catalog_provider_list() {
-        let local_dsn = "postgresql://postgres:123456@192.168.0.227:25432/kokedb";
-
-        match PostgreSQLMetaCatalogProviderList::new(local_dsn).await {
+        match PostgreSQLMetaCatalogProviderList::new().await {
             Ok(catalog_list) => {
                 let catalog_names = catalog_list.catalog_names();
                 println!("Found catalogs: {:?}", catalog_names);

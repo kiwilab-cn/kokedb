@@ -2921,6 +2921,7 @@ dependencies = [
 name = "kokedb-catalog"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema",
  "async-trait",
  "dashmap",
  "datafusion",
@@ -2928,6 +2929,7 @@ dependencies = [
  "datafusion-expr",
  "kokedb-common",
  "kokedb-common-datafusion",
+ "kokedb-meta",
  "kokedb-task-manager",
  "lazy_static",
  "log",
@@ -3005,6 +3007,20 @@ dependencies = [
  "syn 2.0.106",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "kokedb-meta"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-schema",
+ "async-trait",
+ "dashmap",
+ "datafusion",
+ "kokedb-common",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
@@ -3110,6 +3126,7 @@ dependencies = [
  "datafusion-physical-expr",
  "kokedb-catalog",
  "kokedb-common",
+ "kokedb-meta",
  "kokedb-sql-analyzer",
  "kokedb-task-manager",
  "tokio",
@@ -3164,6 +3181,7 @@ dependencies = [
  "datafusion",
  "futures-util",
  "kokedb-common",
+ "kokedb-meta",
  "log",
  "rust_decimal",
  "serde",

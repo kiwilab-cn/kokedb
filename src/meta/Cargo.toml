@@ -1,0 +1,18 @@
+[package]
+name = "kokedb-meta"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kokedb-common.workspace = true
+
+arrow.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+sqlx.workspace = true
+dashmap.workspace = true
+datafusion.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

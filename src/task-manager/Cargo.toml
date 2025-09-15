@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 kokedb-common.workspace = true
+kokedb-meta.workspace = true
 
 
 datafusion.workspace = true

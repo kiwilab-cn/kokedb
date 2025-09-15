@@ -6,10 +6,10 @@ use datafusion::{
 };
 use datafusion_common::plan_datafusion_err;
 use kokedb_catalog::{
-    datafusion_catalog::PostgreSQLMetaCatalogProviderList,
     manager::{CatalogManager, CatalogManagerOptions},
     provider::CatalogProvider,
 };
+use kokedb_meta::datafusion_catalog::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::task::{TaskManager, TaskManagerConfig};
 
 use crate::mem_catalog::MemoryCatalogProvider;
@@ -28,13 +28,7 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
     let mut catalogs: HashMap<String, Arc<dyn CatalogProvider>> = HashMap::new();
     catalogs.insert(default_catalog.clone(), Arc::new(provider));
 
-    let local_dsn = std::env::var("PG_META_DSN")
-        .unwrap_or("postgresql://postgres:123456@127.0.0.1:25432/kokedb".to_string());
-    let catalog_list = Arc::new(
-        PostgreSQLMetaCatalogProviderList::new(&local_dsn)
-            .await
-            .unwrap(),
-    );
+    let catalog_list = Arc::new(PostgreSQLMetaCatalogProviderList::new().await.unwrap());
 
     let task_manager_config = TaskManagerConfig::default();
     let task_manager = TaskManager::new().await?;

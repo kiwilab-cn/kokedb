@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use arrow::{array::*, datatypes::*, record_batch::RecordBatch};
+use arrow::{array::*, datatypes::*, ipc::writer, record_batch::RecordBatch};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use datafusion::parquet;
 use futures_util::TryStreamExt;
@@ -79,7 +79,7 @@ impl PostgresToParquetConverter {
         &self,
         table_name: &str,
         output_path: &str,
-    ) -> Result<()> {
+    ) -> Result<Arc<Schema>> {
         let schema = self.get_table_schema(table_name).await?;
         let arrow_schema = Arc::new(schema);
 
@@ -109,7 +109,7 @@ impl PostgresToParquetConverter {
         }
 
         println!("Successfully converted to {}", output_path);
-        Ok(())
+        Ok(arrow_schema)
     }
 
     async fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
@@ -224,6 +224,7 @@ impl PostgresToParquetConverter {
         }
 
         let schema = Arc::new(Schema::new(fields));
+
         RecordBatch::try_new(schema, arrow_arrays).context("Failed to create RecordBatch")
     }
 
@@ -432,13 +433,15 @@ impl PostgresToParquetConverter {
 
 pub async fn convert_postgres_to_parquet(
     dsn: &str,
-    table_name: &str,
+    remote_table: &str,
     output_path: &str,
-) -> Result<()> {
+) -> Result<Arc<Schema>> {
     let converter = PostgresToParquetConverter::new(dsn).await?;
-    converter
-        .convert_table_to_parquet(table_name, output_path)
-        .await
+    let schema = converter
+        .convert_table_to_parquet(remote_table, output_path)
+        .await?;
+
+    Ok(schema)
 }
 
 #[cfg(test)]

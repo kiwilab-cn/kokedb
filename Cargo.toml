@@ -18,6 +18,7 @@ members = [
   "src/python-udf",
   "src/data-source",
   "src/task-manager",
+  "src/meta"
 ]
 default-members = ["src/server/mysql"]
 
@@ -36,17 +37,17 @@ panic = "deny"
 
 [workspace.dependencies]
 kokedb-common = { path = "src/common" }
-kokedb-sql-macro = {path = "sql-macro"}
-kokedb-sql-parser = {path = "src/sql-parser"}
-kokedb-sql-analyzer = {path = "src/sql-analyzer"}
-kokedb-query = {path = "src/query"}
-kokedb-common-datafusion = {path = "src/common-datafusion"}
-kokedb-catalog = {path = "src/catalog"}
-kokedb-plan = {path = "src/plan"}
-kokedb-python-udf = {path = "src/python-udf"}
-kokedb-data-source = {path = "src/data-source"}
-kokedb-task-manager = {path = "src/task-manager"}
-
+kokedb-sql-macro = { path = "sql-macro" }
+kokedb-sql-parser = { path = "src/sql-parser" }
+kokedb-sql-analyzer = { path = "src/sql-analyzer" }
+kokedb-query = { path = "src/query" }
+kokedb-common-datafusion = { path = "src/common-datafusion" }
+kokedb-catalog = { path = "src/catalog" }
+kokedb-plan = { path = "src/plan" }
+kokedb-python-udf = { path = "src/python-udf" }
+kokedb-data-source = { path = "src/data-source" }
+kokedb-task-manager = { path = "src/task-manager" }
+kokedb-meta = { path = "src/meta" }
 
 
 

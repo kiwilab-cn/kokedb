@@ -10,11 +10,13 @@ workspace = true
 kokedb-common.workspace = true
 kokedb-common-datafusion.workspace = true
 kokedb-task-manager.workspace = true
+kokedb-meta.workspace = true
 
 dashmap.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 log.workspace = true
+arrow-schema.workspace = true
 
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
