@@ -70,15 +70,27 @@ cargo run
 
 ## Usage
 
-(Coming soon: Example usage snippets. Basic steps:)
+(Example usage snippets. Basic steps:)
 
-1. Start the KokeDB server.
-2. Connect via MySQL client and create remote table.
-3. Execute sql queries.
+1. Start postgresql meta server.  
+```sehll
+sudo docker run -d --name test-postgres -e POSTGRES_PASSWORD=123456 -e PGDATA=/var/lib/postgresql/data/pgdata  -v /opt/postgresql/data:/var/lib/postgresql/data -p 0.0.0.0:25432:5432 postgres:17.6
+```
 
-Example query:
+2. Start the KokeDB server.  
+```shell
+cargo run
+```
+3. Connect via MySQL client and create remote table.  
+```shell
+mysql -h 127.0.0.1 -P 3306 -u root
+```
+4. Execute sql queries.  
+
+Example query:  
 ```sql
-SELECT * FROM your_table WHERE condition;
+create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres;
+SELECT * FROM demo.public.table WHERE condition;
 ```
 
 ## Contributing
