@@ -21,7 +21,7 @@ impl TaskExecutor for DataSyncExecutor {
     async fn execute(
         &self,
         config: CacheTableTaskConfig,
-        progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
+        _progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError> {
         info!("Received task: {:?}", &config);
         let dsn = config.dsn;

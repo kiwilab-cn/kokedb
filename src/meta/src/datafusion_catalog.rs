@@ -44,12 +44,15 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     pub async fn init_db(&self) -> Result<()> {
-        let init_meta_tables_sql =
-            r#"
-            -- create schema
-            CREATE SCHEMA IF NOT EXISTS system;
+        let mut tx = self
+            .local_pool
+            .begin()
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-            -- create trigger function.
+        let sql_statements = vec![
+            "CREATE SCHEMA IF NOT EXISTS system;",
+            r#"
             CREATE OR REPLACE FUNCTION system.update_modified_column()
             RETURNS TRIGGER AS $$
             BEGIN
@@ -57,8 +60,8 @@ impl PostgreSQLMetaCatalogProviderList {
                 RETURN NEW;
             END;
             $$ LANGUAGE plpgsql;
-
-            -- create table table_arrow_schema
+            "#,
+            r#"
             CREATE TABLE IF NOT EXISTS system.table_arrow_schema (
                 id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
                 catalog_name varchar,
@@ -73,8 +76,27 @@ impl PostgreSQLMetaCatalogProviderList {
                 arrow_schema bytea,
                 CONSTRAINT unique_catalog_schema_table UNIQUE (catalog_name, schema_name, table_name)
             );
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS system.catalog (
+                id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
+                name varchar,
+                dsn varchar,
+                created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
+                updated_at timestamp DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+        ];
 
-            -- create table_arrow_schema table's trigger
+        for sql in sql_statements {
+            sqlx::query(sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
+
+        let trigger_statements = vec![
+            r#"
             DO $$
             BEGIN
                 IF NOT EXISTS (
@@ -88,24 +110,8 @@ impl PostgreSQLMetaCatalogProviderList {
                     FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
                 END IF;
             END $$;
-
-            -- create index
-            CREATE INDEX IF NOT EXISTS idx_table_arrow_schema_partition_info_gin
-            ON system.table_arrow_schema USING gin (partition_info);
-
-            CREATE INDEX IF NOT EXISTS idx_table_arrow_schema_table_stats_gin
-            ON system.table_arrow_schema USING gin (table_stats);
-
-            -- create table catalog
-            CREATE TABLE IF NOT EXISTS system.catalog (
-                id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
-                name varchar,
-                dsn varchar,
-                created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
-                updated_at timestamp DEFAULT CURRENT_TIMESTAMP
-            );
-
-            -- create catalog table trigger
+            "#,
+            r#"
             DO $$
             BEGIN
                 IF NOT EXISTS (
@@ -115,13 +121,39 @@ impl PostgreSQLMetaCatalogProviderList {
                     AND tgrelid = 'system.catalog'::regclass
                 ) THEN
                     CREATE TRIGGER update_catalog_modtime
-                    BEFORE UPDATE ON system.catalog
-                    FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
+                        BEFORE UPDATE ON system.catalog
+                FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
                 END IF;
             END $$;
-            "#.to_string();
-        sqlx::query(&init_meta_tables_sql)
-            .execute(&self.local_pool)
+            "#,
+        ];
+
+        for sql in trigger_statements {
+            sqlx::query(sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
+
+        let index_statements = vec![
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_table_arrow_schema_partition_info_gin
+            ON system.table_arrow_schema USING gin (partition_info);
+            "#,
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_table_arrow_schema_table_stats_gin
+            ON system.table_arrow_schema USING gin (table_stats);
+            "#,
+        ];
+
+        for sql in index_statements {
+            sqlx::query(sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
+
+        tx.commit()
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 

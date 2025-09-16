@@ -10,7 +10,6 @@ use datafusion::{
 use kokedb_common::opentelemetry::init_logger;
 use kokedb_plan::{config::PlanConfig, resolve_and_execute_plan};
 use kokedb_query::{binder::*, context::create_session_context};
-use kokedb_task_manager::task::TaskManager;
 use opensrv_mysql::*;
 use tokio::{io::AsyncWrite, net::TcpListener};
 

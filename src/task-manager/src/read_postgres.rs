@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use arrow::{array::*, datatypes::*, ipc::writer, record_batch::RecordBatch};
+use arrow::{array::*, datatypes::*, record_batch::RecordBatch};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use datafusion::parquet;
 use futures_util::TryStreamExt;
