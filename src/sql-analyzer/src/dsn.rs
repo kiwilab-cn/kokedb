@@ -6,6 +6,19 @@ use kokedb_sql_parser::{
 use crate::error::{SqlError, SqlResult};
 
 pub fn from_ast_database_jdbc_dsn(dsn: DatabaseJdbcDsn) -> SqlResult<String> {
+    let support_schema = vec![
+        "postgresql".to_string(),
+        "oracle".to_string(),
+        "mysql".to_string(),
+    ];
+    let schema = dsn.schema.value;
+    if !support_schema.contains(&schema) {
+        return Err(SqlError::NotSupported(format!(
+            "Unsupported schema:{}",
+            &schema
+        )));
+    }
+
     let passwd = if dsn.credentials.password.is_some() {
         dsn.credentials.password.unwrap().value
     } else {
@@ -27,7 +40,7 @@ pub fn from_ast_database_jdbc_dsn(dsn: DatabaseJdbcDsn) -> SqlResult<String> {
 
     let mut dsn_str = format!(
         "{}://{}:{}@{}:{}/{}",
-        dsn.schema.value,
+        &schema,
         dsn.credentials.username.value,
         passwd,
         host.join("."),

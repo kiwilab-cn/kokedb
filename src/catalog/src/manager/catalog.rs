@@ -45,11 +45,14 @@ impl CatalogManager {
         //TODO: check dsn is valid.
         let catalog = catalog.into();
         let dsn = options.dsn;
+        let comment = options.comment;
+        let properties = options.properties;
+        let db_type = options.db_type.to_string();
 
         let ret = self
             .state()?
             .dynamic_catalog_list
-            .create_catalog(&catalog, &dsn);
+            .create_catalog(&catalog, &dsn, &db_type, comment, properties);
 
         if ret.is_err() {
             return Err(CatalogError::External(format!(

@@ -171,9 +171,18 @@ impl PlanResolver<'_> {
                 catalog,
                 definition,
             } => {
+                let dsn = definition.dsn;
+                let db_type = if dsn.starts_with("postgresql://") {
+                    RemoteDatabaseType::PostgreSQL
+                } else if dsn.starts_with("mysql://") {
+                    RemoteDatabaseType::Mysql
+                } else {
+                    RemoteDatabaseType::Oracle
+                };
+
                 let options = kokedb_catalog::provider::CreateCatalogOptions {
-                    db_type: RemoteDatabaseType::PostgreSQL,
-                    dsn: definition.dsn,
+                    db_type,
+                    dsn,
                     comment: definition.comment,
                     properties: definition.properties,
                 };

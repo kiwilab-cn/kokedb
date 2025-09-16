@@ -82,6 +82,8 @@ impl PostgreSQLMetaCatalogProviderList {
                 id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
                 name varchar,
                 dsn varchar,
+                db_type varchar,
+                description varchar,
                 created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
                 updated_at timestamp DEFAULT CURRENT_TIMESTAMP
             );
@@ -196,14 +198,24 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(catalog_info)
     }
 
-    pub fn create_catalog(&self, catalog: &str, dsn: &str) -> Result<bool> {
-        let insert_sql = "INSERT INTO system.catalog (name, dsn) VALUES ($1, $2)";
+    pub fn create_catalog(
+        &self,
+        catalog: &str,
+        dsn: &str,
+        db_type: &str,
+        comment: Option<String>,
+        _properties: Vec<(String, String)>,
+    ) -> Result<bool> {
+        let insert_sql =
+            "INSERT INTO system.catalog (name, dsn, db_type, description) VALUES ($1, $2, $3, $4)";
 
         let ret = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 sqlx::query(insert_sql)
                     .bind(catalog)
                     .bind(dsn)
+                    .bind(db_type)
+                    .bind(comment)
                     .execute(&self.local_pool)
                     .await
             })
@@ -259,7 +271,11 @@ impl PostgreSQLMetaCatalogProviderList {
         schema: &str,
         table: &str,
     ) -> Result<Arc<Schema>> {
-        let sql = format!("select arrow_schema from system.table_arrow_schema where catalog_name = '{}' and schema_name='{}' and table_name='{}'", catalog, schema, table);
+        let sql = format!(
+            "select arrow_schema from system.table_arrow_schema \
+            where catalog_name = '{}' and schema_name='{}' and table_name='{}'",
+            catalog, schema, table
+        );
 
         let row = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()

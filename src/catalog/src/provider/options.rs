@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion_common::Column;
@@ -62,6 +62,17 @@ pub enum RemoteDatabaseType {
     PostgreSQL,
     Mysql,
     Oracle,
+}
+
+impl fmt::Display for RemoteDatabaseType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            RemoteDatabaseType::PostgreSQL => "postgresql",
+            RemoteDatabaseType::Mysql => "mysql",
+            RemoteDatabaseType::Oracle => "oracle",
+        };
+        write!(f, "{}", s)
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd)]
