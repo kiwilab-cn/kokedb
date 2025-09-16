@@ -11,6 +11,7 @@ use kokedb_catalog::{
 };
 use kokedb_meta::datafusion_catalog::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::task::TaskManager;
+use tokio_cron_scheduler::JobScheduler;
 
 use crate::mem_catalog::MemoryCatalogProvider;
 
@@ -32,6 +33,8 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
     catalog_list.init_db().await?;
 
     let task_manager = TaskManager::new().await?;
+    let task_scheduler = JobScheduler::new().await?;
+    task_scheduler.start().await?;
 
     let options = CatalogManagerOptions {
         catalogs,
@@ -40,6 +43,7 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
         global_temporary_database: default_global_database,
         dynamic_catalog_list: catalog_list.clone(),
         catalog_task_manager: Arc::new(task_manager),
+        catalog_task_scheduler: Arc::new(task_scheduler),
     };
 
     let catalog_manager = CatalogManager::new(options)

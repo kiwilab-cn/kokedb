@@ -3,7 +3,8 @@ use std::sync::Arc;
 use kokedb_task_manager::error::TaskError;
 use kokedb_task_manager::postgres_table_analyzer::get_postgres_top_tables;
 use kokedb_task_manager::task::CacheTableTaskConfig;
-use log::warn;
+use log::{info, warn};
+use tokio_cron_scheduler::Job;
 
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
@@ -99,5 +100,56 @@ impl CatalogManager {
         })?;
 
         Ok(catalog)
+    }
+
+    pub async fn create_catalog_scheduler_job(
+        &self,
+        dsn: &str,
+        catalog: &str,
+    ) -> CatalogResult<uuid::Uuid> {
+        const SCHEDULE_INTERVAL_MINUTES: u32 = 60; // 1 hour
+        let cron_expr = format!("0 */{} * * *", SCHEDULE_INTERVAL_MINUTES);
+
+        let dsn = dsn.to_string();
+        let catalog = catalog.to_string();
+
+        let task_handler = move |_uuid, _l| {
+            let dsn = dsn.clone();
+            let catalog = catalog.clone();
+
+            Box::pin(async move {
+                if let Err(e) = Self::execute_catalog_sync_task(&dsn, &catalog).await {
+                    error!(
+                        "Catalog sync task failed for catalog '{}' with DSN '{}': {}",
+                        catalog, dsn, e
+                    );
+                }
+            })
+        };
+
+        let job = Job::new_async(cron_expr, task_handler).map_err(|e| {
+            CatalogError::External(format!(
+                "Failed to create scheduler job for catalog '{}': {}",
+                catalog, e
+            ))
+        })?;
+
+        let state = self
+            .state()
+            .map_err(|e| CatalogError::Internal(format!("Failed to get state: {}", e)))?;
+
+        let job_uuid = state.catalog_task_scheduler.add(job).await.map_err(|e| {
+            CatalogError::External(format!(
+                "Failed to add scheduler job for catalog '{}': {}",
+                catalog, e
+            ))
+        })?;
+
+        info!(
+            "Successfully added scheduled sync job for catalog '{}' (UUID: {})",
+            catalog, job_uuid
+        );
+
+        Ok(job_uuid)
     }
 }

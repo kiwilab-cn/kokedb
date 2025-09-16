@@ -21,3 +21,4 @@ datafusion-physical-expr.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
+tokio-cron-scheduler.workspace = true

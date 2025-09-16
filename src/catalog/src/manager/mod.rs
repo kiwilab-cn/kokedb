@@ -5,6 +5,7 @@ use datafusion::catalog::CatalogProviderList;
 use kokedb_common_datafusion::extension::SessionExtension;
 use kokedb_meta::datafusion_catalog::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::task::TaskManager;
+use tokio_cron_scheduler::JobScheduler;
 
 use crate::datafusion_catalog_adapter::DataFusionCatalogAdapter;
 use crate::error::{CatalogError, CatalogResult};
@@ -28,6 +29,7 @@ pub(super) struct CatalogManagerState {
     pub(super) catalogs: HashMap<Arc<str>, Arc<dyn CatalogProvider>>,
     pub(super) dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
     pub(super) catalog_task_manager: Arc<TaskManager>,
+    pub(super) catalog_task_scheduler: Arc<JobScheduler>,
     pub(super) default_catalog: Arc<str>,
     pub(super) default_database: Namespace,
     pub(super) global_temporary_database: Namespace,
@@ -37,6 +39,7 @@ pub struct CatalogManagerOptions {
     pub catalogs: HashMap<String, Arc<dyn CatalogProvider>>,
     pub dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
     pub catalog_task_manager: Arc<TaskManager>,
+    pub catalog_task_scheduler: Arc<JobScheduler>,
     pub default_catalog: String,
     pub default_database: Vec<String>,
     pub global_temporary_database: Vec<String>,
@@ -65,6 +68,7 @@ impl CatalogManager {
             global_temporary_database: options.global_temporary_database.try_into()?,
             dynamic_catalog_list: options.dynamic_catalog_list,
             catalog_task_manager: options.catalog_task_manager.clone(),
+            catalog_task_scheduler: options.catalog_task_scheduler.clone(),
         };
         Ok(CatalogManager {
             state: Arc::new(Mutex::new(state)),
