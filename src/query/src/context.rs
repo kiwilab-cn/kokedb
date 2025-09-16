@@ -53,7 +53,6 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
     let state_builder = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime)
-        .with_catalog_list(catalog_list.clone())
         .with_default_features()
         .build();
     let ctx = SessionContext::new_with_state(state_builder);
