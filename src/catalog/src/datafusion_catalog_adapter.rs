@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::catalog::CatalogProvider;
+use kokedb_common::file::get_remote_catalog_local_path;
 
 use crate::{
     error::{CatalogError, CatalogResult},
@@ -62,11 +63,7 @@ impl DataFusionCatalogAdapter {
             })
             .collect();
 
-        //TODO: must move to common.
-        let table_path = format!(
-            "file:///tmp/{}/{}/{}",
-            self.catalog_name, schema_name, table_name
-        );
+        let table_path = get_remote_catalog_local_path(&self.catalog_name, schema_name, table_name);
         TableStatus {
             name: table_name.to_string(),
             kind: TableKind::Table {

@@ -1,3 +1,4 @@
+use kokedb_common::file::get_remote_catalog_parent_local_path;
 use kokedb_meta::{datafusion_catalog::PostgreSQLMetaCatalogProviderList, schema::SchemaTable};
 use log::info;
 
@@ -29,7 +30,12 @@ impl TaskExecutor for DataSyncExecutor {
         let source_table = &config.source_table;
         let local_table = &config.local_table;
 
-        let local_path = format!("{}/{}/{}", "/tmp", catalog, local_table.replace('.', "/"));
+        let local_path = format!(
+            "{}/{}/{}",
+            get_remote_catalog_parent_local_path(),
+            catalog,
+            local_table.replace('.', "/")
+        );
 
         let (schema, table) = local_table
             .split_once('.')
