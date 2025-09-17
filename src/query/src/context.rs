@@ -10,7 +10,7 @@ use kokedb_catalog::{
     provider::CatalogProvider,
 };
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
-use kokedb_task_manager::task::TaskManager;
+use kokedb_task_manager::task_manager::TaskManager;
 use tokio_cron_scheduler::JobScheduler;
 
 use crate::mem_catalog::MemoryCatalogProvider;

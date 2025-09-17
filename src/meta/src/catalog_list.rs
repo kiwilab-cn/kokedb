@@ -8,6 +8,8 @@ use datafusion::catalog::{CatalogProvider, CatalogProviderList};
 
 use datafusion::error::{DataFusionError, Result};
 
+use datafusion::sql::sqlparser::parser::ParserError;
+use kokedb_common::cache_policy::parse_cache_policy;
 use sqlx::{PgPool, Row};
 
 use crate::datafusion_catalog::PostgreSQLCatalogProvider;
@@ -80,6 +82,7 @@ impl PostgreSQLMetaCatalogProviderList {
                 dsn varchar,
                 db_type varchar,
                 description varchar,
+                cache_policy varchar,
                 created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
                 updated_at timestamp DEFAULT CURRENT_TIMESTAMP
             );
@@ -194,16 +197,44 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(catalog_info)
     }
 
+    pub async fn get_catalog_cache_policy(&self, name: &str) -> Result<String> {
+        let query = format!(
+            "SELECT cache_policy FROM system.catalog where name='{}'",
+            name
+        );
+
+        let row = sqlx::query(&query)
+            .fetch_one(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let cache_policy: String = row.get("cache_policy");
+        Ok(cache_policy)
+    }
+
     pub fn create_catalog(
         &self,
         catalog: &str,
         dsn: &str,
         db_type: &str,
         comment: Option<String>,
-        _properties: Vec<(String, String)>,
+        properties: Vec<(String, String)>,
     ) -> Result<bool> {
+        let cache_policy = parse_cache_policy(properties).map_err(|x| {
+            DataFusionError::SQL(
+                Box::new(ParserError::ParserError(
+                    "Failed to get topk/all/select and k/table_set value from the properties."
+                        .to_string(),
+                )),
+                Some(format!(
+                    "Failed to get cache policy from properties:{:?}",
+                    x
+                )),
+            )
+        })?;
+
         let insert_sql =
-            "INSERT INTO system.catalog (name, dsn, db_type, description) VALUES ($1, $2, $3, $4)";
+            "INSERT INTO system.catalog (name, dsn, db_type, description, cache_policy) VALUES ($1, $2, $3, $4, $5)";
 
         let ret = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -212,6 +243,7 @@ impl PostgreSQLMetaCatalogProviderList {
                     .bind(dsn)
                     .bind(db_type)
                     .bind(comment)
+                    .bind(cache_policy.to_string())
                     .execute(&self.local_pool)
                     .await
             })

@@ -59,6 +59,24 @@ pub async fn get_postgres_top_tables(dsn: &str, k: usize) -> Result<Vec<String>,
     return Ok(topk_tables);
 }
 
+pub async fn get_postgres_all_tables(dsn: &str) -> Result<Vec<String>, TaskError> {
+    let pool = PgPool::connect(dsn).await.map_err(|x| {
+        TaskError::DatabaseError(format!(
+            "Failed to connect postgresql: {} with error: {}",
+            dsn, x
+        ))
+    })?;
+    let tables = get_all_tables_info(&pool).await?;
+    pool.close().await;
+
+    let all_tables = tables
+        .iter()
+        .map(|t| format!("{}.{}", t.schema_name, t.table_name))
+        .collect();
+
+    return Ok(all_tables);
+}
+
 pub async fn get_top_tables_info(pool: &PgPool, k: usize) -> Result<Vec<String>, TaskError> {
     let mut tables = get_all_tables_info(pool).await?;
     tables.sort();

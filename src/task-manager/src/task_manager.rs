@@ -552,11 +552,12 @@ mod tests {
         let task_config = CacheTableTaskConfig {
             dsn: "postgresql://root:12345@192.168.0.227:25432/postgres".to_string(),
             source_table: "public.demo".to_string(),
-            local_table: "kokedb.public.demo".to_string(),
+            local_table: "public.demo".to_string(),
             batch_size: Some(1000),
             timeout_seconds: Some(100),
             priority: crate::task::TaskPriority::Critical,
             additional_params: HashMap::new(),
+            catalog_name: "kokedb".to_string(),
         };
 
         task_manager.add_task(task_config).await.unwrap();

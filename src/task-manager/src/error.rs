@@ -20,4 +20,6 @@ pub enum TaskError {
     ThreadPoolError(String),
     #[error("Task queue full")]
     QueueFull,
+    #[error("Invalid task argument: {0}")]
+    InvalideTaskArgment(String),
 }

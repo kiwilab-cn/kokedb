@@ -3,7 +3,8 @@ use kokedb_meta::{catalog_list::PostgreSQLMetaCatalogProviderList, schema::Schem
 use log::info;
 
 use crate::{
-    error::TaskError, read_postgres::convert_postgres_to_parquet, task::CacheTableTaskConfig,
+    error::TaskError, read_postgres::convert_postgres_to_parquet,
+    task_manager::CacheTableTaskConfig,
 };
 
 #[async_trait::async_trait]

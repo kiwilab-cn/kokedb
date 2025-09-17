@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use datafusion::catalog::CatalogProviderList;
 use kokedb_common_datafusion::extension::SessionExtension;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
-use kokedb_task_manager::task::TaskManager;
+use kokedb_task_manager::task_manager::TaskManager;
 use tokio_cron_scheduler::JobScheduler;
 
 use crate::datafusion_catalog_adapter::DataFusionCatalogAdapter;
