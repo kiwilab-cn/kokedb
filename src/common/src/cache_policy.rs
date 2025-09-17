@@ -31,6 +31,11 @@ impl CachePolicy {
             return Ok(CachePolicy::All);
         }
 
+        if s.is_empty() {
+            let default = CachePolicy::TopK { k: 10 };
+            return Ok(default);
+        }
+
         if let Some(colon_pos) = s.find(':') {
             let (policy_type, params) = s.split_at(colon_pos);
             let params = &params[1..]; // 跳过冒号

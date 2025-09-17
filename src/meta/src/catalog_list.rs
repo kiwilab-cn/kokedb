@@ -161,7 +161,7 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(())
     }
 
-    async fn load_catalog_info(&self) -> Result<Vec<CatalogInfo>> {
+    pub async fn load_catalog_info(&self) -> Result<Vec<CatalogInfo>> {
         let query = "SELECT name, dsn FROM system.catalog";
 
         let rows = sqlx::query(query)
@@ -208,7 +208,9 @@ impl PostgreSQLMetaCatalogProviderList {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let cache_policy: String = row.get("cache_policy");
+        let cache_policy: String = row
+            .try_get("cache_policy")
+            .unwrap_or_else(|_| String::new());
         Ok(cache_policy)
     }
 

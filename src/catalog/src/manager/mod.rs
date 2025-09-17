@@ -5,6 +5,7 @@ use datafusion::catalog::CatalogProviderList;
 use kokedb_common_datafusion::extension::SessionExtension;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::task_manager::TaskManager;
+use log::info;
 use tokio_cron_scheduler::JobScheduler;
 
 use crate::datafusion_catalog_adapter::DataFusionCatalogAdapter;
@@ -74,6 +75,34 @@ impl CatalogManager {
             state: Arc::new(Mutex::new(state)),
             temporary_views: Default::default(),
         })
+    }
+
+    pub async fn init_catalog_job(&self) -> CatalogResult<()> {
+        let catalogs = {
+            self.state()?
+                .dynamic_catalog_list
+                .load_catalog_info()
+                .await
+                .map_err(|x| {
+                    CatalogError::Internal(format!("Failed to get catalog list with error: {}", x))
+                })?
+        };
+
+        for to_init_catalog in catalogs {
+            let catalog = to_init_catalog.name.as_str();
+            let dsn = to_init_catalog.dsn.as_str();
+            self.create_catalog_scheduler_job(dsn, catalog)
+                .await
+                .map_err(|x| {
+                    CatalogError::Internal(format!(
+                        "Failed to create catalog: {} and dsn: {} scheduler job with error:{}",
+                        catalog, dsn, x
+                    ))
+                })?;
+            info!("Success added catalog:{} scheduler job.", catalog);
+        }
+
+        Ok(())
     }
 
     pub(super) fn state(&self) -> CatalogResult<MutexGuard<'_, CatalogManagerState>> {

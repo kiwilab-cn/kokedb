@@ -47,7 +47,11 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
     };
 
     let catalog_manager = CatalogManager::new(options)
-        .map_err(|e| plan_datafusion_err!("failed to create catalog manager: {e}"))?;
+        .map_err(|e| plan_datafusion_err!("Failed to create catalog manager: {e}"))?;
+    catalog_manager
+        .init_catalog_job()
+        .await
+        .map_err(|e| plan_datafusion_err!("Failed to init catalog job: {e}"))?;
 
     let config = SessionConfig::new()
         .with_create_default_catalog_and_schema(false)
