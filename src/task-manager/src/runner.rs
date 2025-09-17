@@ -31,10 +31,11 @@ impl TaskExecutor for DataSyncExecutor {
         let local_table = &config.local_table;
 
         let local_path = format!(
-            "{}/{}/{}",
+            "{}/{}/{}/{}",
             get_remote_catalog_parent_local_path(),
             catalog,
-            local_table.replace('.', "/")
+            local_table.replace('.', "/"),
+            uuid::Uuid::new_v4()
         );
 
         let (schema, table) = local_table

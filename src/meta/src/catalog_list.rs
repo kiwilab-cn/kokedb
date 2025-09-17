@@ -266,9 +266,9 @@ impl PostgreSQLMetaCatalogProviderList {
         catalog: &str,
         schema: &str,
         table: &str,
-    ) -> Result<Arc<Schema>> {
+    ) -> Result<(Arc<Schema>, String)> {
         let sql = format!(
-            "select arrow_schema from system.table_arrow_schema \
+            "select arrow_schema, local_path from system.table_arrow_schema \
             where catalog_name = '{}' and schema_name='{}' and table_name='{}'",
             catalog, schema, table
         );
@@ -280,9 +280,11 @@ impl PostgreSQLMetaCatalogProviderList {
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let arrow_schema: Vec<u8> = row.get("arrow_schema");
+        let local_path: String = row.get("local_path");
+
         let schema = binary_to_schema(&arrow_schema)?;
 
-        Ok(schema)
+        Ok((schema, local_path))
     }
 }
 

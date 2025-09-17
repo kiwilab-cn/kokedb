@@ -11,7 +11,6 @@ use datafusion::datasource::listing::{
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 
-use kokedb_common::file::get_remote_catalog_local_path;
 use sqlx::{PgPool, Row};
 
 use crate::catalog_list::{CatalogInfo, PostgreSQLMetaCatalogProviderList};
@@ -138,11 +137,8 @@ impl PostgreSQLSchemaProvider {
     }
 
     async fn create_listing_table(&self, table_name: &str) -> Result<Arc<dyn TableProvider>> {
-        let table_path =
-            get_remote_catalog_local_path(&self.catalog_info.name, &self.schema_name, table_name);
-
         let meta_client = PostgreSQLMetaCatalogProviderList::new().await?;
-        let schema =
+        let (schema, table_path) =
             meta_client.get_table_schema(&self.catalog_info.name, &self.schema_name, table_name)?;
 
         let file_format: Arc<dyn datafusion::datasource::file_format::FileFormat> =

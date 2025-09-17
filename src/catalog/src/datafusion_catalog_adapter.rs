@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use async_trait::async_trait;
-use datafusion::catalog::CatalogProvider;
-use kokedb_common::file::get_remote_catalog_local_path;
+use datafusion::{
+    catalog::{CatalogProvider, TableProvider},
+    datasource::listing::ListingTable,
+};
+use log::error;
 
 use crate::{
     error::{CatalogError, CatalogResult},
@@ -62,8 +65,17 @@ impl DataFusionCatalogAdapter {
                 is_cluster: false,
             })
             .collect();
+        let table_path = Self::get_parent_directory(table_provider);
+        let location = if table_path.is_ok() {
+            Some(table_path.unwrap())
+        } else {
+            error!(
+                "Failed to get table: {}.{} location url.",
+                schema_name, table_name
+            );
+            None
+        };
 
-        let table_path = get_remote_catalog_local_path(&self.catalog_name, schema_name, table_name);
         TableStatus {
             name: table_name.to_string(),
             kind: TableKind::Table {
@@ -72,7 +84,7 @@ impl DataFusionCatalogAdapter {
                 columns,
                 comment: None,
                 constraints: vec![],
-                location: Some(table_path),
+                location,
                 format: "parquet".to_string(),
                 partition_by: vec![],
                 sort_by: vec![],
@@ -80,6 +92,24 @@ impl DataFusionCatalogAdapter {
                 options: vec![],
                 properties: vec![],
             },
+        }
+    }
+
+    fn get_parent_directory(
+        table_provider: Arc<dyn TableProvider>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        match table_provider.as_any().downcast_ref::<ListingTable>() {
+            Some(listing_table) => {
+                let paths = listing_table.table_paths();
+
+                if paths.is_empty() {
+                    return Err("No paths found in ListingTable".into());
+                }
+
+                let first_path = paths[0].get_url().path();
+                Ok(first_path.to_string())
+            }
+            None => Err("TableProvider is not a ListingTable".into()),
         }
     }
 }
