@@ -47,7 +47,7 @@ impl Ord for TableInfo {
     }
 }
 
-pub async fn get_postgres_top_tables(dsn: &String, k: usize) -> Result<Vec<String>, TaskError> {
+pub async fn get_postgres_top_tables(dsn: &str, k: usize) -> Result<Vec<String>, TaskError> {
     let pool = PgPool::connect(dsn).await.map_err(|x| {
         TaskError::DatabaseError(format!(
             "Failed to connect postgresql: {} with error: {}",

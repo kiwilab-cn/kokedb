@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use kokedb_task_manager::error::TaskError;
 use kokedb_task_manager::postgres_table_analyzer::get_postgres_top_tables;
-use kokedb_task_manager::task::CacheTableTaskConfig;
-use log::{info, warn};
+use kokedb_task_manager::task::{CacheTableTaskConfig, TaskManager};
+use log::{error, info, warn};
 use tokio_cron_scheduler::Job;
 
 use crate::error::{CatalogError, CatalogResult};
@@ -65,30 +65,16 @@ impl CatalogManager {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let dsn = dsn.clone();
-                let postgres_topk_table = get_postgres_top_tables(&dsn, 10).await?;
+                let catalog = catalog.clone();
+                self.create_catalog_scheduler_job(&dsn, &catalog)
+                    .await
+                    .map_err(|x| {
+                        TaskError::Internal(format!(
+                            "Failed to added scheduler job with error:{:?}",
+                            x
+                        ))
+                    })?;
 
-                for table in postgres_topk_table {
-                    let config = CacheTableTaskConfig::new(
-                        catalog.to_string(),
-                        dsn.clone(),
-                        table.clone(),
-                        table.clone(),
-                    );
-
-                    let state = self
-                        .state()
-                        .map_err(|e| TaskError::Internal(e.to_string()))?;
-
-                    let ret = state.catalog_task_manager.add_task(config).await;
-                    if ret.is_err() {
-                        warn!(
-                            "Failed to add cache dsn: {} table: {} task with error: {:?}",
-                            &dsn,
-                            &table,
-                            ret.err()
-                        );
-                    }
-                }
                 Ok(())
             })
         })
@@ -107,36 +93,55 @@ impl CatalogManager {
         dsn: &str,
         catalog: &str,
     ) -> CatalogResult<uuid::Uuid> {
-        const SCHEDULE_INTERVAL_MINUTES: u32 = 60; // 1 hour
-        let cron_expr = format!("0 */{} * * *", SCHEDULE_INTERVAL_MINUTES);
+        const SCHEDULE_INTERVAL_MINUTES: u32 = 3; // 1 hour
 
-        let dsn = dsn.to_string();
-        let catalog = catalog.to_string();
+        let state = self
+            .state()
+            .map_err(|e| CatalogError::Internal(format!("Failed to get state: {}", e)))?;
 
-        let task_handler = move |_uuid, _l| {
-            let dsn = dsn.clone();
-            let catalog = catalog.clone();
+        let catalog_task_manager = state.catalog_task_manager.clone();
+
+        // Run once first, and then added scheduler job.
+        if let Err(e) =
+            Self::execute_catalog_sync_task(dsn, catalog, catalog_task_manager.clone()).await
+        {
+            error!(
+                "Catalog first sync task failed for catalog '{}' with DSN '{}': {}",
+                catalog, dsn, e
+            );
+        } else {
+            info!(
+                "Success first sync task for catalog {} with DSN: {}",
+                catalog, dsn
+            );
+        }
+
+        let job_dsn = dsn.to_string();
+        let job_catalog = catalog.to_string();
+        let cron_expr = format!("0 */{} * * * *", SCHEDULE_INTERVAL_MINUTES);
+
+        let job = Job::new_async(cron_expr, move |_uuid, _l| {
+            let dsn = job_dsn.clone();
+            let catalog = job_catalog.clone();
+            let catalog_task_manager = catalog_task_manager.clone();
 
             Box::pin(async move {
-                if let Err(e) = Self::execute_catalog_sync_task(&dsn, &catalog).await {
+                if let Err(e) =
+                    Self::execute_catalog_sync_task(&dsn, &catalog, catalog_task_manager).await
+                {
                     error!(
                         "Catalog sync task failed for catalog '{}' with DSN '{}': {}",
-                        catalog, dsn, e
+                        &catalog, &dsn, e
                     );
                 }
             })
-        };
-
-        let job = Job::new_async(cron_expr, task_handler).map_err(|e| {
+        })
+        .map_err(|e| {
             CatalogError::External(format!(
                 "Failed to create scheduler job for catalog '{}': {}",
                 catalog, e
             ))
         })?;
-
-        let state = self
-            .state()
-            .map_err(|e| CatalogError::Internal(format!("Failed to get state: {}", e)))?;
 
         let job_uuid = state.catalog_task_scheduler.add(job).await.map_err(|e| {
             CatalogError::External(format!(
@@ -151,5 +156,42 @@ impl CatalogManager {
         );
 
         Ok(job_uuid)
+    }
+
+    async fn execute_catalog_sync_task(
+        dsn: &str,
+        catalog: &str,
+        catalog_task_manager: Arc<TaskManager>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        info!(
+            "Begin running catalog sync task with catalog {} and dsn {}",
+            catalog, dsn
+        );
+        let postgres_topk_table = get_postgres_top_tables(dsn, 10).await?;
+
+        for table in postgres_topk_table {
+            let config = CacheTableTaskConfig::new(
+                catalog.to_string(),
+                dsn.to_string(),
+                table.clone(),
+                table.clone(),
+            );
+            let ret = catalog_task_manager.add_task(config).await;
+            if ret.is_err() {
+                warn!(
+                    "Failed to add cache dsn: {} table: {} task with error: {:?}",
+                    &dsn,
+                    &table,
+                    ret.err()
+                );
+            }
+        }
+
+        info!(
+            "Finished running catalog sync task with catalog {} and dsn {}",
+            catalog, dsn
+        );
+
+        Ok(())
     }
 }
