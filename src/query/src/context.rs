@@ -9,7 +9,7 @@ use kokedb_catalog::{
     manager::{CatalogManager, CatalogManagerOptions},
     provider::CatalogProvider,
 };
-use kokedb_meta::datafusion_catalog::PostgreSQLMetaCatalogProviderList;
+use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::task::TaskManager;
 use tokio_cron_scheduler::JobScheduler;
 

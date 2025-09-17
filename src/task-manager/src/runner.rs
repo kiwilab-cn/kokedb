@@ -1,5 +1,5 @@
 use kokedb_common::file::get_remote_catalog_parent_local_path;
-use kokedb_meta::{datafusion_catalog::PostgreSQLMetaCatalogProviderList, schema::SchemaTable};
+use kokedb_meta::{catalog_list::PostgreSQLMetaCatalogProviderList, schema::SchemaTable};
 use log::info;
 
 use crate::{
