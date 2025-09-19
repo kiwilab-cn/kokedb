@@ -51,7 +51,7 @@ impl PostgreSQLTableProvider {
     }
 
     async fn infer_schema(pool: &PgPool, config: &PostgreSQLConfig) -> Result<Schema> {
-        let full_table_name = match &config.schema_name {
+        let _full_table_name = match &config.schema_name {
             Some(schema) => format!("{}.{}", schema, config.table_name),
             None => config.table_name.clone(),
         };
@@ -112,42 +112,6 @@ impl PostgreSQLTableProvider {
             "uuid" => Ok(DataType::Utf8),
             "json" | "jsonb" => Ok(DataType::Utf8),
             _ => Ok(DataType::Utf8),
-        }
-    }
-
-    fn expr_to_sql(&self, expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::BinaryExpr(binary_expr) => {
-                let left = self.expr_to_sql(&binary_expr.left)?;
-                let right = self.expr_to_sql(&binary_expr.right)?;
-                let op = match binary_expr.op {
-                    datafusion::logical_expr::Operator::Eq => "=",
-                    datafusion::logical_expr::Operator::NotEq => "!=",
-                    datafusion::logical_expr::Operator::Lt => "<",
-                    datafusion::logical_expr::Operator::LtEq => "<=",
-                    datafusion::logical_expr::Operator::Gt => ">",
-                    datafusion::logical_expr::Operator::GtEq => ">=",
-                    datafusion::logical_expr::Operator::And => "AND",
-                    datafusion::logical_expr::Operator::Or => "OR",
-                    datafusion::logical_expr::Operator::LikeMatch => "LIKE",
-                    datafusion::logical_expr::Operator::NotLikeMatch => "NOT LIKE",
-                    _ => return None,
-                };
-                Some(format!("({} {} {})", left, op, right))
-            }
-            Expr::Column(col) => Some(format!("\"{}\"", col.name)),
-            Expr::Literal(scalar_value, None) => match scalar_value {
-                datafusion::scalar::ScalarValue::Utf8(Some(s)) => {
-                    Some(format!("'{}'", s.replace("'", "''")))
-                }
-                datafusion::scalar::ScalarValue::Int32(Some(i)) => Some(i.to_string()),
-                datafusion::scalar::ScalarValue::Int64(Some(i)) => Some(i.to_string()),
-                datafusion::scalar::ScalarValue::Float32(Some(f)) => Some(f.to_string()),
-                datafusion::scalar::ScalarValue::Float64(Some(f)) => Some(f.to_string()),
-                datafusion::scalar::ScalarValue::Boolean(Some(b)) => Some(b.to_string()),
-                _ => None,
-            },
-            _ => None,
         }
     }
 }
