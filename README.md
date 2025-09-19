@@ -3,7 +3,7 @@
 **"Though tiny as it can be, the moss blooms with pride like the tree peony."**
 
 [![GitHub License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/kiwilab-cn/kokedb/blob/main/LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/yourusername/kokedb?style=social)](https://github.com/kiwilab-cn/kokedb/stargazers)
+[![GitHub Stars](https://img.shields.io/github/stars/kiwilab-cn/kokedb?style=social)](https://github.com/kiwilab-cn/kokedb/stargazers)
 
 KokeDB is an open-source project designed to accelerate query computations on large datasets in OLTP databases. By integrating with your OLTP database, KokeDB leverages columnar storage and vectorized execution engines to speed up queries. It also supports automated materialized views, caching frequent query results and automatically updating them when source table data changes.
 
