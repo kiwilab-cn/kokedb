@@ -81,6 +81,8 @@ impl<T: ListingFormat> TableFormat for ListingTableFormat<T> {
 
         let urls = crate::url::resolve_listing_urls(ctx, paths).await?;
         let file_format = self.inner.create_read_format(ctx, options.clone(), None)?;
+        //TODO: when urls is empty, read data from remote table direct.
+
         let extension_with_compression =
             file_format.compression_type().and_then(|compression_type| {
                 match file_format.get_ext_with_compression(&compression_type) {

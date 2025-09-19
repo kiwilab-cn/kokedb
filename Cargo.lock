@@ -2996,6 +2996,8 @@ dependencies = [
 name = "kokedb-data-source"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "async-stream",
  "async-trait",
  "bytes",
  "chumsky",
@@ -3015,7 +3017,9 @@ dependencies = [
  "regex",
  "serde",
  "serde_yaml",
+ "sqlx",
  "syn 2.0.106",
+ "tokio",
  "url",
  "uuid",
 ]
