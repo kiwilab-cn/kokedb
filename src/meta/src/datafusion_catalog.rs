@@ -138,7 +138,7 @@ impl PostgreSQLSchemaProvider {
 
     async fn create_listing_table(&self, table_name: &str) -> Result<Arc<dyn TableProvider>> {
         let meta_client = PostgreSQLMetaCatalogProviderList::new().await?;
-        let (schema, table_path) =
+        let (schema, table_path, _dsn) =
             meta_client.get_table_schema(&self.catalog_info.name, &self.schema_name, table_name)?;
 
         let file_format: Arc<dyn datafusion::datasource::file_format::FileFormat> =

@@ -12,6 +12,7 @@ use kokedb_common_datafusion::datasource::SourceInfo;
 use kokedb_common_datafusion::extension::SessionExtensionAccessor;
 use kokedb_common_datafusion::utils::rename_logical_plan;
 use kokedb_data_source::default_registry;
+use kokedb_data_source::formats::remote_table::{PostgreSQLConfig, PostgreSQLTableProvider};
 use kokedb_python_udf::udf::pyspark_unresolved_udf::PySparkUnresolvedUDF;
 
 use crate::error::{PlanError, PlanResult};
@@ -55,7 +56,7 @@ impl PlanResolver<'_> {
         let plan = match status.kind {
             TableKind::Table {
                 catalog: _,
-                database: _,
+                database,
                 columns,
                 comment: _,
                 constraints,
@@ -66,11 +67,12 @@ impl PlanResolver<'_> {
                 bucket_by,
                 options: table_options,
                 properties: _,
+                dsn,
             } => {
                 let schema = Schema::new(columns.iter().map(|x| x.field()).collect::<Vec<_>>());
                 let constraints = self.resolve_catalog_table_constraints(constraints, &schema)?;
                 let info = SourceInfo {
-                    paths: location.map(|x| vec![x]).unwrap_or_default(),
+                    paths: location.clone().map(|x| vec![x]).unwrap_or_default(),
                     schema: Some(schema),
                     constraints,
                     partition_by,
@@ -82,10 +84,31 @@ impl PlanResolver<'_> {
                         options.into_iter().collect(),
                     ],
                 };
-                let table_provider = default_registry()
-                    .get_format(&format)?
-                    .create_provider(&self.ctx.state(), info)
-                    .await?;
+
+                let table_provider = if (location.as_ref().is_none()
+                    || location.as_ref().is_some_and(|x| x.is_empty()))
+                    && dsn.as_ref().is_some_and(|x| !x.is_empty())
+                {
+                    let schema_name = if database.is_empty() {
+                        None
+                    } else {
+                        Some(database.first().unwrap().clone())
+                    };
+                    let config = PostgreSQLConfig {
+                        connection_string: dsn.unwrap(),
+                        table_name: table_reference.table().to_string(),
+                        schema_name,
+                    };
+
+                    let remote_table = PostgreSQLTableProvider::new(config).await?;
+                    Arc::new(remote_table)
+                } else {
+                    default_registry()
+                        .get_format(&format)?
+                        .create_provider(&self.ctx.state(), info)
+                        .await?
+                };
+
                 let names = state.register_fields(table_provider.schema().fields());
                 let table_provider = RenameTableProvider::try_new(table_provider, names)?;
                 LogicalPlan::TableScan(TableScan::try_new(

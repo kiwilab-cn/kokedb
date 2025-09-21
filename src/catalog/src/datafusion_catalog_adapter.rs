@@ -5,6 +5,7 @@ use datafusion::{
     catalog::{CatalogProvider, TableProvider},
     datasource::listing::ListingTable,
 };
+use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use log::error;
 
 use crate::{
@@ -48,7 +49,7 @@ impl DataFusionCatalogAdapter {
         schema_name: &str,
         table_name: &str,
         table_provider: Arc<dyn datafusion::datasource::TableProvider>,
-    ) -> TableStatus {
+    ) -> Result<TableStatus, CatalogError> {
         let schema = table_provider.schema();
         let columns = schema
             .fields()
@@ -65,6 +66,19 @@ impl DataFusionCatalogAdapter {
                 is_cluster: false,
             })
             .collect();
+        let meta_client = PostgreSQLMetaCatalogProviderList::new()
+            .await
+            .map_err(|x| {
+                CatalogError::External(format!("Failed to get meta client with error: {}", x))
+            })?;
+        let (_saved_schema, _table_path, dsn) = meta_client
+            .get_table_schema(&self.catalog_name, schema_name, table_name)
+            .map_err(|x| {
+                CatalogError::Internal(format!(
+                    "Failed to get table schema and path from meta with error: {}",
+                    x
+                ))
+            })?;
         let table_path = Self::get_parent_directory(table_provider);
         let location = if table_path.is_ok() {
             Some(table_path.unwrap())
@@ -76,7 +90,7 @@ impl DataFusionCatalogAdapter {
             None
         };
 
-        TableStatus {
+        let table = TableStatus {
             name: table_name.to_string(),
             kind: TableKind::Table {
                 catalog: self.catalog_name.clone(),
@@ -91,8 +105,11 @@ impl DataFusionCatalogAdapter {
                 bucket_by: None,
                 options: vec![],
                 properties: vec![],
+                dsn: Some(dsn),
             },
-        }
+        };
+
+        Ok(table)
     }
 
     fn get_parent_directory(
@@ -177,9 +194,10 @@ impl crate::provider::CatalogProvider for DataFusionCatalogAdapter {
                 .await
                 .map_err(|e| CatalogError::Internal(format!("DataFusion error: {}", e)))?
             {
-                Ok(self
+                let table_status = self
                     .create_table_status(schema_name, table, table_provider)
-                    .await)
+                    .await?;
+                Ok(table_status)
             } else {
                 Err(CatalogError::NotFound("table", table.to_string()))
             }

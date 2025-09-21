@@ -406,6 +406,7 @@ impl PlanResolver<'_> {
                 bucket_by,
                 options,
                 properties: _,
+                dsn: _,
             } => Ok(Some(TableInfo {
                 columns,
                 location,

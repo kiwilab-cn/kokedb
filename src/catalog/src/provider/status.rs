@@ -35,6 +35,7 @@ pub enum TableKind {
         bucket_by: Option<CatalogTableBucketBy>,
         options: Vec<(String, String)>,
         properties: Vec<(String, String)>,
+        dsn: Option<String>,
     },
     View {
         catalog: String,

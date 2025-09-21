@@ -203,7 +203,7 @@ impl CatalogProvider for MemoryCatalogProvider {
         let status = TableStatus {
             name: table.to_string(),
             kind: TableKind::Table {
-                catalog: self.name.clone(),
+                catalog: __self.name.clone(),
                 database: database.clone().into(),
                 columns,
                 comment,
@@ -215,6 +215,7 @@ impl CatalogProvider for MemoryCatalogProvider {
                 bucket_by,
                 options,
                 properties,
+                dsn: None,
             },
         };
         db.tables.insert(table.to_string(), status.clone());

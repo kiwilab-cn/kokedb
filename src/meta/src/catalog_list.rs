@@ -300,9 +300,9 @@ impl PostgreSQLMetaCatalogProviderList {
         catalog: &str,
         schema: &str,
         table: &str,
-    ) -> Result<(Arc<Schema>, String)> {
+    ) -> Result<(Arc<Schema>, String, String)> {
         let sql = format!(
-            "select arrow_schema, local_path from system.table_arrow_schema \
+            "select arrow_schema, local_path, dsn from system.table_arrow_schema \
             where catalog_name = '{}' and schema_name='{}' and table_name='{}'",
             catalog, schema, table
         );
@@ -315,10 +315,11 @@ impl PostgreSQLMetaCatalogProviderList {
 
         let arrow_schema: Vec<u8> = row.get("arrow_schema");
         let local_path: String = row.get("local_path");
+        let dsn: String = row.get("dsn");
 
         let schema = binary_to_schema(&arrow_schema)?;
 
-        Ok((schema, local_path))
+        Ok((schema, local_path, dsn))
     }
 }
 
