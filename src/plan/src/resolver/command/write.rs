@@ -407,6 +407,7 @@ impl PlanResolver<'_> {
                 options,
                 properties: _,
                 dsn: _,
+                is_cached: _,
             } => Ok(Some(TableInfo {
                 columns,
                 location,

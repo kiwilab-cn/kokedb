@@ -3034,6 +3034,7 @@ dependencies = [
  "dashmap",
  "datafusion",
  "kokedb-common",
+ "kokedb-data-source",
  "sqlx",
  "tokio",
 ]

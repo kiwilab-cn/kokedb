@@ -36,6 +36,7 @@ pub enum TableKind {
         options: Vec<(String, String)>,
         properties: Vec<(String, String)>,
         dsn: Option<String>,
+        is_cached: bool,
     },
     View {
         catalog: String,

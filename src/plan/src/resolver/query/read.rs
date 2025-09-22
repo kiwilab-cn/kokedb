@@ -68,6 +68,7 @@ impl PlanResolver<'_> {
                 options: table_options,
                 properties: _,
                 dsn,
+                is_cached,
             } => {
                 let schema = Schema::new(columns.iter().map(|x| x.field()).collect::<Vec<_>>());
                 let constraints = self.resolve_catalog_table_constraints(constraints, &schema)?;
@@ -85,10 +86,7 @@ impl PlanResolver<'_> {
                     ],
                 };
 
-                let table_provider = if (location.as_ref().is_none()
-                    || location.as_ref().is_some_and(|x| x.is_empty()))
-                    && dsn.as_ref().is_some_and(|x| !x.is_empty())
-                {
+                let table_provider = if !is_cached {
                     let schema_name = if database.is_empty() {
                         None
                     } else {
@@ -99,7 +97,6 @@ impl PlanResolver<'_> {
                         table_name: table_reference.table().to_string(),
                         schema_name,
                     };
-
                     let remote_table = PostgreSQLTableProvider::new(config).await?;
                     Arc::new(remote_table)
                 } else {

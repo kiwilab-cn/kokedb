@@ -11,6 +11,7 @@ use datafusion::datasource::listing::{
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 
+use kokedb_data_source::formats::remote_table::{PostgreSQLConfig, PostgreSQLTableProvider};
 use sqlx::{PgPool, Row};
 
 use crate::catalog_list::{CatalogInfo, PostgreSQLMetaCatalogProviderList};
@@ -136,11 +137,13 @@ impl PostgreSQLSchemaProvider {
         Ok(table_names)
     }
 
-    async fn create_listing_table(&self, table_name: &str) -> Result<Arc<dyn TableProvider>> {
-        let meta_client = PostgreSQLMetaCatalogProviderList::new().await?;
-        let (schema, table_path, _dsn) =
+    async fn create_listing_table(
+        &self,
+        table_name: &str,
+        meta_client: &PostgreSQLMetaCatalogProviderList,
+    ) -> Result<Arc<dyn TableProvider>> {
+        let (schema, table_path) =
             meta_client.get_table_schema(&self.catalog_info.name, &self.schema_name, table_name)?;
-
         let file_format: Arc<dyn datafusion::datasource::file_format::FileFormat> =
             Arc::new(ParquetFormat::default());
 
@@ -180,13 +183,32 @@ impl SchemaProvider for PostgreSQLSchemaProvider {
             return Ok(Some(Arc::clone(&table)));
         }
 
-        match self.create_listing_table(name).await {
-            Ok(table) => {
-                self.table_cache
-                    .insert(name.to_string(), Arc::clone(&table));
-                Ok(Some(table))
+        let catalog = self.catalog_info.name.clone();
+        let schema = self.schema_name.clone();
+        let dsn = self.catalog_info.dsn.clone();
+
+        let meta_client = PostgreSQLMetaCatalogProviderList::new().await?;
+        let is_cached = meta_client
+            .check_table_is_cached(&catalog, &schema, name)
+            .await?;
+
+        if is_cached {
+            match self.create_listing_table(name, &meta_client).await {
+                Ok(table) => {
+                    self.table_cache
+                        .insert(name.to_string(), Arc::clone(&table));
+                    Ok(Some(table))
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
+        } else {
+            let config = PostgreSQLConfig {
+                connection_string: dsn.clone(),
+                table_name: name.to_string(),
+                schema_name: Some(schema.clone()),
+            };
+            let remote_table = PostgreSQLTableProvider::new(config).await?;
+            Ok(Some(Arc::new(remote_table)))
         }
     }
 

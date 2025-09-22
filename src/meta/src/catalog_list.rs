@@ -181,7 +181,7 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(catalogs)
     }
 
-    async fn get_catalog(&self, name: &str) -> Result<CatalogInfo> {
+    pub async fn get_catalog(&self, name: &str) -> Result<CatalogInfo> {
         let query = format!("SELECT name, dsn FROM system.catalog where name='{}'", name);
 
         let row = sqlx::query(&query)
@@ -295,31 +295,55 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(true)
     }
 
+    pub async fn check_table_is_cached(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<bool> {
+        let sql = format!(
+            "select arrow_schema, local_path from system.table_arrow_schema \
+            where catalog_name = '{}' and schema_name='{}' and table_name='{}'",
+            catalog, schema, table
+        );
+
+        let row = sqlx::query(&sql)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(row.is_some())
+    }
+
     pub fn get_table_schema(
         &self,
         catalog: &str,
         schema: &str,
         table: &str,
-    ) -> Result<(Arc<Schema>, String, String)> {
+    ) -> Result<(Arc<Schema>, String)> {
         let sql = format!(
-            "select arrow_schema, local_path, dsn from system.table_arrow_schema \
+            "select arrow_schema, local_path from system.table_arrow_schema \
             where catalog_name = '{}' and schema_name='{}' and table_name='{}'",
             catalog, schema, table
         );
 
         let row = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
-                .block_on(async { sqlx::query(&sql).fetch_one(&self.local_pool).await })
+                .block_on(async { sqlx::query(&sql).fetch_optional(&self.local_pool).await })
         })
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let arrow_schema: Vec<u8> = row.get("arrow_schema");
-        let local_path: String = row.get("local_path");
-        let dsn: String = row.get("dsn");
+        let (schema, local_path) = if row.is_some() {
+            let row = row.unwrap();
+            let arrow_schema: Vec<u8> = row.get("arrow_schema");
+            let local_path: String = row.get("local_path");
+            let schema = binary_to_schema(&arrow_schema)?;
+            (schema, local_path)
+        } else {
+            (Arc::new(Schema::empty()), "".to_string())
+        };
 
-        let schema = binary_to_schema(&arrow_schema)?;
-
-        Ok((schema, local_path, dsn))
+        Ok((schema, local_path))
     }
 }
 

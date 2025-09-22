@@ -1,12 +1,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::{
-    catalog::{CatalogProvider, TableProvider},
-    datasource::listing::ListingTable,
-};
-use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
-use log::error;
+use datafusion::catalog::CatalogProvider;
+use kokedb_meta::catalog_list::{CatalogInfo, PostgreSQLMetaCatalogProviderList};
 
 use crate::{
     error::{CatalogError, CatalogResult},
@@ -71,22 +67,35 @@ impl DataFusionCatalogAdapter {
             .map_err(|x| {
                 CatalogError::External(format!("Failed to get meta client with error: {}", x))
             })?;
-        let (_saved_schema, _table_path, dsn) = meta_client
-            .get_table_schema(&self.catalog_name, schema_name, table_name)
+        let catalog_info: CatalogInfo =
+            meta_client
+                .get_catalog(&self.catalog_name)
+                .await
+                .map_err(|x| {
+                    CatalogError::Internal(format!(
+                        "Failed to get catalog from meta with error: {}",
+                        x
+                    ))
+                })?;
+        let dsn = catalog_info.dsn;
+        let is_cached = meta_client
+            .check_table_is_cached(&catalog_info.name, schema_name, table_name)
+            .await
             .map_err(|x| {
-                CatalogError::Internal(format!(
-                    "Failed to get table schema and path from meta with error: {}",
-                    x
-                ))
+                CatalogError::External(format!("Failed to query table is cached with error:{}.", x))
             })?;
-        let table_path = Self::get_parent_directory(table_provider);
-        let location = if table_path.is_ok() {
-            Some(table_path.unwrap())
+
+        let location = if is_cached {
+            let (_schema, local_path) = meta_client
+                .get_table_schema(&catalog_info.name, schema_name, table_name)
+                .map_err(|x| {
+                    CatalogError::Internal(format!(
+                        "Failed to get table schema and path with error: {}",
+                        x
+                    ))
+                })?;
+            Some(local_path)
         } else {
-            error!(
-                "Failed to get table: {}.{} location url.",
-                schema_name, table_name
-            );
             None
         };
 
@@ -106,12 +115,13 @@ impl DataFusionCatalogAdapter {
                 options: vec![],
                 properties: vec![],
                 dsn: Some(dsn),
+                is_cached,
             },
         };
 
         Ok(table)
     }
-
+    /*
     fn get_parent_directory(
         table_provider: Arc<dyn TableProvider>,
     ) -> Result<String, Box<dyn std::error::Error>> {
@@ -128,7 +138,7 @@ impl DataFusionCatalogAdapter {
             }
             None => Err("TableProvider is not a ListingTable".into()),
         }
-    }
+    }*/
 }
 
 #[async_trait]

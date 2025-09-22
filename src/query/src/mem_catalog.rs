@@ -216,6 +216,7 @@ impl CatalogProvider for MemoryCatalogProvider {
                 options,
                 properties,
                 dsn: None,
+                is_cached: false,
             },
         };
         db.tables.insert(table.to_string(), status.clone());

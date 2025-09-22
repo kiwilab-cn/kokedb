@@ -540,7 +540,7 @@ impl TaskManager {
 mod tests {
     use std::collections::HashMap;
 
-    use crate::task::{CacheTableTaskConfig, TaskManager, TaskManagerConfig};
+    use crate::task_manager::{CacheTableTaskConfig, TaskManager, TaskManagerConfig, TaskPriority};
 
     #[tokio::test]
     async fn test_task_manager_run_task() {
@@ -555,7 +555,7 @@ mod tests {
             local_table: "public.demo".to_string(),
             batch_size: Some(1000),
             timeout_seconds: Some(100),
-            priority: crate::task::TaskPriority::Critical,
+            priority: TaskPriority::Critical,
             additional_params: HashMap::new(),
             catalog_name: "kokedb".to_string(),
         };

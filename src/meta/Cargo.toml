@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 kokedb-common.workspace = true
+kokedb-data-source.workspace = true
 
 arrow.workspace = true
 arrow-schema.workspace = true
