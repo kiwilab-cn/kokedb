@@ -30,3 +30,8 @@ tokio.workspace = true
 env_logger.workspace = true
 fastrace.workspace = true
 opentelemetry.workspace = true
+
+sqlx.workspace = true
+rust_decimal.workspace = true
+chrono.workspace = true
+hex.workspace = true

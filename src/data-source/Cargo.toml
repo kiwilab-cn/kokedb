@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 kokedb-common-datafusion.workspace = true
+kokedb-common.workspace = true
 
 sqlx.workspace = true
 arrow.workspace = true

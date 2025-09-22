@@ -8,4 +8,5 @@ pub mod object;
 pub mod opentelemetry;
 pub mod spec;
 pub mod string;
+pub mod table;
 pub mod tests;

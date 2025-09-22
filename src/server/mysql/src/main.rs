@@ -50,16 +50,29 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
     ) -> io::Result<()> {
         println!("sql: {}", sql);
         // TODO: remove unwrap.
-        let plan = plan_sql(sql).unwrap();
+        let plan = plan_sql(sql);
+        if plan.is_err() {
+            return Ok(());
+        }
+        let plan = plan.unwrap();
         let ctx = self.ctx.clone();
         let default_plan_config = PlanConfig::default();
 
-        let df_plan = resolve_and_execute_plan(&ctx, Arc::new(default_plan_config), plan)
-            .await
-            .unwrap();
-        let batches = execute_stream(df_plan, ctx.task_ctx())?;
-        let batches = collect(batches).await?;
+        let df_plan = resolve_and_execute_plan(&ctx, Arc::new(default_plan_config), plan).await;
+        if df_plan.is_err() {
+            return Ok(());
+        }
 
+        let df_plan = df_plan.unwrap();
+
+        let batches = execute_stream(df_plan, ctx.task_ctx())?;
+
+        let batches = collect(batches).await;
+        if batches.is_err() {
+            return Ok(());
+        }
+
+        let batches = batches.unwrap();
         let schema = batches[0].schema();
 
         let columns = compact_columns(schema)?;

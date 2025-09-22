@@ -3,7 +3,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
 use datafusion::catalog::Session;
@@ -18,8 +17,8 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use futures::stream::{Stream, StreamExt};
-use sqlx::postgres::{PgPool, PgRow};
-use sqlx::Row;
+use kokedb_common::table::postgresql::{get_postgresql_table_schema, rows_to_record_batch};
+use sqlx::postgres::PgPool;
 
 #[derive(Debug, Clone)]
 pub struct PostgreSQLConfig {
@@ -51,68 +50,12 @@ impl PostgreSQLTableProvider {
     }
 
     async fn infer_schema(pool: &PgPool, config: &PostgreSQLConfig) -> Result<Schema> {
-        let _full_table_name = match &config.schema_name {
-            Some(schema) => format!("{}.{}", schema, config.table_name),
-            None => config.table_name.clone(),
-        };
-
-        let query = format!(
-            "SELECT column_name, data_type, is_nullable 
-             FROM information_schema.columns 
-             WHERE table_name = $1 
-             AND table_schema = $2
-             ORDER BY ordinal_position",
-        );
-
         let schema_name = config.schema_name.as_deref().unwrap_or("public");
+        let table_name = &config.table_name;
 
-        let rows = sqlx::query(&query)
-            .bind(&config.table_name)
-            .bind(schema_name)
-            .fetch_all(pool)
+        get_postgresql_table_schema(pool, schema_name, table_name)
             .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
-        let mut fields = Vec::new();
-
-        for row in rows {
-            let column_name: String = row.get("column_name");
-            let data_type: String = row.get("data_type");
-            let is_nullable: String = row.get("is_nullable");
-
-            let arrow_type = Self::pg_type_to_arrow(&data_type)?;
-            let nullable = is_nullable == "YES";
-
-            fields.push(Field::new(column_name, arrow_type, nullable));
-        }
-
-        Ok(Schema::new(fields))
-    }
-
-    fn pg_type_to_arrow(pg_type: &str) -> Result<DataType> {
-        match pg_type.to_lowercase().as_str() {
-            "smallint" | "int2" => Ok(DataType::Int16),
-            "integer" | "int4" => Ok(DataType::Int32),
-            "bigint" | "int8" => Ok(DataType::Int64),
-            "real" | "float4" => Ok(DataType::Float32),
-            "double precision" | "float8" => Ok(DataType::Float64),
-            "numeric" | "decimal" => Ok(DataType::Decimal128(38, 10)),
-            "boolean" | "bool" => Ok(DataType::Boolean),
-            "text" | "varchar" | "character varying" | "char" | "character" => Ok(DataType::Utf8),
-            "bytea" => Ok(DataType::Binary),
-            "date" => Ok(DataType::Date32),
-            "timestamp" | "timestamp without time zone" => {
-                Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
-            }
-            "timestamp with time zone" | "timestamptz" => Ok(DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into()),
-            )),
-            "time" | "time without time zone" => Ok(DataType::Time64(TimeUnit::Microsecond)),
-            "uuid" => Ok(DataType::Utf8),
-            "json" | "jsonb" => Ok(DataType::Utf8),
-            _ => Ok(DataType::Utf8),
-        }
+            .map_err(|x| DataFusionError::External(Box::new(x)))
     }
 }
 
@@ -346,13 +289,13 @@ impl PostgreSQLStream {
                         batch_rows.push(row);
 
                         if batch_rows.len() >= BATCH_SIZE {
-                            match Self::rows_to_record_batch(&batch_rows, &schema_for_stream) {
+                            match rows_to_record_batch(&batch_rows, &schema_for_stream) {
                                 Ok(batch) => {
                                     yield Ok(batch);
                                     batch_rows.clear();
                                 }
                                 Err(e) => {
-                                    yield Err(e);
+                                    yield Err(DataFusionError::Internal(format!("Failed to transaction record batch with error: {}", e)));
                                     return;
                                 }
                             }
@@ -366,9 +309,9 @@ impl PostgreSQLStream {
             }
 
             if !batch_rows.is_empty() {
-                match Self::rows_to_record_batch(&batch_rows, &schema_for_stream) {
+                match rows_to_record_batch(&batch_rows, &schema_for_stream) {
                     Ok(batch) => yield Ok(batch),
-                    Err(e) => yield Err(e),
+                    Err(e) => yield Err(DataFusionError::Internal(format!("Failed to transaction record_batch with error: {}", e))),
                 }
             }
         };
@@ -376,82 +319,6 @@ impl PostgreSQLStream {
         Self {
             schema,
             stream: Box::pin(stream),
-        }
-    }
-
-    fn rows_to_record_batch(rows: &[PgRow], schema: &Schema) -> Result<RecordBatch> {
-        if rows.is_empty() {
-            return Ok(RecordBatch::new_empty(Arc::new(schema.clone())));
-        }
-
-        let mut columns = Vec::new();
-
-        for (col_idx, field) in schema.fields().iter().enumerate() {
-            let array = Self::build_array_from_rows(rows, col_idx, field)?;
-            columns.push(array);
-        }
-
-        Ok(RecordBatch::try_new(Arc::new(schema.clone()), columns)?)
-    }
-
-    fn build_array_from_rows(rows: &[PgRow], col_idx: usize, field: &Field) -> Result<ArrayRef> {
-        match field.data_type() {
-            DataType::Int16 => {
-                let values: Vec<Option<i16>> = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<i16>, _>(col_idx).unwrap_or(None))
-                    .collect();
-                Ok(Arc::new(Int16Array::from(values)))
-            }
-            DataType::Int32 => {
-                let values: Vec<Option<i32>> = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<i32>, _>(col_idx).unwrap_or(None))
-                    .collect();
-                Ok(Arc::new(Int32Array::from(values)))
-            }
-            DataType::Int64 => {
-                let values: Vec<Option<i64>> = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<i64>, _>(col_idx).unwrap_or(None))
-                    .collect();
-                Ok(Arc::new(Int64Array::from(values)))
-            }
-            DataType::Float32 => {
-                let values: Vec<Option<f32>> = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<f32>, _>(col_idx).unwrap_or(None))
-                    .collect();
-                Ok(Arc::new(Float32Array::from(values)))
-            }
-            DataType::Float64 => {
-                let values: Vec<Option<f64>> = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<f64>, _>(col_idx).unwrap_or(None))
-                    .collect();
-                Ok(Arc::new(Float64Array::from(values)))
-            }
-            DataType::Boolean => {
-                let values: Vec<Option<bool>> = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<bool>, _>(col_idx).unwrap_or(None))
-                    .collect();
-                Ok(Arc::new(BooleanArray::from(values)))
-            }
-            DataType::Utf8 => {
-                let values: Vec<Option<String>> = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<String>, _>(col_idx).unwrap_or(None))
-                    .collect();
-                Ok(Arc::new(StringArray::from(values)))
-            }
-            _ => {
-                let values: Vec<Option<String>> = rows
-                    .iter()
-                    .map(|row| row.try_get::<Option<String>, _>(col_idx).unwrap_or(None))
-                    .collect();
-                Ok(Arc::new(StringArray::from(values)))
-            }
         }
     }
 }

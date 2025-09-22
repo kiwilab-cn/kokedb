@@ -2959,18 +2959,22 @@ dependencies = [
  "arrow",
  "arrow-buffer",
  "arrow-schema",
+ "chrono",
  "env_logger",
  "fastrace",
  "figment",
  "glob",
  "half",
+ "hex",
  "iana-time-zone",
  "num-traits",
  "num_enum",
  "opentelemetry",
+ "rust_decimal",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sqlx",
  "thiserror 2.0.16",
  "tokio",
 ]
@@ -3006,6 +3010,7 @@ dependencies = [
  "datafusion-datasource",
  "futures",
  "glob",
+ "kokedb-common",
  "kokedb-common-datafusion",
  "log",
  "object_store",
@@ -4633,9 +4638,9 @@ checksum = "ad8388ea1a9e0ea807e442e8263a699e7edcb320ecbcd21b4fa8ff859acce3ba"
 
 [[package]]
 name = "rust_decimal"
-version = "1.37.2"
+version = "1.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b203a6425500a03e0919c42d3c47caca51e79f1132046626d2c8871c5092035d"
+checksum = "c8975fc98059f365204d635119cf9c5a60ae67b841ed49b5422a9a7e56cdfac0"
 dependencies = [
  "arrayvec",
  "borsh",
