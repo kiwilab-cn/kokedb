@@ -1,4 +1,5 @@
 pub mod column;
+pub mod error;
 pub mod row;
 
 use std::{io, sync::Arc};

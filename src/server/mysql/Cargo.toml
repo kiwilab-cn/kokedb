@@ -15,7 +15,7 @@ async-trait.workspace = true
 
 datafusion.workspace = true
 log.workspace = true
-
+thiserror.workspace = true
 
 [[bin]]
 path = "src/main.rs"

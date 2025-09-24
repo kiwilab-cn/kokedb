@@ -3056,6 +3056,7 @@ dependencies = [
  "kokedb-task-manager",
  "log",
  "opensrv-mysql",
+ "thiserror 2.0.16",
  "tokio",
 ]
 
