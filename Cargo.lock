@@ -3151,6 +3151,7 @@ dependencies = [
  "kokedb-meta",
  "kokedb-sql-analyzer",
  "kokedb-task-manager",
+ "thiserror 2.0.16",
  "tokio",
  "tokio-cron-scheduler",
 ]
