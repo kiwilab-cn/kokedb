@@ -1,3 +1,4 @@
+use kokedb_sql_analyzer::error::SqlError;
 use thiserror::Error;
 
 pub type QueryResult<T> = Result<T, QueryError>;
@@ -22,6 +23,15 @@ pub enum QueryError {
     CreatePlanError(String),
 }
 
-
-
-
+impl From<SqlError> for QueryError {
+    fn from(value: SqlError) -> Self {
+        match value {
+            SqlError::SqlParserError(mesg) => QueryError::SqlParserError(mesg),
+            SqlError::MissingArgument(mesg) => QueryError::MissingArgument(mesg),
+            SqlError::InvalidArgument(mesg) => QueryError::InvalidArgument(mesg),
+            SqlError::NotImplemented(mesg) => QueryError::NotImplemented(mesg),
+            SqlError::NotSupported(mesg) => QueryError::NotSupported(mesg),
+            SqlError::InternalError(mesg) => QueryError::InternalError(mesg),
+        }
+    }
+}

@@ -21,8 +21,6 @@ struct CoreContex {
     ctx: Arc<SessionContext>,
 }
 
-fn to_mysql_error(err_mesg: SqlError) -> (ErrorKind, &str) {}
-
 #[async_trait::async_trait]
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
     type Error = io::Error;
@@ -53,20 +51,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
     ) -> io::Result<()> {
         println!("sql: {}", sql);
         // TODO: remove unwrap.
-        let plan = plan_sql(sql);
+        let plan = sql_parser(sql);
         if plan.is_err() {
-            let msg = plan.err().unwrap();
-            match msg {
-                kokedb_query::error::QueryError::SqlParserError(_) => todo!(),
-                kokedb_query::error::QueryError::MissingArgument(_) => todo!(),
-                kokedb_query::error::QueryError::InvalidArgument(_) => todo!(),
-                kokedb_query::error::QueryError::NotImplemented(_) => todo!(),
-                kokedb_query::error::QueryError::NotSupported(_) => todo!(),
-                kokedb_query::error::QueryError::InternalError(_) => todo!(),
-                kokedb_query::error::QueryError::CreateContextError(_) => todo!(),
-                kokedb_query::error::QueryError::CreatePlanError(_) => todo!(),
-            };
-            return results.error(ErrorKind::ER_SYNTAX_ERROR, &msg).await;
+            return results.error(kind, msg).await;
         }
         let plan = plan.unwrap();
         let ctx = self.ctx.clone();

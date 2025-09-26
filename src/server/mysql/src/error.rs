@@ -1,3 +1,7 @@
+use datafusion::error::DataFusionError;
+use kokedb_plan::error::PlanError;
+use kokedb_query::error::QueryError;
+use opensrv_mysql::ErrorKind;
 use thiserror::Error;
 
 pub type MysqlResult<T> = Result<T, MysqlServerError>;
@@ -20,4 +24,26 @@ pub enum MysqlServerError {
     Internal(String),
     #[error("external error: {0}")]
     External(String),
+}
+
+impl From<QueryError> for MysqlServerError {
+    fn from(value: QueryError) -> Self {
+        todo!()
+    }
+}
+
+impl From<PlanError> for MysqlServerError {
+    fn from(value: PlanError) -> Self {
+        todo!()
+    }
+}
+
+impl From<DataFusionError> for MysqlServerError {
+    fn from(value: DataFusionError) -> Self {
+        todo!()
+    }
+}
+
+pub fn to_mysql_error(err: MysqlServerError) -> (ErrorKind, String) {
+    todo!()
 }
