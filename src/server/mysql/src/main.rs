@@ -52,9 +52,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         println!("sql: {}", sql);
         // TODO: remove unwrap.
         let plan = sql_parser(sql);
-        if plan.is_err() {
-            return results.error(kind, msg).await;
-        }
+
         let plan = plan.unwrap();
         let ctx = self.ctx.clone();
         let default_plan_config = PlanConfig::default();

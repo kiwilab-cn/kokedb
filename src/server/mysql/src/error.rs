@@ -1,3 +1,5 @@
+use std::io;
+
 use datafusion::error::DataFusionError;
 use kokedb_plan::error::PlanError;
 use kokedb_query::error::QueryError;
@@ -41,6 +43,14 @@ impl From<PlanError> for MysqlServerError {
 impl From<DataFusionError> for MysqlServerError {
     fn from(value: DataFusionError) -> Self {
         todo!()
+    }
+}
+
+impl From<io::Error> for MysqlServerError {
+    fn from(error: io::Error) -> Self {
+        let msg = format!("{} ({})", error.kind(), &error);
+
+        MysqlServerError::WriteMysqlResultError(msg)
     }
 }
 
