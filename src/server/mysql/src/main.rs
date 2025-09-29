@@ -2,15 +2,11 @@ pub mod column;
 pub mod error;
 pub mod row;
 
-use std::{io, sync::Arc};
+use std::sync::Arc;
 
-use datafusion::{
-    physical_plan::{common::collect, execute_stream},
-    prelude::SessionContext,
-};
+use datafusion::prelude::SessionContext;
 use kokedb_common::opentelemetry::init_logger;
-use kokedb_plan::{config::PlanConfig, resolve_and_execute_plan};
-use kokedb_query::{binder::*, context::create_session_context};
+use kokedb_query::{binder::query, context::create_session_context};
 use opensrv_mysql::*;
 use tokio::{io::AsyncWrite, net::TcpListener};
 
@@ -23,14 +19,16 @@ struct CoreContex {
 
 #[async_trait::async_trait]
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
-    type Error = io::Error;
+    type Error = MysqlServerError;
 
     async fn on_prepare<'a>(
         &'a mut self,
         _: &'a str,
         info: StatementMetaWriter<'a, W>,
-    ) -> io::Result<()> {
-        info.reply(42, &[], &[]).await
+    ) -> Result<(), MysqlServerError> {
+        info.reply(42, &[], &[])
+            .await
+            .map_err(|x| MysqlServerError::InternalError(x.to_string()))
     }
 
     async fn on_execute<'a>(
@@ -38,8 +36,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         _: u32,
         _: opensrv_mysql::ParamParser<'a>,
         results: QueryResultWriter<'a, W>,
-    ) -> io::Result<()> {
-        results.completed(OkResponse::default()).await
+    ) -> Result<(), MysqlServerError> {
+        results
+            .completed(OkResponse::default())
+            .await
+            .map_err(|x| MysqlServerError::InternalError(x.to_string()))
     }
 
     async fn on_close(&mut self, _: u32) {}
@@ -48,48 +49,40 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         &'a mut self,
         sql: &'a str,
         results: QueryResultWriter<'a, W>,
-    ) -> io::Result<()> {
+    ) -> Result<(), MysqlServerError> {
         println!("sql: {}", sql);
         // TODO: remove unwrap.
-        let plan = sql_parser(sql);
 
-        let plan = plan.unwrap();
         let ctx = self.ctx.clone();
-        let default_plan_config = PlanConfig::default();
 
-        let df_plan = resolve_and_execute_plan(&ctx, Arc::new(default_plan_config), plan).await;
-        if df_plan.is_err() {
-            return Ok(());
-        }
-
-        let df_plan = df_plan.unwrap();
-
-        let batches = execute_stream(df_plan, ctx.task_ctx())?;
-
-        let batches = collect(batches).await;
-        if batches.is_err() {
-            return Ok(());
-        }
-
-        let batches = batches.unwrap();
+        let batches = query(ctx, sql).await?;
         let schema = batches[0].schema();
 
         let columns = compact_columns(schema)?;
 
-        let mut writer = results.start(&columns).await?;
+        let mut writer = results
+            .start(&columns)
+            .await
+            .map_err(|x| MysqlServerError::CreateMysqlResultWriterError(x.to_string()))?;
 
         let rows: Vec<Vec<String>> = compact_rows(batches)?;
         for row in rows {
-            writer.write_row(row.iter().map(|s| s.as_str())).await?;
+            writer
+                .write_row(row.iter().map(|s| s.as_str()))
+                .await
+                .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()))?;
         }
 
-        writer.finish_with_info("Query executed successfully").await
+        writer
+            .finish_with_info("Query executed successfully")
+            .await
+            .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()))
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    init_logger()?;
+async fn main() -> Result<(), MysqlServerError> {
+    init_logger().unwrap();
     let listener = TcpListener::bind("0.0.0.0:3306").await.unwrap();
     let ctx = create_session_context().await.unwrap();
 

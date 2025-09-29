@@ -1,7 +1,9 @@
 use fastrace::prelude::SpanContext;
 use std::io::Write;
 
-pub fn init_logger() -> Result<(), Box<dyn std::error::Error>> {
+use crate::error::CommonError;
+
+pub fn init_logger() -> Result<(), CommonError> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(move |buf, record| {
             let level = record.level();
