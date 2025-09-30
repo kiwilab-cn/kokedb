@@ -1,6 +1,7 @@
 use std::io;
 
 use kokedb_query::error::QueryError;
+use opensrv_mysql::ErrorKind;
 use thiserror::Error;
 
 pub type MysqlResult<T> = Result<T, MysqlServerError>;
@@ -71,4 +72,12 @@ impl From<io::Error> for MysqlServerError {
 
         MysqlServerError::WriteMysqlResultError(msg)
     }
+}
+
+pub fn to_mysql_error(error: &QueryError) -> (ErrorKind, String) {
+    let mesg = error.to_string();
+
+    let kind = ErrorKind::ER_QUERY_INTERRUPTED;
+
+    (kind, mesg)
 }

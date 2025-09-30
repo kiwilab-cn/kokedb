@@ -10,7 +10,11 @@ use kokedb_query::{binder::query, context::create_session_context};
 use opensrv_mysql::*;
 use tokio::{io::AsyncWrite, net::TcpListener};
 
-use crate::{column::compact_columns, error::MysqlServerError, row::compact_rows};
+use crate::{
+    column::compact_columns,
+    error::{to_mysql_error, MysqlServerError},
+    row::compact_rows,
+};
 
 #[derive(Clone)]
 struct CoreContex {
@@ -55,7 +59,17 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
 
         let ctx = self.ctx.clone();
 
-        let batches = query(ctx, sql).await?;
+        let query_result = query(ctx, sql).await;
+        if query_result.is_err() {
+            let error = query_result.err().unwrap();
+            let (kind, error_mesg) = to_mysql_error(&error);
+            return results
+                .error(kind, error_mesg.as_bytes())
+                .await
+                .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()));
+        }
+
+        let batches = query_result.unwrap();
         let schema = batches[0].schema();
 
         let columns = compact_columns(schema)?;
