@@ -1,0 +1,29 @@
+[package]
+name = "kokedb-task-manager"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kokedb-common.workspace = true
+kokedb-meta.workspace = true
+
+
+datafusion.workspace = true
+arrow.workspace = true
+
+thiserror.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde.workspace = true
+
+rust_decimal.workspace = true
+sqlx.workspace = true
+futures-util.workspace = true
+log.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

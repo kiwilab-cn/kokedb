@@ -1,0 +1,26 @@
+[package]
+name = "kokedb-query"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kokedb-common.workspace = true
+kokedb-sql-analyzer.workspace = true
+kokedb-catalog.workspace = true
+kokedb-task-manager.workspace = true
+kokedb-meta.workspace = true
+kokedb-plan.workspace = true
+
+datafusion.workspace = true
+datafusion-common.workspace = true
+datafusion-expr.workspace = true
+datafusion-expr-common.workspace = true
+datafusion-functions.workspace = true
+datafusion-functions-nested.workspace = true
+datafusion-physical-expr.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+dashmap.workspace = true
+tokio-cron-scheduler.workspace = true
+thiserror.workspace = true

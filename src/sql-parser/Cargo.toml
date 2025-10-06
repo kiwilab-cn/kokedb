@@ -1,0 +1,20 @@
+[package]
+name = "kokedb-sql-parser"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+kokedb-sql-macro.workspace = true
+
+chumsky.workspace = true
+phf.workspace = true
+either.workspace = true
+paste.workspace = true
+
+[build-dependencies]
+prettyplease.workspace = true
+syn.workspace = true
+quote.workspace = true

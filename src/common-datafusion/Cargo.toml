@@ -1,0 +1,21 @@
+[package]
+name = "kokedb-common-datafusion"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+kokedb-common.workspace = true
+
+chrono.workspace = true
+ryu.workspace = true
+datafusion.workspace = true
+datafusion-common.workspace = true
+datafusion-expr.workspace = true
+thiserror.workspace = true
+lexical-core.workspace = true
+futures.workspace = true
+serde.workspace = true
+async-trait.workspace = true

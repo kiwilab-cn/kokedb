@@ -1,0 +1,26 @@
+[package]
+name = "kokedb-python-udf"
+version = { workspace = true }
+edition = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+kokedb-common.workspace = true
+kokedb-common-datafusion.workspace = true
+
+thiserror = { workspace = true }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+arrow-pyarrow = { workspace = true }
+pyo3 = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+md-5 = { workspace = true }
+num-bigint = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]

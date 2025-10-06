@@ -1,0 +1,37 @@
+[package]
+name = "kokedb-common"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+# DO NOT add DataFusion dependencies for this crate.
+# All utilities that depend on DataFusion should be defined in the `sail-common-datafusion` crate.
+
+[dependencies]
+# Ideally we should use the re-exported version of Arrow in DataFusion,
+# but here we depend on the Arrow crates directly so that this crate can be built without DataFusion.
+arrow.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+glob.workspace = true
+num_enum.workspace = true
+num-traits.workspace = true
+figment.workspace = true
+half.workspace = true
+iana-time-zone.workspace = true
+tokio.workspace = true 
+
+env_logger.workspace = true
+fastrace.workspace = true
+opentelemetry.workspace = true
+
+sqlx.workspace = true
+rust_decimal.workspace = true
+chrono.workspace = true
+hex.workspace = true
