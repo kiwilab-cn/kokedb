@@ -87,6 +87,18 @@ impl PostgreSQLMetaCatalogProviderList {
                 updated_at timestamp DEFAULT CURRENT_TIMESTAMP
             );
             "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS system.sql_stats (
+                sql_hash BIGINT PRIMARY KEY,
+                sql_text TEXT NOT NULL,
+                execution_time BIGINT NOT NULL DEFAULT 0,
+                count INTEGER NOT NULL DEFAULT 0,
+                min_time BIGINT,
+                max_time BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
         ];
 
         for sql in sql_statements {
@@ -123,6 +135,21 @@ impl PostgreSQLMetaCatalogProviderList {
                 ) THEN
                     CREATE TRIGGER update_catalog_modtime
                         BEFORE UPDATE ON system.catalog
+                FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
+                END IF;
+            END $$;
+            "#,
+            r#"
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_trigger
+                    WHERE tgname = 'update_sql_stats_modtime'
+                    AND tgrelid = 'system.sql_stats'::regclass
+                ) THEN
+                    CREATE TRIGGER update_sql_stats_modtime
+                        BEFORE UPDATE ON system.sql_stats
                 FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
                 END IF;
             END $$;
@@ -344,6 +371,31 @@ impl PostgreSQLMetaCatalogProviderList {
         };
 
         Ok((schema, local_path))
+    }
+
+    pub fn save_sql_history(&self, sql: &str, key: u64, cost: u64) -> Result<bool> {
+        let insert_sql =
+            "INSERT INTO sql_stats (sql_hash, sql_text, execution_time, count, min_time, max_time)
+            VALUES ($1, $2, $3, 1, $3, $3)
+            ON CONFLICT (sql_hash) DO UPDATE SET
+            execution_time = sql_stats.execution_time + EXCLUDED.execution_time,
+            count = sql_stats.count + 1,
+            min_time = LEAST(sql_stats.min_time, EXCLUDED.min_time),
+            max_time = GREATEST(sql_stats.max_time, EXCLUDED.max_time)";
+
+        let ret = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                sqlx::query(insert_sql)
+                    .bind(key as i64)
+                    .bind(sql)
+                    .bind(cost as i64)
+                    .execute(&self.local_pool)
+                    .await
+            })
+        })
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(ret.rows_affected().is_eq(1))
     }
 }
 
