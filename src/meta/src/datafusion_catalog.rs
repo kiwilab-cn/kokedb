@@ -12,6 +12,8 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 
 use kokedb_data_source::formats::remote_table::{PostgreSQLConfig, PostgreSQLTableProvider};
+use log::error;
+use sqlx::types::chrono;
 use sqlx::{PgPool, Row};
 
 use crate::catalog_list::{CatalogInfo, PostgreSQLMetaCatalogProviderList};
@@ -142,8 +144,9 @@ impl PostgreSQLSchemaProvider {
         table_name: &str,
         meta_client: &PostgreSQLMetaCatalogProviderList,
     ) -> Result<Arc<dyn TableProvider>> {
-        let (schema, table_path) =
-            meta_client.get_table_schema(&self.catalog_info.name, &self.schema_name, table_name)?;
+        let (schema, table_path) = meta_client
+            .get_table_schema(&self.catalog_info.name, &self.schema_name, table_name)
+            .await?;
         let file_format: Arc<dyn datafusion::datasource::file_format::FileFormat> =
             Arc::new(ParquetFormat::default());
 
@@ -179,15 +182,23 @@ impl SchemaProvider for PostgreSQLSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>, DataFusionError> {
-        if let Some(table) = self.table_cache.get(name) {
-            return Ok(Some(Arc::clone(&table)));
-        }
-
         let catalog = self.catalog_info.name.clone();
         let schema = self.schema_name.clone();
         let dsn = self.catalog_info.dsn.clone();
 
         let meta_client = PostgreSQLMetaCatalogProviderList::new().await?;
+        let today = chrono::Local::now().naive_local().date();
+
+        let ret = meta_client
+            .save_table_daily_stats(&catalog, &schema, &name, today)
+            .await;
+        if ret.is_err() {
+            error!(
+                "Failed to store table daily stats to meta db with error: {:?}",
+                ret.err().unwrap()
+            );
+        }
+
         let is_cached = meta_client
             .check_table_is_cached(&catalog, &schema, name)
             .await?;

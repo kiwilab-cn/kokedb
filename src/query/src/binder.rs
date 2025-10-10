@@ -16,7 +16,6 @@ use crate::error::{QueryError, QueryResult};
 
 pub fn parser(sql: &str) -> QueryResult<Plan> {
     let tree = parse_one_statement(sql)?;
-
     let plan = from_ast_statement(tree)?;
     Ok(plan)
 }
@@ -35,7 +34,10 @@ pub async fn query(ctx: Arc<SessionContext>, sql: &str) -> Result<Vec<RecordBatc
 
     let ret = save_sql_history(sql, &plan, cost).await;
     if ret.is_err() {
-        error!("Failed to store sql execute info to meta db.");
+        error!(
+            "Failed to store sql execute info to meta db with error: {:?}",
+            ret.err().unwrap()
+        );
     }
 
     Ok(batches)
@@ -53,9 +55,12 @@ async fn save_sql_history(sql: &str, plan: &Plan, cost: u64) -> Result<bool, Que
         .map_err(|_x| {
             QueryError::InternalError("Failed to connect meta postgresql server.".to_string())
         })?;
-    let ret = meta_client.save_sql_history(sql, key, cost).map_err(|x| {
-        QueryError::SaveSqlStatsError(format!("Failed to save sql stats with error: {:?}", x))
-    })?;
+    let ret = meta_client
+        .save_sql_stats(sql, key, cost)
+        .await
+        .map_err(|x| {
+            QueryError::SaveSqlStatsError(format!("Failed to save sql stats with error: {:?}", x))
+        })?;
 
     Ok(ret)
 }

@@ -42,6 +42,8 @@ pub enum MysqlServerError {
     ObjectStoreError(String),
     #[error("parquet store error: {0}")]
     ParquetError(String),
+    #[error("save sql stats error: {0}")]
+    SaveSqlStatsError(String),
 }
 
 impl From<QueryError> for MysqlServerError {
@@ -62,6 +64,7 @@ impl From<QueryError> for MysqlServerError {
             QueryError::IoError(mesg) => MysqlServerError::IoError(mesg),
             QueryError::ObjectStoreError(mesg) => MysqlServerError::ObjectStoreError(mesg),
             QueryError::ParquetError(mesg) => MysqlServerError::ParquetError(mesg),
+            QueryError::SaveSqlStatsError(mesg) => MysqlServerError::SaveSqlStatsError(mesg),
         }
     }
 }

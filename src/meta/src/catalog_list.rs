@@ -10,6 +10,7 @@ use datafusion::error::{DataFusionError, Result};
 
 use datafusion::sql::sqlparser::parser::ParserError;
 use kokedb_common::cache_policy::parse_cache_policy;
+use sqlx::types::chrono::NaiveDate;
 use sqlx::{PgPool, Row};
 
 use crate::datafusion_catalog::PostgreSQLCatalogProvider;
@@ -89,7 +90,7 @@ impl PostgreSQLMetaCatalogProviderList {
             "#,
             r#"
             CREATE TABLE IF NOT EXISTS system.sql_stats (
-                sql_hash BIGINT PRIMARY KEY,
+                sql_hash VARCHAR(20) PRIMARY KEY,
                 sql_text TEXT NOT NULL,
                 execution_time BIGINT NOT NULL DEFAULT 0,
                 count INTEGER NOT NULL DEFAULT 0,
@@ -97,6 +98,19 @@ impl PostgreSQLMetaCatalogProviderList {
                 max_time BIGINT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS query_table_daily_stats (
+                id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
+                catalog VARCHAR(255) NOT NULL,
+                schema_name VARCHAR(255) NOT NULL,
+                table_name VARCHAR(255) NOT NULL,
+                stat_date DATE NOT NULL,
+                query_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(catalog, schema_name, table_name, stat_date)
             );
             "#,
         ];
@@ -150,6 +164,21 @@ impl PostgreSQLMetaCatalogProviderList {
                 ) THEN
                     CREATE TRIGGER update_sql_stats_modtime
                         BEFORE UPDATE ON system.sql_stats
+                FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
+                END IF;
+            END $$;
+            "#,
+            r#"
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_trigger
+                    WHERE tgname = 'update_table_daily_stats_modtime'
+                    AND tgrelid = 'system.query_table_daily_stats'::regclass
+                ) THEN
+                    CREATE TRIGGER update_table_daily_stats_modtime
+                        BEFORE UPDATE ON system.query_table_daily_stats
                 FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
                 END IF;
             END $$;
@@ -342,7 +371,7 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(row.is_some())
     }
 
-    pub fn get_table_schema(
+    pub async fn get_table_schema(
         &self,
         catalog: &str,
         schema: &str,
@@ -354,11 +383,10 @@ impl PostgreSQLMetaCatalogProviderList {
             catalog, schema, table
         );
 
-        let row = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { sqlx::query(&sql).fetch_optional(&self.local_pool).await })
-        })
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let row = sqlx::query(&sql)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let (schema, local_path) = if row.is_some() {
             let row = row.unwrap();
@@ -373,9 +401,9 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok((schema, local_path))
     }
 
-    pub fn save_sql_history(&self, sql: &str, key: u64, cost: u64) -> Result<bool> {
+    pub async fn save_sql_stats(&self, sql: &str, key: u64, cost: u64) -> Result<bool> {
         let insert_sql =
-            "INSERT INTO sql_stats (sql_hash, sql_text, execution_time, count, min_time, max_time)
+            "INSERT INTO system.sql_stats (sql_hash, sql_text, execution_time, count, min_time, max_time)
             VALUES ($1, $2, $3, 1, $3, $3)
             ON CONFLICT (sql_hash) DO UPDATE SET
             execution_time = sql_stats.execution_time + EXCLUDED.execution_time,
@@ -383,19 +411,41 @@ impl PostgreSQLMetaCatalogProviderList {
             min_time = LEAST(sql_stats.min_time, EXCLUDED.min_time),
             max_time = GREATEST(sql_stats.max_time, EXCLUDED.max_time)";
 
-        let ret = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                sqlx::query(insert_sql)
-                    .bind(key as i64)
-                    .bind(sql)
-                    .bind(cost as i64)
-                    .execute(&self.local_pool)
-                    .await
-            })
-        })
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let ret = sqlx::query(insert_sql)
+            .bind(key.to_string())
+            .bind(sql)
+            .bind(cost as i64)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Ok(ret.rows_affected().is_eq(1))
+    }
+
+    pub async fn save_table_daily_stats(
+        &self,
+        catalog: &str,
+        schema_name: &str,
+        table_name: &str,
+        stat_date: NaiveDate,
+    ) -> Result<bool> {
+        let insert_sql =
+            "INSERT INTO query_table_daily_stats (catalog, schema_name, table_name, stat_date, query_count)
+            VALUES ($1, $2, $3, $4, 1)
+            ON CONFLICT (catalog, schema_name, table_name, stat_date)
+            DO UPDATE SET
+                query_count = query_table_daily_stats.query_count + 1";
+
+        let ret = sqlx::query(insert_sql)
+            .bind(catalog)
+            .bind(schema_name)
+            .bind(table_name)
+            .bind(stat_date)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(ret.rows_affected() == 1)
     }
 }
 
