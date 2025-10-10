@@ -88,6 +88,7 @@ impl DataFusionCatalogAdapter {
         let location = if is_cached {
             let (_schema, local_path) = meta_client
                 .get_table_schema(&catalog_info.name, schema_name, table_name)
+                .await
                 .map_err(|x| {
                     CatalogError::Internal(format!(
                         "Failed to get table schema and path with error: {}",

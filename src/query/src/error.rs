@@ -37,6 +37,8 @@ pub enum QueryError {
     ObjectStoreError(String),
     #[error("parquet store error: {0}")]
     ParquetError(String),
+    #[error("save sql stats error: {0}")]
+    SaveSqlStatsError(String),
 }
 
 impl From<SqlError> for QueryError {
