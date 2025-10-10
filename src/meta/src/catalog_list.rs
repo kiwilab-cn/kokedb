@@ -101,7 +101,7 @@ impl PostgreSQLMetaCatalogProviderList {
             );
             "#,
             r#"
-            CREATE TABLE IF NOT EXISTS query_table_daily_stats (
+            CREATE TABLE IF NOT EXISTS system.query_table_daily_stats (
                 id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
                 catalog VARCHAR(255) NOT NULL,
                 schema_name VARCHAR(255) NOT NULL,
@@ -430,7 +430,7 @@ impl PostgreSQLMetaCatalogProviderList {
         stat_date: NaiveDate,
     ) -> Result<bool> {
         let insert_sql =
-            "INSERT INTO query_table_daily_stats (catalog, schema_name, table_name, stat_date, query_count)
+            "INSERT INTO system.query_table_daily_stats (catalog, schema_name, table_name, stat_date, query_count)
             VALUES ($1, $2, $3, $4, 1)
             ON CONFLICT (catalog, schema_name, table_name, stat_date)
             DO UPDATE SET
