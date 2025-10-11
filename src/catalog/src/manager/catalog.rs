@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use kokedb_common::cache_policy::CachePolicy;
+use kokedb_common::env::get_env_as;
 use kokedb_task_manager::cache_sync_task::execute_catalog_sync_task;
 use kokedb_task_manager::error::TaskError;
 use log::{error, info};
@@ -93,7 +94,7 @@ impl CatalogManager {
         dsn: &str,
         catalog: &str,
     ) -> CatalogResult<uuid::Uuid> {
-        const SCHEDULE_INTERVAL_MINUTES: u32 = 3; // 1 hour
+        let schedule_interval_min: u32 = get_env_as("KOKEDB_CACHE_JOB_INTERVAL", 60u32); // 1 hour
 
         let state = self
             .state()
@@ -117,29 +118,9 @@ impl CatalogManager {
             ))
         })?;
 
-        // Run once first, and then added scheduler job.
-        if let Err(e) = execute_catalog_sync_task(
-            dsn,
-            catalog,
-            catalog_task_manager.clone(),
-            cache_policy.clone(),
-        )
-        .await
-        {
-            error!(
-                "Catalog first sync task failed for catalog '{}' with DSN '{}': {}",
-                catalog, dsn, e
-            );
-        } else {
-            info!(
-                "Success first sync task for catalog {} with DSN: {}",
-                catalog, dsn
-            );
-        }
-
         let job_dsn = dsn.to_string();
         let job_catalog = catalog.to_string();
-        let cron_expr = format!("0 */{} * * * *", SCHEDULE_INTERVAL_MINUTES);
+        let cron_expr = format!("0 */{} * * * *", schedule_interval_min);
 
         let job = Job::new_async(cron_expr, move |_uuid, _l| {
             let dsn = job_dsn.clone();

@@ -2,6 +2,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
+use chrono::{Duration, Local, NaiveDate};
 use dashmap::DashMap;
 use datafusion::arrow::array::ArrowNativeTypeOp;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList};
@@ -10,7 +11,6 @@ use datafusion::error::{DataFusionError, Result};
 
 use datafusion::sql::sqlparser::parser::ParserError;
 use kokedb_common::cache_policy::parse_cache_policy;
-use sqlx::types::chrono::NaiveDate;
 use sqlx::{PgPool, Row};
 
 use crate::datafusion_catalog::PostgreSQLCatalogProvider;
@@ -218,7 +218,7 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     pub async fn load_catalog_info(&self) -> Result<Vec<CatalogInfo>> {
-        let query = "SELECT name, dsn FROM system.catalog";
+        let query = "SELECT name, dsn FROM system.catalog;";
 
         let rows = sqlx::query(query)
             .fetch_all(&self.local_pool)
@@ -238,9 +238,10 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     pub async fn get_catalog(&self, name: &str) -> Result<CatalogInfo> {
-        let query = format!("SELECT name, dsn FROM system.catalog where name='{}'", name);
+        let sql = "SELECT name, dsn FROM system.catalog where name = $1;";
 
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sql)
+            .bind(name)
             .fetch_one(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -254,12 +255,10 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     pub async fn get_catalog_cache_policy(&self, name: &str) -> Result<String> {
-        let query = format!(
-            "SELECT cache_policy FROM system.catalog where name='{}'",
-            name
-        );
+        let sql = "SELECT cache_policy FROM system.catalog where name = $1;";
 
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sql)
+            .bind(name)
             .fetch_one(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -292,7 +291,7 @@ impl PostgreSQLMetaCatalogProviderList {
         })?;
 
         let insert_sql =
-            "INSERT INTO system.catalog (name, dsn, db_type, description, cache_policy) VALUES ($1, $2, $3, $4, $5)";
+            "INSERT INTO system.catalog (name, dsn, db_type, description, cache_policy) VALUES ($1, $2, $3, $4, $5);";
 
         let ret = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -357,13 +356,13 @@ impl PostgreSQLMetaCatalogProviderList {
         schema: &str,
         table: &str,
     ) -> Result<bool> {
-        let sql = format!(
-            "select arrow_schema, local_path from system.table_arrow_schema \
-            where catalog_name = '{}' and schema_name='{}' and table_name='{}'",
-            catalog, schema, table
-        );
+        let sql = "select arrow_schema, local_path from system.table_arrow_schema \
+            where catalog_name = $1 and schema_name = $2 and table_name = $3;";
 
         let row = sqlx::query(&sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
             .fetch_optional(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -377,28 +376,25 @@ impl PostgreSQLMetaCatalogProviderList {
         schema: &str,
         table: &str,
     ) -> Result<(Arc<Schema>, String)> {
-        let sql = format!(
-            "select arrow_schema, local_path from system.table_arrow_schema \
-            where catalog_name = '{}' and schema_name='{}' and table_name='{}'",
-            catalog, schema, table
-        );
+        let sql = "select arrow_schema, local_path from system.table_arrow_schema \
+        where catalog_name = $1 and schema_name = $2 and table_name = $3;";
 
-        let row = sqlx::query(&sql)
+        let row = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
             .fetch_optional(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let (schema, local_path) = if row.is_some() {
-            let row = row.unwrap();
+        if let Some(row) = row {
             let arrow_schema: Vec<u8> = row.get("arrow_schema");
             let local_path: String = row.get("local_path");
             let schema = binary_to_schema(&arrow_schema)?;
-            (schema, local_path)
+            Ok((schema, local_path))
         } else {
-            (Arc::new(Schema::empty()), "".to_string())
-        };
-
-        Ok((schema, local_path))
+            Ok((Arc::new(Schema::empty()), String::new()))
+        }
     }
 
     pub async fn save_sql_stats(&self, sql: &str, key: u64, cost: u64) -> Result<bool> {
@@ -409,7 +405,7 @@ impl PostgreSQLMetaCatalogProviderList {
             execution_time = sql_stats.execution_time + EXCLUDED.execution_time,
             count = sql_stats.count + 1,
             min_time = LEAST(sql_stats.min_time, EXCLUDED.min_time),
-            max_time = GREATEST(sql_stats.max_time, EXCLUDED.max_time)";
+            max_time = GREATEST(sql_stats.max_time, EXCLUDED.max_time);";
 
         let ret = sqlx::query(insert_sql)
             .bind(key.to_string())
@@ -434,7 +430,7 @@ impl PostgreSQLMetaCatalogProviderList {
             VALUES ($1, $2, $3, $4, 1)
             ON CONFLICT (catalog, schema_name, table_name, stat_date)
             DO UPDATE SET
-                query_count = query_table_daily_stats.query_count + 1";
+                query_count = query_table_daily_stats.query_count + 1;";
 
         let ret = sqlx::query(insert_sql)
             .bind(catalog)
@@ -446,6 +442,32 @@ impl PostgreSQLMetaCatalogProviderList {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Ok(ret.rows_affected() == 1)
+    }
+
+    pub async fn get_recent_table_stats(&self, catalog: &str) -> Result<Vec<String>> {
+        let seven_days_ago = Local::now() - Duration::days(7);
+
+        let sql = "select distinct schema_name, table_name from system.query_table_daily_stats \
+        where catalog = $1 and stat_date >= $2 \
+        order by schema_name, table_name;";
+
+        let rows = sqlx::query(sql)
+            .bind(catalog)
+            .bind(seven_days_ago.date_naive())
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let stats = rows
+            .iter()
+            .map(|row| {
+                let schema_name: String = row.get("schema_name");
+                let table_name: String = row.get("table_name");
+                format!("{}.{}", schema_name, table_name)
+            })
+            .collect();
+
+        Ok(stats)
     }
 }
 

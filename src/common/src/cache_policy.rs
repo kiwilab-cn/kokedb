@@ -5,6 +5,7 @@ pub enum CachePolicy {
     TopK { k: u32 },
     All,
     Select { table_set: String },
+    Smart,
 }
 
 #[derive(Debug)]
@@ -23,17 +24,15 @@ impl CachePolicy {
             CachePolicy::TopK { k } => format!("topk:k={}", k),
             CachePolicy::All => "all".to_string(),
             CachePolicy::Select { table_set } => format!("select:table_set={}", table_set),
+            CachePolicy::Smart => "smart".to_string(),
         }
     }
 
     pub fn from_string(s: &str) -> Result<Self, ParseError> {
         if s == "all" {
             return Ok(CachePolicy::All);
-        }
-
-        if s.is_empty() {
-            let default = CachePolicy::TopK { k: 10 };
-            return Ok(default);
+        } else if s == "smart" || s.is_empty() {
+            return Ok(CachePolicy::Smart);
         }
 
         if let Some(colon_pos) = s.find(':') {
@@ -71,7 +70,7 @@ impl CachePolicy {
 pub fn parse_cache_policy(properties: Vec<(String, String)>) -> Result<CachePolicy, ParseError> {
     let props: HashMap<String, String> = properties.into_iter().collect();
 
-    let default = CachePolicy::TopK { k: 10 };
+    let default = CachePolicy::Smart;
     let cache_policy = props.get("cache_policy");
     if cache_policy.is_none() {
         return Ok(default);
@@ -91,6 +90,7 @@ pub fn parse_cache_policy(properties: Vec<(String, String)>) -> Result<CachePoli
             Ok(CachePolicy::TopK { k })
         }
         "all" => Ok(CachePolicy::All),
+        "smart" => Ok(CachePolicy::Smart),
         "select" => {
             let table_set = props
                 .get("table_set")
