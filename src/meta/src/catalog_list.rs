@@ -218,7 +218,7 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     pub async fn load_catalog_info(&self) -> Result<Vec<CatalogInfo>> {
-        let query = "SELECT name, dsn FROM system.catalog";
+        let query = "SELECT name, dsn FROM system.catalog;";
 
         let rows = sqlx::query(query)
             .fetch_all(&self.local_pool)
@@ -238,7 +238,7 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     pub async fn get_catalog(&self, name: &str) -> Result<CatalogInfo> {
-        let sql = "SELECT name, dsn FROM system.catalog where name=?";
+        let sql = "SELECT name, dsn FROM system.catalog where name = $1;";
 
         let row = sqlx::query(sql)
             .bind(name)
@@ -255,7 +255,7 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     pub async fn get_catalog_cache_policy(&self, name: &str) -> Result<String> {
-        let sql = "SELECT cache_policy FROM system.catalog where name=?";
+        let sql = "SELECT cache_policy FROM system.catalog where name = $1;";
 
         let row = sqlx::query(sql)
             .bind(name)
@@ -291,7 +291,7 @@ impl PostgreSQLMetaCatalogProviderList {
         })?;
 
         let insert_sql =
-            "INSERT INTO system.catalog (name, dsn, db_type, description, cache_policy) VALUES ($1, $2, $3, $4, $5)";
+            "INSERT INTO system.catalog (name, dsn, db_type, description, cache_policy) VALUES ($1, $2, $3, $4, $5);";
 
         let ret = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -357,7 +357,7 @@ impl PostgreSQLMetaCatalogProviderList {
         table: &str,
     ) -> Result<bool> {
         let sql = "select arrow_schema, local_path from system.table_arrow_schema \
-            where catalog_name = ? and schema_name=? and table_name=?";
+            where catalog_name = $1 and schema_name = $2 and table_name = $3;";
 
         let row = sqlx::query(&sql)
             .bind(catalog)
@@ -377,7 +377,7 @@ impl PostgreSQLMetaCatalogProviderList {
         table: &str,
     ) -> Result<(Arc<Schema>, String)> {
         let sql = "select arrow_schema, local_path from system.table_arrow_schema \
-        where catalog_name = ? and schema_name = ? and table_name = ?";
+        where catalog_name = $1 and schema_name = $2 and table_name = $3;";
 
         let ret = sqlx::query(sql)
             .bind(catalog)
@@ -408,7 +408,7 @@ impl PostgreSQLMetaCatalogProviderList {
             execution_time = sql_stats.execution_time + EXCLUDED.execution_time,
             count = sql_stats.count + 1,
             min_time = LEAST(sql_stats.min_time, EXCLUDED.min_time),
-            max_time = GREATEST(sql_stats.max_time, EXCLUDED.max_time)";
+            max_time = GREATEST(sql_stats.max_time, EXCLUDED.max_time);";
 
         let ret = sqlx::query(insert_sql)
             .bind(key.to_string())
@@ -433,7 +433,7 @@ impl PostgreSQLMetaCatalogProviderList {
             VALUES ($1, $2, $3, $4, 1)
             ON CONFLICT (catalog, schema_name, table_name, stat_date)
             DO UPDATE SET
-                query_count = query_table_daily_stats.query_count + 1";
+                query_count = query_table_daily_stats.query_count + 1;";
 
         let ret = sqlx::query(insert_sql)
             .bind(catalog)
@@ -451,8 +451,8 @@ impl PostgreSQLMetaCatalogProviderList {
         let seven_days_ago = Local::now() - Duration::days(7);
 
         let sql = "select distinct schema_name, table_name from system.query_table_daily_stats \
-        where catalog = ? and stat_date >= ? \
-        order by schema_name, table_name";
+        where catalog = $1 and stat_date >= $2 \
+        order by schema_name, table_name;";
 
         let rows = sqlx::query(sql)
             .bind(catalog)
