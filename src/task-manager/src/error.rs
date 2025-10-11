@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum TaskError {
+    #[error("Query meta db error: {0}")]
+    MetaReqeustError(String),
     #[error("Interval error: {0}")]
     Internal(String),
     #[error("Task not found: {0}")]
