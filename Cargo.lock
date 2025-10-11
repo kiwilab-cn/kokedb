@@ -3036,6 +3036,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "async-trait",
+ "chrono",
  "dashmap",
  "datafusion",
  "kokedb-common",

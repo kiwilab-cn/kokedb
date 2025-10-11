@@ -2,6 +2,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
+use chrono::{Duration, Local, NaiveDate};
 use dashmap::DashMap;
 use datafusion::arrow::array::ArrowNativeTypeOp;
 use datafusion::catalog::{CatalogProvider, CatalogProviderList};
@@ -10,7 +11,6 @@ use datafusion::error::{DataFusionError, Result};
 
 use datafusion::sql::sqlparser::parser::ParserError;
 use kokedb_common::cache_policy::parse_cache_policy;
-use sqlx::types::chrono::NaiveDate;
 use sqlx::{PgPool, Row};
 
 use crate::datafusion_catalog::PostgreSQLCatalogProvider;
@@ -238,9 +238,10 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     pub async fn get_catalog(&self, name: &str) -> Result<CatalogInfo> {
-        let query = format!("SELECT name, dsn FROM system.catalog where name='{}'", name);
+        let sql = "SELECT name, dsn FROM system.catalog where name=?";
 
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sql)
+            .bind(name)
             .fetch_one(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -254,12 +255,10 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     pub async fn get_catalog_cache_policy(&self, name: &str) -> Result<String> {
-        let query = format!(
-            "SELECT cache_policy FROM system.catalog where name='{}'",
-            name
-        );
+        let sql = "SELECT cache_policy FROM system.catalog where name=?";
 
-        let row = sqlx::query(&query)
+        let row = sqlx::query(sql)
+            .bind(name)
             .fetch_one(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -357,13 +356,13 @@ impl PostgreSQLMetaCatalogProviderList {
         schema: &str,
         table: &str,
     ) -> Result<bool> {
-        let sql = format!(
-            "select arrow_schema, local_path from system.table_arrow_schema \
-            where catalog_name = '{}' and schema_name='{}' and table_name='{}'",
-            catalog, schema, table
-        );
+        let sql = "select arrow_schema, local_path from system.table_arrow_schema \
+            where catalog_name = ? and schema_name=? and table_name=?";
 
         let row = sqlx::query(&sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
             .fetch_optional(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -377,26 +376,26 @@ impl PostgreSQLMetaCatalogProviderList {
         schema: &str,
         table: &str,
     ) -> Result<(Arc<Schema>, String)> {
-        let sql = format!(
-            "select arrow_schema, local_path from system.table_arrow_schema \
-            where catalog_name = '{}' and schema_name='{}' and table_name='{}'",
-            catalog, schema, table
-        );
+        let sql = "select arrow_schema, local_path from system.table_arrow_schema \
+        where catalog_name = ? and schema_name = ? and table_name = ?";
 
-        let row = sqlx::query(&sql)
+        let ret = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
             .fetch_optional(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        let (schema, local_path) = if row.is_some() {
-            let row = row.unwrap();
-            let arrow_schema: Vec<u8> = row.get("arrow_schema");
-            let local_path: String = row.get("local_path");
-            let schema = binary_to_schema(&arrow_schema)?;
-            (schema, local_path)
-        } else {
-            (Arc::new(Schema::empty()), "".to_string())
-        };
+        if ret.is_none() {
+            return Ok((Arc::new(Schema::empty()), String::new()));
+        }
+
+        let row = ret.unwrap();
+
+        let arrow_schema: Vec<u8> = row.get("arrow_schema");
+        let local_path: String = row.get("local_path");
+        let schema = binary_to_schema(&arrow_schema)?;
 
         Ok((schema, local_path))
     }
@@ -446,6 +445,32 @@ impl PostgreSQLMetaCatalogProviderList {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Ok(ret.rows_affected() == 1)
+    }
+
+    pub async fn get_recent_table_stats(&self, catalog: &str) -> Result<Vec<String>> {
+        let seven_days_ago = Local::now() - Duration::days(7);
+
+        let sql = "select distinct schema_name, table_name from system.query_table_daily_stats \
+        where catalog = ? and stat_date >= ? \
+        order by schema_name, table_name";
+
+        let rows = sqlx::query(sql)
+            .bind(catalog)
+            .bind(seven_days_ago.date_naive())
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let stats = rows
+            .iter()
+            .map(|row| {
+                let schema_name: String = row.get("schema_name");
+                let table_name: String = row.get("table_name");
+                format!("{}.{}", schema_name, table_name)
+            })
+            .collect();
+
+        Ok(stats)
     }
 }
 
