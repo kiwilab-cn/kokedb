@@ -379,7 +379,7 @@ impl PostgreSQLMetaCatalogProviderList {
         let sql = "select arrow_schema, local_path from system.table_arrow_schema \
         where catalog_name = $1 and schema_name = $2 and table_name = $3;";
 
-        let ret = sqlx::query(sql)
+        let row = sqlx::query(sql)
             .bind(catalog)
             .bind(schema)
             .bind(table)
@@ -387,17 +387,14 @@ impl PostgreSQLMetaCatalogProviderList {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-        if ret.is_none() {
-            return Ok((Arc::new(Schema::empty()), String::new()));
+        if let Some(row) = row {
+            let arrow_schema: Vec<u8> = row.get("arrow_schema");
+            let local_path: String = row.get("local_path");
+            let schema = binary_to_schema(&arrow_schema)?;
+            Ok((schema, local_path))
+        } else {
+            Ok((Arc::new(Schema::empty()), String::new()))
         }
-
-        let row = ret.unwrap();
-
-        let arrow_schema: Vec<u8> = row.get("arrow_schema");
-        let local_path: String = row.get("local_path");
-        let schema = binary_to_schema(&arrow_schema)?;
-
-        Ok((schema, local_path))
     }
 
     pub async fn save_sql_stats(&self, sql: &str, key: u64, cost: u64) -> Result<bool> {
