@@ -118,6 +118,25 @@ impl CatalogManager {
             ))
         })?;
 
+        if let Err(e) = execute_catalog_sync_task(
+            &dsn,
+            &catalog,
+            catalog_task_manager.clone(),
+            cache_policy.clone(),
+        )
+        .await
+        {
+            error!(
+                "Catalog sync task failed for catalog '{}' with DSN '{}': {}",
+                &catalog, &dsn, e
+            );
+        } else {
+            info!(
+                "Catalog first sync task successed for catalog '{}' with DSN '{}'",
+                &catalog, &dsn
+            )
+        }
+
         let job_dsn = dsn.to_string();
         let job_catalog = catalog.to_string();
         let cron_expr = format!("0 */{} * * * *", schedule_interval_min);

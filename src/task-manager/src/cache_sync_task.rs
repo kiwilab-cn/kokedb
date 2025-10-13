@@ -93,12 +93,13 @@ async fn create_smart_table_task(
             ))
         })?;
 
-    if hot_tables.is_empty() {
-        warn!("Found empty hot table, so the dsn: {} is not cached.", dsn);
-        return Ok(());
-    }
+    let postgres_topk_table = get_postgres_top_tables(dsn, 10).await?;
+    let merged_tables = postgres_topk_table
+        .into_iter()
+        .chain(hot_tables)
+        .collect::<Vec<String>>();
 
-    add_table_sync_task(hot_tables, catalog, dsn, catalog_task_manager).await
+    add_table_sync_task(merged_tables, catalog, dsn, catalog_task_manager).await
 }
 
 async fn create_all_table_task(
