@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use kokedb_common::cache_policy::CachePolicy;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
@@ -97,6 +97,8 @@ async fn create_smart_table_task(
     let merged_tables = postgres_topk_table
         .into_iter()
         .chain(hot_tables)
+        .collect::<HashSet<_>>()
+        .into_iter()
         .collect::<Vec<String>>();
 
     add_table_sync_task(merged_tables, catalog, dsn, catalog_task_manager).await
