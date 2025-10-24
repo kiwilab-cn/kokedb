@@ -1,0 +1,10 @@
+[package]
+name = "kokedb-cache"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+foyer.workspace = true
+
+[lints]
+workspace = true

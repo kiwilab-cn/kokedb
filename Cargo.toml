@@ -19,7 +19,7 @@ members = [
   "src/data-source",
   "src/task-manager",
   "src/meta"
-]
+, "src/cache"]
 default-members = ["src/server/mysql"]
 
 
@@ -160,3 +160,5 @@ anyhow = "1.0.99"
 tokio-cron-scheduler = "0.14.0"
 hex = "0.4"
 xxhash-rust = { version = "0.8.15", features = ["xxh3",] }
+
+foyer = "0.20"
