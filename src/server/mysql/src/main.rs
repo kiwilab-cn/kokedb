@@ -6,7 +6,11 @@ use std::sync::Arc;
 
 use datafusion::prelude::SessionContext;
 use kokedb_common::opentelemetry::init_logger;
-use kokedb_query::{binder::query, context::create_session_context};
+use kokedb_query::{
+    binder::{parser, query, save_sql_history},
+    context::create_session_context,
+};
+use log::error;
 use opensrv_mysql::*;
 use tokio::{io::AsyncWrite, net::TcpListener};
 
@@ -54,9 +58,21 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         sql: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), MysqlServerError> {
+        let instant = std::time::Instant::now();
         let ctx = self.ctx.clone();
 
-        let query_result = query(ctx, sql).await;
+        let plan = parser(sql)?;
+
+        let query_result = query(ctx, &plan).await;
+
+        let cost = instant.elapsed().as_millis() as u64;
+        let ret = save_sql_history(sql, &plan, cost).await;
+        if ret.is_err() {
+            error!(
+                "Failed to store sql execute info to meta db with error: {:?}",
+                ret.err().unwrap()
+            );
+        }
         if query_result.is_err() {
             let error = query_result.err().unwrap();
             let (kind, error_mesg) = to_mysql_error(&error);

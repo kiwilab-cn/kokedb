@@ -398,6 +398,7 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     pub async fn save_sql_stats(&self, sql: &str, key: u64, cost: u64) -> Result<bool> {
+        //TODO: store cache status / execute status.
         let insert_sql =
             "INSERT INTO system.sql_stats (sql_hash, sql_text, execution_time, count, min_time, max_time)
             VALUES ($1, $2, $3, 1, $3, $3)
