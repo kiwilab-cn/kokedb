@@ -3155,7 +3155,13 @@ dependencies = [
 name = "kokedb-cache"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "bytes",
  "foyer",
+ "futures",
+ "serde",
+ "thiserror 2.0.16",
+ "zstd",
 ]
 
 [[package]]

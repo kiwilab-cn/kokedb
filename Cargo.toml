@@ -162,3 +162,4 @@ hex = "0.4"
 xxhash-rust = { version = "0.8.15", features = ["xxh3",] }
 
 foyer = "0.20"
+zstd = "0.13.3"

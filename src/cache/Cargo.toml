@@ -5,6 +5,14 @@ edition.workspace = true
 
 [dependencies]
 foyer.workspace = true
+bytes.workspace = true
+zstd.workspace = true
+arrow.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+
+
 
 [lints]
 workspace = true
