@@ -123,6 +123,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
 async fn main() -> Result<(), MysqlServerError> {
     init_logger().unwrap();
     let listener = TcpListener::bind("0.0.0.0:3306").await.unwrap();
+    let result_cache = LruResultCache::new(2000, 40000).await?;
     let ctx = create_session_context().await.unwrap();
 
     loop {

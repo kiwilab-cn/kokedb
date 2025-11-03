@@ -9,13 +9,15 @@ use futures::Stream;
 
 use crate::{codec::RecordBatchCodec, error::CacheError};
 
-struct LruResultCache {
+#[derive(Clone)]
+pub struct LruResultCache {
     pub inner: Arc<HybridCache<u64, Vec<u8>>>,
 }
 
 impl LruResultCache {
     pub async fn new(memory_size: usize, disk_size: usize) -> Result<Self, CacheError> {
-        let cache_dir = std::env::var("RESULT_CACHE_DIR").unwrap_or("/tmp".to_string());
+        let cache_dir =
+            std::env::var("RESULT_CACHE_DIR").unwrap_or("/tmp/kokedb-cache".to_string());
         let cache_path = Path::new(&cache_dir);
 
         let device = FsDeviceBuilder::new(cache_path)

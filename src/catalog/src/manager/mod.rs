@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use datafusion::catalog::CatalogProviderList;
+use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_common_datafusion::extension::SessionExtension;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::task_manager::TaskManager;
@@ -34,6 +35,7 @@ pub(super) struct CatalogManagerState {
     pub(super) default_catalog: Arc<str>,
     pub(super) default_database: Namespace,
     pub(super) global_temporary_database: Namespace,
+    pub(super) result_cache: LruResultCache,
 }
 
 pub struct CatalogManagerOptions {
@@ -41,6 +43,7 @@ pub struct CatalogManagerOptions {
     pub dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
     pub catalog_task_manager: Arc<TaskManager>,
     pub catalog_task_scheduler: Arc<JobScheduler>,
+    pub result_cache: LruResultCache,
     pub default_catalog: String,
     pub default_database: Vec<String>,
     pub global_temporary_database: Vec<String>,
@@ -70,6 +73,7 @@ impl CatalogManager {
             dynamic_catalog_list: options.dynamic_catalog_list,
             catalog_task_manager: options.catalog_task_manager.clone(),
             catalog_task_scheduler: options.catalog_task_scheduler.clone(),
+            result_cache: options.result_cache.clone(),
         };
         Ok(CatalogManager {
             state: Arc::new(Mutex::new(state)),
@@ -105,9 +109,9 @@ impl CatalogManager {
         Ok(())
     }
 
-    pub fn cache(&self) -> CatalogResult<> {
-        
-    } 
+    pub fn cache(&self) -> CatalogResult {
+        let state = self.state()?;
+    }
 
     pub(super) fn state(&self) -> CatalogResult<MutexGuard<'_, CatalogManagerState>> {
         self.state

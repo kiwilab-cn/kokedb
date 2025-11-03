@@ -18,8 +18,8 @@ members = [
   "src/python-udf",
   "src/data-source",
   "src/task-manager",
-  "src/meta"
-, "src/cache"]
+  "src/meta",
+  "src/cache"]
 default-members = ["src/server/mysql"]
 
 
@@ -48,6 +48,7 @@ kokedb-python-udf = { path = "src/python-udf" }
 kokedb-data-source = { path = "src/data-source" }
 kokedb-task-manager = { path = "src/task-manager" }
 kokedb-meta = { path = "src/meta" }
+kokedb-cache = { path = "src/cache" }
 
 
 
