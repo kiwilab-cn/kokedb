@@ -1,3 +1,4 @@
+use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_common::file::get_remote_catalog_parent_local_path;
 use kokedb_meta::{catalog_list::PostgreSQLMetaCatalogProviderList, schema::SchemaTable};
 use log::info;
@@ -12,6 +13,7 @@ pub trait TaskExecutor: Send + Sync {
     async fn execute(
         &self,
         config: CacheTableTaskConfig,
+        cache: LruResultCache,
         progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError>;
 }
@@ -23,6 +25,7 @@ impl TaskExecutor for DataSyncExecutor {
     async fn execute(
         &self,
         config: CacheTableTaskConfig,
+        cache: LruResultCache,
         _progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError> {
         info!("Received task: {:?}", &config);
@@ -74,6 +77,8 @@ impl TaskExecutor for DataSyncExecutor {
                     "Failed to save table schema to meta postgresql server.".to_string(),
                 )
             })?;
+
+        
         Ok(())
     }
 }

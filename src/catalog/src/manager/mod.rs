@@ -109,10 +109,6 @@ impl CatalogManager {
         Ok(())
     }
 
-    pub fn cache(&self) -> CatalogResult {
-        let state = self.state()?;
-    }
-
     pub(super) fn state(&self) -> CatalogResult<MutexGuard<'_, CatalogManagerState>> {
         self.state
             .lock()

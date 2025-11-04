@@ -1,4 +1,5 @@
 use datafusion_common::DataFusionError;
+use kokedb_common::error::CommonError;
 use kokedb_plan::error::PlanError;
 use kokedb_sql_analyzer::error::SqlError;
 use thiserror::Error;
@@ -39,6 +40,17 @@ pub enum QueryError {
     ParquetError(String),
     #[error("save sql stats error: {0}")]
     SaveSqlStatsError(String),
+}
+
+impl From<CommonError> for QueryError {
+    fn from(error: CommonError) -> Self {
+        match error {
+            CommonError::MissingArgument(mesg) => QueryError::MissingArgument(mesg),
+            CommonError::InvalidArgument(mesg) => QueryError::InvalidArgument(mesg),
+            CommonError::NotSupported(mesg) => QueryError::NotSupported(mesg),
+            CommonError::InternalError(mesg) => QueryError::InternalError(mesg),
+        }
+    }
 }
 
 impl From<SqlError> for QueryError {

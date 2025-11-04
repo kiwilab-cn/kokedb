@@ -4,8 +4,9 @@ pub mod row;
 
 use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
-use kokedb_common::opentelemetry::init_logger;
+use datafusion::{physical_plan::common::collect, prelude::SessionContext};
+use kokedb_cache::foyer_hybrid::LruResultCache;
+use kokedb_common::{hash::get_plan_hash, opentelemetry::init_logger};
 use kokedb_query::{
     binder::{parser, query, save_sql_history},
     context::create_session_context,
@@ -23,6 +24,7 @@ use crate::{
 #[derive(Clone)]
 struct CoreContex {
     ctx: Arc<SessionContext>,
+    cache: LruResultCache,
 }
 
 #[async_trait::async_trait]
@@ -71,21 +73,19 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
     ) -> Result<(), MysqlServerError> {
         let instant = std::time::Instant::now();
         let ctx = self.ctx.clone();
+        let cache = self.cache.clone();
 
         let plan = parser(sql)?;
 
-        let query_result = query(ctx, &plan).await;
+        let cache_key = get_plan_hash(&plan)?;
+        let query_result_stream = if cache.inner.contains(&cache_key) {
+            cache.get(cache_key).await
+        } else {
+            query(ctx, &plan).await
+        };
 
-        let cost = instant.elapsed().as_millis() as u64;
-        let ret = save_sql_history(sql, &plan, cost).await;
-        if ret.is_err() {
-            error!(
-                "Failed to store sql execute info to meta db with error: {:?}",
-                ret.err().unwrap()
-            );
-        }
-        if query_result.is_err() {
-            let error = query_result.err().unwrap();
+        if query_result_stream.is_err() {
+            let error = query_result_stream.err().unwrap();
             let (kind, error_mesg) = to_mysql_error(&error);
             return results
                 .error(kind, error_mesg.as_bytes())
@@ -93,7 +93,24 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
                 .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()));
         }
 
-        let batches = query_result.unwrap();
+        let batches = query_result_stream.unwrap();
+
+        tokio::spawn(async move {
+            info!("Create insert result to hybrid cache thread.");
+            if let Ok(batches) = collect(query_result_stream).await {
+                let result = cache.insert(cache_key, &batches).await;
+                match result {
+                    Ok(()) => {
+                        info!("Success to save result to hybrid cache.")
+                    }
+                    Err(e) => {
+                        error!("Failed to save result to hybrid cache with error:{}", e)
+                    }
+                }
+            } else {
+                error!("Failed to collect query result stream.")
+            }
+        });
 
         let schema = batches[0].schema();
 
@@ -112,10 +129,21 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
                 .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()))?;
         }
 
-        writer
+        let _ret = writer
             .finish_with_info("Query executed successfully")
             .await
-            .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()))
+            .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()))?;
+
+        //TODO: check need change to running in thread?
+        let cost = instant.elapsed().as_millis() as u64;
+        let ret = save_sql_history(sql, &plan, cost).await;
+        if ret.is_err() {
+            error!(
+                "Failed to store sql execute info to meta db with error: {:?}",
+                ret.err().unwrap()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -124,12 +152,15 @@ async fn main() -> Result<(), MysqlServerError> {
     init_logger().unwrap();
     let listener = TcpListener::bind("0.0.0.0:3306").await.unwrap();
     let result_cache = LruResultCache::new(2000, 40000).await?;
-    let ctx = create_session_context().await.unwrap();
+    let ctx = create_session_context(result_cache).await.unwrap();
 
     loop {
         let (stream, _) = listener.accept().await?;
         let (r, w) = stream.into_split();
         let ctx = Arc::new(ctx.clone());
-        tokio::spawn(async move { AsyncMysqlIntermediary::run_on(CoreContex { ctx }, r, w).await });
+        let cache = result_cache.clone();
+        tokio::spawn(async move {
+            AsyncMysqlIntermediary::run_on(CoreContex { ctx, cache }, r, w).await
+        });
     }
 }

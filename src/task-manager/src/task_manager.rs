@@ -60,13 +60,11 @@ pub enum TaskStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskType {
     DataSync,
-    ResultRefresh,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TaskConfig {
     DataSyncTaskConfig(CacheTableTaskConfig),
-    ResultRefreshTaskConfig(),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +229,7 @@ impl TaskManager {
                             let task_handles_clone = task_handles.clone();
                             let executor_clone = executor.clone();
                             let active_tasks_clone = active_tasks.clone();
+                            let cache = cache.clone();
 
                             let handle = tokio::spawn(async move {
                                 let task_id_for_callback = task_id.clone();
@@ -241,7 +240,7 @@ impl TaskManager {
                                     }
                                 });
 
-                                let result = executor_clone.execute(task_config.clone(), Some(progress_callback)).await;
+                                let result = executor_clone.execute(task_config.clone(), cache.clone(),  Some(progress_callback)).await;
 
                                 match result {
                                     Ok(_) => {
@@ -565,6 +564,7 @@ impl TaskManager {
 mod tests {
     use std::collections::HashMap;
 
+    use kokedb_cache::foyer_hybrid::LruResultCache;
     use log::info;
 
     use crate::task_manager::{CacheTableTaskConfig, TaskManager, TaskManagerConfig, TaskPriority};
@@ -572,7 +572,8 @@ mod tests {
     #[tokio::test]
     async fn test_task_manager_run_task() {
         let config = TaskManagerConfig::default();
-        let task_manager = TaskManager::new_with(config).await.unwrap();
+        let cache = LruResultCache::new(100, 100).await.unwrap();
+        let task_manager = TaskManager::new_with(config, cache).await.unwrap();
         let runtime_info = task_manager.get_runtime_info();
         info!("Runtime Info: {:?}", runtime_info);
 

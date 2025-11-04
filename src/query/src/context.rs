@@ -35,7 +35,7 @@ pub async fn create_session_context(
     let catalog_list = Arc::new(PostgreSQLMetaCatalogProviderList::new().await.unwrap());
     catalog_list.init_db().await?;
 
-    let task_manager = TaskManager::new().await?;
+    let task_manager = TaskManager::new(result_cache).await?;
     let task_scheduler = JobScheduler::new().await?;
     task_scheduler.start().await?;
 

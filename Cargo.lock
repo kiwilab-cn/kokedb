@@ -3216,6 +3216,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.16",
  "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3291,6 +3292,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "datafusion",
+ "kokedb-cache",
  "kokedb-common",
  "kokedb-query",
  "log",
@@ -3385,6 +3387,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-functions-nested",
  "datafusion-physical-expr",
+ "futures",
  "kokedb-cache",
  "kokedb-catalog",
  "kokedb-common",

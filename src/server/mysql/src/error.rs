@@ -1,5 +1,6 @@
 use std::io;
 
+use kokedb_common::error::CommonError;
 use kokedb_query::error::QueryError;
 use opensrv_mysql::ErrorKind;
 use thiserror::Error;
@@ -74,6 +75,17 @@ impl From<io::Error> for MysqlServerError {
         let msg = format!("{} ({})", error.kind(), &error);
 
         MysqlServerError::WriteMysqlResultError(msg)
+    }
+}
+
+impl From<CommonError> for MysqlServerError {
+    fn from(value: CommonError) -> Self {
+        match value {
+            CommonError::MissingArgument(mesg) => MysqlServerError::MissingArgument(mesg),
+            CommonError::InvalidArgument(mesg) => MysqlServerError::InvalidArgument(mesg),
+            CommonError::NotSupported(mesg) => MysqlServerError::NotSupported(mesg),
+            CommonError::InternalError(mesg) => MysqlServerError::InternalError(mesg),
+        }
     }
 }
 

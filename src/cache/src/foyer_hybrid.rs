@@ -60,6 +60,11 @@ impl LruResultCache {
         Ok(())
     }
 
+    pub async fn delete(&self, key: u64) -> Result<(), CacheError> {
+        let _ret = self.inner.remove(&key);
+        Ok(())
+    }
+
     pub async fn get(
         &self,
         key: u64,
