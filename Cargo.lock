@@ -3157,6 +3157,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "datafusion",
  "foyer",
  "futures",
  "serde",
@@ -3292,6 +3293,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "datafusion",
+ "futures",
  "kokedb-cache",
  "kokedb-common",
  "kokedb-query",

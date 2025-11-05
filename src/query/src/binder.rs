@@ -23,6 +23,7 @@ pub async fn query(
     let default_plan_config = PlanConfig::default();
     let df_plan =
         resolve_and_execute_plan(&ctx, Arc::new(default_plan_config), plan.clone()).await?;
+    // TODO: execute_stream_partitioned maybe better.
     let batches = execute_stream(df_plan, ctx.task_ctx())?;
 
     Ok(batches)

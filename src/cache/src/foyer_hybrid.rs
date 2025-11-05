@@ -1,6 +1,7 @@
 use std::{path::Path, pin::Pin, sync::Arc};
 
 use arrow::array::RecordBatch;
+use datafusion::{error::DataFusionError, execution::SendableRecordBatchStream};
 use foyer::{
     BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
     RuntimeOptions, TokioRuntimeOptions,
@@ -65,11 +66,7 @@ impl LruResultCache {
         Ok(())
     }
 
-    pub async fn get(
-        &self,
-        key: u64,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch, CacheError>> + Send>>, CacheError>
-    {
+    pub async fn get(&self, key: u64) -> Result<SendableRecordBatchStream, CacheError> {
         if let Some(entry) = self.inner.get(&key).await.map_err(|x| {
             CacheError::Internal(format!("Failed to get cache key: {} with error: {x}", &key))
         })? {

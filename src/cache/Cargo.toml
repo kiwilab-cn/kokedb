@@ -11,7 +11,7 @@ arrow.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 serde.workspace = true
-
+datafusion.workspace = true
 
 
 [lints]

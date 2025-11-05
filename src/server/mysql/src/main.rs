@@ -4,22 +4,21 @@ pub mod row;
 
 use std::sync::Arc;
 
-use datafusion::{physical_plan::common::collect, prelude::SessionContext};
+use crate::{column::compact_columns, error::MysqlServerError, row::compact_batch_rows};
+use datafusion::{
+    arrow::array::RecordBatch, physical_plan::stream::RecordBatchStreamAdapter,
+    prelude::SessionContext,
+};
+use futures::StreamExt;
 use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_common::{hash::get_plan_hash, opentelemetry::init_logger};
 use kokedb_query::{
     binder::{parser, query, save_sql_history},
     context::create_session_context,
 };
-use log::error;
+use log::{error, info};
 use opensrv_mysql::*;
 use tokio::{io::AsyncWrite, net::TcpListener};
-
-use crate::{
-    column::compact_columns,
-    error::{to_mysql_error, MysqlServerError},
-    row::compact_rows,
-};
 
 #[derive(Clone)]
 struct CoreContex {
@@ -76,44 +75,77 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         let cache = self.cache.clone();
 
         let plan = parser(sql)?;
-
         let cache_key = get_plan_hash(&plan)?;
-        let query_result_stream = if cache.inner.contains(&cache_key) {
-            cache.get(cache_key).await
+
+        let mut batch_stream = if cache.inner.contains(&cache_key) {
+            cache
+                .get(cache_key)
+                .await
+                .map_err(|e| MysqlServerError::from(e))?
         } else {
-            query(ctx, &plan).await
+            let query_stream = query(ctx, &plan)
+                .await
+                .map_err(|e| MysqlServerError::from(e))?;
+            let schema = query_stream.schema();
+
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+            let cache_clone = cache.clone();
+            tokio::spawn(async move {
+                let mut collected_batches = Vec::new();
+                let mut receiver = rx;
+
+                while let Some(batch) = receiver.recv().await {
+                    collected_batches.push(batch);
+                }
+
+                if collected_batches.is_empty() {
+                    info!("No batches to cache");
+                    return;
+                }
+
+                info!(
+                    "Collected {} batches, inserting to cache",
+                    collected_batches.len()
+                );
+                match cache_clone.insert(cache_key, &collected_batches).await {
+                    Ok(()) => info!("Successfully cached query results"),
+                    Err(e) => error!("Failed to cache query results: {}", e),
+                }
+            });
+
+            let adapted_stream = query_stream.map(move |batch_result| {
+                if let Ok(ref batch) = batch_result {
+                    let _ = tx.send(batch.clone());
+                }
+                batch_result
+            });
+
+            Box::pin(RecordBatchStreamAdapter::new(schema, adapted_stream))
         };
 
-        if query_result_stream.is_err() {
-            let error = query_result_stream.err().unwrap();
-            let (kind, error_mesg) = to_mysql_error(&error);
-            return results
-                .error(kind, error_mesg.as_bytes())
-                .await
-                .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()));
-        }
+        let first_batch = match batch_stream.next().await {
+            Some(Ok(batch)) => batch,
+            Some(Err(e)) => return Err(MysqlServerError::DataFusionError(e.to_string())),
+            None => {
+                let writer = results
+                    .start(&[])
+                    .await
+                    .map_err(|x| MysqlServerError::CreateMysqlResultWriterError(x.to_string()))?;
+                writer
+                    .finish_with_info("Query executed successfully")
+                    .await
+                    .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()))?;
 
-        let batches = query_result_stream.unwrap();
-
-        tokio::spawn(async move {
-            info!("Create insert result to hybrid cache thread.");
-            if let Ok(batches) = collect(query_result_stream).await {
-                let result = cache.insert(cache_key, &batches).await;
-                match result {
-                    Ok(()) => {
-                        info!("Success to save result to hybrid cache.")
-                    }
-                    Err(e) => {
-                        error!("Failed to save result to hybrid cache with error:{}", e)
-                    }
+                let cost = instant.elapsed().as_millis() as u64;
+                if let Err(e) = save_sql_history(sql, &plan, cost).await {
+                    error!("Failed to store sql execute info: {:?}", e);
                 }
-            } else {
-                error!("Failed to collect query result stream.")
+                return Ok(());
             }
-        });
+        };
 
-        let schema = batches[0].schema();
-
+        let schema = first_batch.schema();
         let columns = compact_columns(schema)?;
 
         let mut writer = results
@@ -121,30 +153,41 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
             .await
             .map_err(|x| MysqlServerError::CreateMysqlResultWriterError(x.to_string()))?;
 
-        let rows: Vec<Vec<String>> = compact_rows(batches)?;
-        for row in rows {
-            writer
-                .write_row(row.iter().map(|s| s.as_str()))
-                .await
-                .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()))?;
+        write_batch_to_mysql(&mut writer, &first_batch).await?;
+
+        while let Some(batch_result) = batch_stream.next().await {
+            let batch =
+                batch_result.map_err(|e| MysqlServerError::DataFusionError(e.to_string()))?;
+
+            write_batch_to_mysql(&mut writer, &batch).await?;
         }
 
-        let _ret = writer
+        writer
             .finish_with_info("Query executed successfully")
             .await
             .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()))?;
 
-        //TODO: check need change to running in thread?
         let cost = instant.elapsed().as_millis() as u64;
-        let ret = save_sql_history(sql, &plan, cost).await;
-        if ret.is_err() {
-            error!(
-                "Failed to store sql execute info to meta db with error: {:?}",
-                ret.err().unwrap()
-            );
+        if let Err(e) = save_sql_history(sql, &plan, cost).await {
+            error!("Failed to store sql execute info: {:?}", e);
         }
+
         Ok(())
     }
+}
+
+async fn write_batch_to_mysql<'a, W: AsyncWrite + Unpin>(
+    writer: &mut RowWriter<'a, W>,
+    batch: &RecordBatch,
+) -> Result<(), MysqlServerError> {
+    let rows = compact_batch_rows(batch)?;
+    for row in rows {
+        writer
+            .write_row(row.iter().map(|s| s.as_str()))
+            .await
+            .map_err(|x| MysqlServerError::WriteMysqlResultError(x.to_string()))?;
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -152,7 +195,7 @@ async fn main() -> Result<(), MysqlServerError> {
     init_logger().unwrap();
     let listener = TcpListener::bind("0.0.0.0:3306").await.unwrap();
     let result_cache = LruResultCache::new(2000, 40000).await?;
-    let ctx = create_session_context(result_cache).await.unwrap();
+    let ctx = create_session_context(result_cache.clone()).await.unwrap();
 
     loop {
         let (stream, _) = listener.accept().await?;

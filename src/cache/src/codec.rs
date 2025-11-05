@@ -1,13 +1,15 @@
-use std::{io::Cursor, pin::Pin};
+use std::{io::Cursor, sync::Arc};
 
 use arrow::{
     array::RecordBatch,
     ipc::{reader::FileReader, writer::FileWriter},
 };
-use futures::{stream, Stream, StreamExt};
+use datafusion::{error::DataFusionError, execution::SendableRecordBatchStream};
+use futures::{stream, StreamExt};
 use zstd::{decode_all, encode_all};
 
 use crate::error::CacheError;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 
 pub struct RecordBatchCodec;
 
@@ -42,12 +44,12 @@ impl RecordBatchCodec {
         Ok(compressed)
     }
 
-    pub fn decode(
-        data: &[u8],
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<RecordBatch, CacheError>> + Send>>, CacheError>
-    {
+    pub fn decode(data: &[u8]) -> Result<SendableRecordBatchStream, CacheError> {
         if data.is_empty() {
-            return Ok(stream::iter(vec![]).boxed());
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::new(datafusion::arrow::datatypes::Schema::empty()),
+                stream::empty(),
+            )));
         }
 
         let decompressed = decode_all(data).map_err(|x| {
@@ -59,14 +61,13 @@ impl RecordBatchCodec {
             CacheError::Internal(format!("Failed to new FileReader with error: {x}"))
         })?;
 
-        let stream = stream::iter(reader)
-            .map(|result| {
-                result.map_err(|e| {
-                    CacheError::Internal(format!("Failed to read batch with error: {e}"))
-                })
+        let schema = reader.schema();
+        let stream = stream::iter(reader).map(|result| {
+            result.map_err(|e| {
+                DataFusionError::Internal(format!("Failed to read batch with error: {e}"))
             })
-            .boxed();
+        });
 
-        Ok(stream)
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }

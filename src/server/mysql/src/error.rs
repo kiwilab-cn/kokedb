@@ -1,5 +1,6 @@
 use std::io;
 
+use kokedb_cache::error::CacheError;
 use kokedb_common::error::CommonError;
 use kokedb_query::error::QueryError;
 use opensrv_mysql::ErrorKind;
@@ -45,6 +46,8 @@ pub enum MysqlServerError {
     ParquetError(String),
     #[error("save sql stats error: {0}")]
     SaveSqlStatsError(String),
+    #[error("{0} not found: {1}")]
+    CacheKeyNotFound(&'static str, String),
 }
 
 impl From<QueryError> for MysqlServerError {
@@ -89,7 +92,20 @@ impl From<CommonError> for MysqlServerError {
     }
 }
 
-pub fn to_mysql_error(error: &QueryError) -> (ErrorKind, String) {
+impl From<CacheError> for MysqlServerError {
+    fn from(value: CacheError) -> Self {
+        match value {
+            CacheError::InvalidArgument(mesg) => MysqlServerError::InvalidArgument(mesg),
+            CacheError::NotFound(x, y) => MysqlServerError::CacheKeyNotFound(x, y),
+            CacheError::NotSupported(mesg) => MysqlServerError::NotSupported(mesg),
+            CacheError::Internal(mesg) => MysqlServerError::InternalError(mesg),
+            CacheError::External(mesg) => MysqlServerError::ExternalError(mesg),
+            CacheError::FoyerError(mesg) => MysqlServerError::ExternalError(mesg),
+        }
+    }
+}
+
+pub fn to_mysql_error(error: &MysqlServerError) -> (ErrorKind, String) {
     let mesg = error.to_string();
 
     let kind = ErrorKind::ER_QUERY_INTERRUPTED;

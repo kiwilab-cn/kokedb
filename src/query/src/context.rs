@@ -35,7 +35,7 @@ pub async fn create_session_context(
     let catalog_list = Arc::new(PostgreSQLMetaCatalogProviderList::new().await.unwrap());
     catalog_list.init_db().await?;
 
-    let task_manager = TaskManager::new(result_cache).await?;
+    let task_manager = TaskManager::new(result_cache.clone()).await?;
     let task_scheduler = JobScheduler::new().await?;
     task_scheduler.start().await?;
 
@@ -47,7 +47,7 @@ pub async fn create_session_context(
         dynamic_catalog_list: catalog_list.clone(),
         catalog_task_manager: Arc::new(task_manager),
         catalog_task_scheduler: Arc::new(task_scheduler),
-        result_cache,
+        result_cache: result_cache.clone(),
     };
 
     let catalog_manager = CatalogManager::new(options)
