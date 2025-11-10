@@ -24,18 +24,18 @@ pub mod view;
 /// Each catalog has a name and a corresponding [`CatalogProvider`] instance.
 pub struct CatalogManager {
     state: Arc<Mutex<CatalogManagerState>>,
+    pub result_cache: LruResultCache,
     pub(super) temporary_views: TemporaryViewManager,
 }
 
 pub(super) struct CatalogManagerState {
     pub(super) catalogs: HashMap<Arc<str>, Arc<dyn CatalogProvider>>,
-    pub(super) dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
+    pub dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
     pub(super) catalog_task_manager: Arc<TaskManager>,
     pub(super) catalog_task_scheduler: Arc<JobScheduler>,
     pub(super) default_catalog: Arc<str>,
     pub(super) default_database: Namespace,
     pub(super) global_temporary_database: Namespace,
-    pub(super) result_cache: LruResultCache,
 }
 
 pub struct CatalogManagerOptions {
@@ -70,14 +70,14 @@ impl CatalogManager {
             default_catalog: options.default_catalog.into(),
             default_database: options.default_database.try_into()?,
             global_temporary_database: options.global_temporary_database.try_into()?,
-            dynamic_catalog_list: options.dynamic_catalog_list,
             catalog_task_manager: options.catalog_task_manager.clone(),
+            dynamic_catalog_list: options.dynamic_catalog_list,
             catalog_task_scheduler: options.catalog_task_scheduler.clone(),
-            result_cache: options.result_cache.clone(),
         };
         Ok(CatalogManager {
             state: Arc::new(Mutex::new(state)),
             temporary_views: Default::default(),
+            result_cache: options.result_cache.clone(),
         })
     }
 

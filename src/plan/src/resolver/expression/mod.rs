@@ -363,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_expression_with_name() -> PlanResult<()> {
         let ctx = SessionContext::default();
-        let resolver = PlanResolver::new(&ctx, Arc::new(PlanConfig::new()?));
+        let resolver = PlanResolver::new(&ctx, Arc::new(PlanConfig::new()?), 0);
 
         async fn resolve(resolver: &PlanResolver<'_>, expr: spec::Expr) -> PlanResult<NamedExpr> {
             resolver

@@ -3338,6 +3338,7 @@ dependencies = [
  "kokedb-python-udf",
  "kokedb-sql-analyzer",
  "lazy_static",
+ "log",
  "num",
  "object_store",
  "percent-encoding",

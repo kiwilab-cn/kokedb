@@ -55,8 +55,9 @@ pub async fn resolve_and_execute_plan(
     ctx: &SessionContext,
     config: Arc<PlanConfig>,
     plan: spec::Plan,
+    key: u64,
 ) -> PlanResult<Arc<dyn ExecutionPlan>> {
-    let resolver = PlanResolver::new(ctx, config);
+    let resolver = PlanResolver::new(ctx, config, key);
     let NamedPlan { plan, fields } = resolver.resolve_named_plan(plan).await?;
     let df = execute_logical_plan(ctx, plan).await?;
     let plan = df.create_physical_plan().await?;

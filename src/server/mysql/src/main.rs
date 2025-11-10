@@ -83,7 +83,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
                 .await
                 .map_err(|e| MysqlServerError::from(e))?
         } else {
-            let query_stream = query(ctx, &plan)
+            let query_stream = query(ctx, &plan, cache_key)
                 .await
                 .map_err(|e| MysqlServerError::from(e))?;
             let schema = query_stream.schema();

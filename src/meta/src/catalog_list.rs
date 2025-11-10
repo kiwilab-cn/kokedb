@@ -113,6 +113,18 @@ impl PostgreSQLMetaCatalogProviderList {
                 UNIQUE(catalog, schema_name, table_name, stat_date)
             );
             "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS system.table_stats (
+                id int4 NOT NULL GENERATED ALWAYS AS IDENTITY,
+                catalog VARCHAR(255) NOT NULL,
+                schema VARCHAR(255) NOT NULL,
+                table_name VARCHAR(255) NOT NULL,
+                cache_key_list VARCHAR(20)[] NOT NULL,
+                create_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                update_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(catalog, schema, table_name)
+            );
+            "#,
         ];
 
         for sql in sql_statements {
@@ -179,6 +191,21 @@ impl PostgreSQLMetaCatalogProviderList {
                 ) THEN
                     CREATE TRIGGER update_table_daily_stats_modtime
                         BEFORE UPDATE ON system.query_table_daily_stats
+                FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
+                END IF;
+            END $$;
+            "#,
+            r#"
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_trigger
+                    WHERE tgname = 'update_table_stats_modtime'
+                    AND tgrelid = 'system.table_stats'::regclass
+                ) THEN
+                    CREATE TRIGGER update_table_stats_modtime
+                        BEFORE UPDATE ON system.table_stats
                 FOR EACH ROW EXECUTE FUNCTION system.update_modified_column();
                 END IF;
             END $$;
@@ -310,7 +337,7 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(ret.rows_affected().is_eq(1))
     }
 
-    pub fn save_table_schema(&self, schema_info: &SchemaTable) -> Result<bool> {
+    pub async fn save_table_schema(&self, schema_info: &SchemaTable<'_>) -> Result<bool> {
         let catalog = schema_info.catalog;
         let schema = schema_info.schema;
         let table = schema_info.table;
@@ -333,21 +360,83 @@ impl PostgreSQLMetaCatalogProviderList {
                         local_path = EXCLUDED.local_path
                     RETURNING id
                     "#;
-        let _ret = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                sqlx::query(upsert_sql)
-                    .bind(catalog)
-                    .bind(schema)
-                    .bind(table)
-                    .bind(arrow_schema_bin)
-                    .bind(local_path)
-                    .execute(&self.local_pool)
-                    .await
-            })
-        })
-        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        sqlx::query(upsert_sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(arrow_schema_bin)
+            .bind(local_path)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Ok(true)
+    }
+
+    pub async fn save_table_cache_key(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        cache_key: u64,
+    ) -> Result<bool> {
+        let insert_sql = r#"
+            INSERT INTO system.table_stats (catalog, schema, table_name, cache_key_list)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (catalog, schema, table_name) DO UPDATE SET
+                cache_key_list = array_cat(table_stats.cache_key_list, EXCLUDED.cache_key_list)
+            "#;
+        let key_list = vec![cache_key.to_string()];
+
+        let ret = sqlx::query(insert_sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(key_list)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(ret.rows_affected() >= 1)
+    }
+
+    pub async fn get_table_cache_key(
+        &self,
+        schema_info: &SchemaTable<'_>,
+    ) -> Result<Option<Vec<u64>>> {
+        let catalog = schema_info.catalog;
+        let schema = schema_info.schema;
+        let table_name = schema_info.table;
+        let query_sql = r#"
+            SELECT cache_key_list FROM system.table_stats
+            WHERE catalog = $1 AND schema = $2 AND table_name = $3
+        "#;
+
+        let row: Option<(Vec<String>,)> = sqlx::query_as(query_sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table_name)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        match row {
+            Some((cache_key_list,)) => {
+                let u64_list: Result<Vec<u64>> = cache_key_list
+                    .into_iter()
+                    .map(|s| {
+                        s.parse::<u64>().map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to parse u64 from string: {}",
+                                e
+                            ))
+                        })
+                    })
+                    .collect();
+                Ok(Some(u64_list?))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn check_table_is_cached(

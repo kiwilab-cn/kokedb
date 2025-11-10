@@ -19,10 +19,11 @@ pub fn parser(sql: &str) -> QueryResult<Plan> {
 pub async fn query(
     ctx: Arc<SessionContext>,
     plan: &Plan,
+    key: u64,
 ) -> Result<SendableRecordBatchStream, QueryError> {
     let default_plan_config = PlanConfig::default();
     let df_plan =
-        resolve_and_execute_plan(&ctx, Arc::new(default_plan_config), plan.clone()).await?;
+        resolve_and_execute_plan(&ctx, Arc::new(default_plan_config), plan.clone(), key).await?;
     // TODO: execute_stream_partitioned maybe better.
     let batches = execute_stream(df_plan, ctx.task_ctx())?;
 
