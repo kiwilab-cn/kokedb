@@ -120,8 +120,8 @@ impl PostgreSQLMetaCatalogProviderList {
                 schema VARCHAR(255) NOT NULL,
                 table_name VARCHAR(255) NOT NULL,
                 cache_key_list VARCHAR(20)[] NOT NULL,
-                create_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                update_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(catalog, schema, table_name)
             );
             "#,
