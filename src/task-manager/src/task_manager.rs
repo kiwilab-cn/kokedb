@@ -258,7 +258,7 @@ impl TaskManager {
                                             if task.retry_count < max_retries {
                                                 task.retry_count += 1;
                                                 task.status = TaskStatus::Pending;
-                                                info!("Task {} failed, retrying ({}/{})", task_id, task.retry_count, max_retries);
+                                                info!("Task {} failed with error: {}, retrying ({}/{})", task_id, &e, task.retry_count, max_retries);
                                             }
                                         }
                                     }

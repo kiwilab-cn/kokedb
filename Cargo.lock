@@ -3207,6 +3207,7 @@ dependencies = [
  "half",
  "hex",
  "iana-time-zone",
+ "log",
  "num-traits",
  "num_enum",
  "opentelemetry",

@@ -88,6 +88,7 @@ impl TaskExecutor for DataSyncExecutor {
                     "Failed to save table schema to meta postgresql server.".to_string(),
                 )
             })?;
+
         if let Some(cache_key_list) = table_cache_key_list {
             for cache_key in cache_key_list {
                 let ret = cache.delete(cache_key).await;

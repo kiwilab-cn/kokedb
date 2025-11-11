@@ -6,7 +6,7 @@ use kokedb_common::{
     file::ensure_dir_exists,
     table::postgresql::{get_postgresql_table_schema, rows_to_record_batch},
 };
-use log::{info, warn};
+use log::{error, info, warn};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use std::fs::File;
@@ -61,17 +61,39 @@ impl PostgresToParquetConverter {
         let random_parquet_name = Uuid::new_v4().to_string()[..8].to_string();
         let parquet_file_name = format!("{}/{}.parquet", output_path, random_parquet_name);
 
-        let file = File::create(parquet_file_name)?;
+        let file = File::create(parquet_file_name.clone())?;
+
         let batch = rows_to_record_batch(&pg_rows, &arrow_schema)?;
+
+        info!(
+            "RecordBatch created: {} rows, {} columns",
+            batch.num_rows(),
+            batch.num_columns()
+        );
+
+        if batch.schema().as_ref() != arrow_schema.as_ref() {
+            error!(
+                "Schema mismatch!\nExpected: {:?}\nGot: {:?}",
+                arrow_schema,
+                batch.schema()
+            );
+        }
+
         let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props.clone()))
             .context("Failed to create Parquet writer")?;
 
+        info!("Writing batch to {}", parquet_file_name);
         writer
             .write(&batch)
-            .context("Failed to write batch to Parquet")?;
+            .context(format!("Failed to write batch to: {}", &parquet_file_name))?;
 
-        writer.close().context("Failed to close Parquet writer")?;
+        info!("Closing writer");
+        writer.close().context(format!(
+            "Failed to close writer for: {}",
+            &parquet_file_name
+        ))?;
 
+        info!("Successfully wrote parquet file: {}", parquet_file_name);
         Ok(())
     }
 

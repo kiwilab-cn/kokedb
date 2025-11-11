@@ -1,18 +1,18 @@
+use crate::error::CommonError;
 use arrow::array::{
-    ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, BooleanBuilder, Date32Array,
-    Decimal128Array, FixedSizeBinaryArray, Float32Array, Float32Builder, Float64Array,
-    Float64Builder, Int16Array, Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder,
-    IntervalMonthDayNanoArray, LargeStringArray, ListBuilder, RecordBatch, StringArray,
-    StringBuilder, Time64MicrosecondArray, TimestampMicrosecondArray, UInt32Array,
+    ArrayRef, BinaryArray, BooleanArray, BooleanBuilder, Date32Array, Decimal128Array,
+    FixedSizeBinaryArray, Float32Array, Float32Builder, Float64Array, Float64Builder, Int16Array,
+    Int16Builder, Int32Array, Int32Builder, Int64Array, Int64Builder, IntervalMonthDayNanoArray,
+    LargeStringArray, ListBuilder, RecordBatch, StringArray, StringBuilder, Time64MicrosecondArray,
+    TimestampMicrosecondArray, UInt32Array,
 };
 use arrow_buffer::{Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::Schema;
 use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
+use log::warn;
 use rust_decimal::Decimal;
 use sqlx::types::Uuid;
 use sqlx::PgPool;
-
-use crate::error::CommonError;
 
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::postgres::PgRow;
@@ -20,12 +20,35 @@ use sqlx::Row;
 use sqlx::ValueRef;
 use std::sync::Arc;
 
-pub fn pg_type_to_arrow_schema(pg_type: &str) -> Result<DataType, CommonError> {
-    let normalized_type = pg_type.to_lowercase();
+fn parse_array_type(pg_type: &str) -> Option<String> {
+    let normalized = pg_type.trim();
 
-    if normalized_type.ends_with("[]") {
-        let element_type = &normalized_type[..normalized_type.len() - 2];
-        let element_data_type = convert_pg_type_to_arrow(element_type, None)?;
+    // format 1: text[], integer[], etc.
+    if normalized.ends_with("[]") {
+        let element_type = &normalized[..normalized.len() - 2];
+        return Some(element_type.to_string());
+    }
+
+    // format 2: _text, _int4, etc.
+    if normalized.starts_with('_') && normalized.len() > 1 {
+        let element_type = &normalized[1..];
+        return Some(element_type.to_string());
+    }
+
+    // format 3: ARRAY[text], ARRAY[integer], etc.
+    if normalized.starts_with("array[") && normalized.ends_with(']') {
+        let element_type = &normalized[6..normalized.len() - 1];
+        return Some(element_type.to_string());
+    }
+
+    None
+}
+
+pub fn pg_type_to_arrow_schema(pg_type: &str) -> Result<DataType, CommonError> {
+    let normalized_type = pg_type.to_lowercase().trim().to_string();
+
+    if let Some(element_type) = parse_array_type(&normalized_type) {
+        let element_data_type = convert_pg_type_to_arrow(&element_type, None)?;
         return Ok(DataType::List(Arc::new(Field::new(
             "item",
             element_data_type,
@@ -41,11 +64,10 @@ pub fn pg_type_to_arrow(
     row: &PgRow,
     column_index: usize,
 ) -> Result<DataType, CommonError> {
-    let normalized_type = pg_type.to_lowercase();
+    let normalized_type = pg_type.to_lowercase().trim().to_string();
 
-    if normalized_type.ends_with("[]") {
-        let element_type = &normalized_type[..normalized_type.len() - 2];
-        let element_data_type = convert_pg_type_to_arrow(element_type, Some((row, column_index)))?;
+    if let Some(element_type) = parse_array_type(&normalized_type) {
+        let element_data_type = convert_pg_type_to_arrow(&element_type, Some((row, column_index)))?;
         return Ok(DataType::List(Arc::new(Field::new(
             "item",
             element_data_type,
@@ -334,13 +356,20 @@ pub fn build_array_from_rows(
                             ))
                         })?;
 
+                        let max_value = 10_i128.pow(*precision as u32) - 1;
+                        if value.abs() > max_value {
+                            return Err(CommonError::InternalError(format!(
+                                "Decimal value {} exceeds precision {}",
+                                value, precision
+                            )));
+                        }
+
                         Ok(Some(value))
                     }
                     Ok(None) => Ok(None),
                     Err(_) => Ok(None),
                 })
                 .collect();
-
             match values {
                 Ok(decimal_values) => {
                     let array = Decimal128Array::from(decimal_values)
@@ -359,7 +388,6 @@ pub fn build_array_from_rows(
                 ))),
             }
         }
-
         DataType::Boolean => {
             let values: Vec<Option<bool>> = rows
                 .iter()
@@ -400,7 +428,6 @@ pub fn build_array_from_rows(
                 .collect();
             Ok(Arc::new(LargeStringArray::from(values)))
         }
-
         DataType::Binary => {
             let values: Vec<Option<Vec<u8>>> = rows
                 .iter()
@@ -475,7 +502,6 @@ pub fn build_array_from_rows(
             );
             Ok(Arc::new(array))
         }
-
         DataType::Date32 => {
             let values: Vec<Option<i32>> = rows
                 .iter()
@@ -512,15 +538,19 @@ pub fn build_array_from_rows(
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let values: Vec<Option<i64>> = rows
                 .iter()
-                .map(|row| {
-                    if let Ok(ts_val) = row.try_get::<Option<chrono::NaiveDateTime>, _>(col_idx) {
-                        ts_val.map(|ts| ts.and_utc().timestamp_micros())
-                    } else if let Ok(ts_val) =
-                        row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(col_idx)
-                    {
-                        ts_val.map(|ts| ts.timestamp_micros())
-                    } else {
-                        None
+                .map(|row| match row.try_get_raw(col_idx) {
+                    Ok(raw) if raw.is_null() => None,
+                    _ => {
+                        if let Ok(ts_val) = row.try_get::<Option<chrono::NaiveDateTime>, _>(col_idx)
+                        {
+                            ts_val.map(|ts| ts.and_utc().timestamp_micros())
+                        } else if let Ok(ts_val) =
+                            row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(col_idx)
+                        {
+                            ts_val.map(|ts| ts.timestamp_micros())
+                        } else {
+                            None
+                        }
                     }
                 })
                 .collect();
@@ -538,10 +568,17 @@ pub fn build_array_from_rows(
                 .map(|row| {
                     match row.try_get::<Option<sqlx::postgres::types::PgInterval>, _>(col_idx) {
                         Ok(Some(interval)) => {
-                            let nanos = (interval.microseconds as i128) * 1000;
+                            // PostgreSQL interval: months, days, microseconds
                             let months = interval.months as i128;
                             let days = interval.days as i128;
-                            let value = (nanos << 64) | (months << 32) | days;
+                            let nanos = (interval.microseconds as i128) * 1000;
+
+                            // Arrow IntervalMonthDayNano layout:
+                            // [0-31 bits]: days
+                            // [32-63 bits]: months
+                            // [64-127 bits]: nanoseconds
+                            let value =
+                                (nanos << 64) | ((months & 0xFFFFFFFF) << 32) | (days & 0xFFFFFFFF);
                             Some(value)
                         }
                         Ok(None) => None,
@@ -707,26 +744,36 @@ pub fn build_array_from_rows(
                     Arc::new(list_builder.finish()) as ArrayRef
                 }
                 DataType::Binary => {
-                    let mut list_builder = ListBuilder::new(BinaryBuilder::new());
-                    for opt_vec in values {
-                        match opt_vec {
-                            Some(vec) => {
-                                for v in vec {
-                                    if let Some(s) = v.as_str() {
-                                        // Assuming binary elements are represented as strings; convert to bytes
-                                        list_builder.values().append_value(s.as_bytes());
-                                    } else {
-                                        list_builder.values().append_null();
-                                    }
-                                }
-                                list_builder.append(true);
+                    let values: Vec<Option<Vec<u8>>> = rows
+                        .iter()
+                        .map(|row| row.try_get::<Option<Vec<u8>>, _>(col_idx).unwrap_or(None))
+                        .collect();
+
+                    let mut byte_data = Vec::new();
+                    let mut offsets = Vec::with_capacity(values.len() + 1);
+                    let mut null_buffer = Vec::with_capacity(values.len());
+
+                    offsets.push(0i32);
+                    for value in values {
+                        match value {
+                            Some(bytes) => {
+                                byte_data.extend_from_slice(&bytes);
+                                offsets.push(byte_data.len() as i32);
+                                null_buffer.push(true);
                             }
                             None => {
-                                list_builder.append_null();
+                                offsets.push(byte_data.len() as i32);
+                                null_buffer.push(false);
                             }
                         }
                     }
-                    Arc::new(list_builder.finish()) as ArrayRef
+
+                    let array = BinaryArray::new(
+                        arrow::buffer::OffsetBuffer::new(offsets.into()),
+                        Buffer::from(byte_data),
+                        Some(NullBuffer::from(null_buffer)),
+                    );
+                    Arc::new(array)
                 }
                 DataType::Boolean => {
                     let mut list_builder = ListBuilder::new(BooleanBuilder::new());
@@ -790,6 +837,14 @@ pub fn build_array_from_rows(
                     _ => None,
                 })
                 .collect();
+
+            if values.iter().all(|v| v.is_none()) {
+                warn!(
+                    "Unsupported type {:?} with all NULL values, creating null string array",
+                    field.data_type()
+                );
+            }
+
             Ok(Arc::new(StringArray::from(values)))
         }
     }
