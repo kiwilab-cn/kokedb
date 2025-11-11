@@ -91,13 +91,17 @@ impl CatalogManager {
         &self,
         table: &[T],
         cache_key: u64,
-    ) -> CatalogResult<bool> {
+    ) -> CatalogResult<()> {
         let (provider, database, table) = self.resolve_object(table)?;
         let catalog = provider.get_name();
         let schema = database.head;
-        let state = self.state()?;
-        state
-            .dynamic_catalog_list
+
+        let remote_catalog = {
+            let state = self.state()?;
+            state.dynamic_catalog_list.clone()
+        };
+
+        remote_catalog
             .save_table_cache_key(catalog, &schema, &table, cache_key)
             .await
             .map_err(|x| {
@@ -105,6 +109,7 @@ impl CatalogManager {
                     "Failed to save table cache key with error:{}",
                     x.to_string()
                 ))
-            })
+            })?;
+        Ok(())
     }
 }
