@@ -1,6 +1,6 @@
 [workspace.package]
-name = "kokedb"
 version = "0.1.0"
+authors = ["Zerry <zerix.os@gmail.com>"]
 edition = "2021"
 
 [workspace]

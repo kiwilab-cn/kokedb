@@ -1,12 +1,11 @@
-use std::{path::Path, pin::Pin, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use arrow::array::RecordBatch;
-use datafusion::{error::DataFusionError, execution::SendableRecordBatchStream};
+use datafusion::execution::SendableRecordBatchStream;
 use foyer::{
     BlockEngineBuilder, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
     RuntimeOptions, TokioRuntimeOptions,
 };
-use futures::Stream;
 
 use crate::{codec::RecordBatchCodec, error::CacheError};
 
