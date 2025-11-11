@@ -55,15 +55,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
     async fn on_close(&mut self, _: u32) {}
 
     /*
-     * sql --> cache hit --> return cache result
+     * sql --> cache hit --> yes --> return cache result
      *              |
-     *                   --> execute query  --> return result
-     *                              |
+     *                   --> no  --> execute query  --> return result
+     *                                   |
      *                                      --> save to cache
      *
      * sync table cache task  --> table not used  --> cache table data from remote
      *                                  |
-     *                                            --> execute cached query --> update cached result
+     *                                            --> execute cached query --> delete all cached result abount the table
      */
     async fn on_query<'a>(
         &'a mut self,
