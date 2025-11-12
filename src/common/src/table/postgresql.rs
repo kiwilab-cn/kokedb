@@ -6,7 +6,8 @@ use arrow::array::{
     LargeStringArray, ListBuilder, RecordBatch, StringArray, StringBuilder, Time64MicrosecondArray,
     TimestampMicrosecondArray, UInt32Array,
 };
-use arrow_buffer::{Buffer, NullBuffer, ScalarBuffer};
+use arrow::datatypes::IntervalMonthDayNanoType;
+use arrow_buffer::{Buffer, IntervalMonthDayNano, NullBuffer};
 use arrow_schema::Schema;
 use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit};
 use log::warn;
@@ -57,25 +58,6 @@ pub fn pg_type_to_arrow_schema(pg_type: &str) -> Result<DataType, CommonError> {
     }
 
     convert_pg_type_to_arrow(&normalized_type, None)
-}
-
-pub fn pg_type_to_arrow(
-    pg_type: &str,
-    row: &PgRow,
-    column_index: usize,
-) -> Result<DataType, CommonError> {
-    let normalized_type = pg_type.to_lowercase().trim().to_string();
-
-    if let Some(element_type) = parse_array_type(&normalized_type) {
-        let element_data_type = convert_pg_type_to_arrow(&element_type, Some((row, column_index)))?;
-        return Ok(DataType::List(Arc::new(Field::new(
-            "item",
-            element_data_type,
-            true,
-        ))));
-    }
-
-    convert_pg_type_to_arrow(&normalized_type, Some((row, column_index)))
 }
 
 fn convert_pg_type_to_arrow(
@@ -142,7 +124,8 @@ fn convert_pg_type_to_arrow(
         )),
         "time" | "time without time zone" => Ok(DataType::Time64(TimeUnit::Microsecond)),
         "time with time zone" | "timetz" => Ok(DataType::Time64(TimeUnit::Microsecond)),
-        "interval" => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
+        //"interval" => Ok(DataType::Interval(IntervalUnit::MonthDayNano)),
+        "interval" => Ok(DataType::Utf8),
         "boolean" | "bool" => Ok(DataType::Boolean),
         "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" => Ok(DataType::Utf8),
         "cidr" | "inet" | "macaddr" | "macaddr8" => Ok(DataType::Utf8),
@@ -404,6 +387,10 @@ pub fn build_array_from_rows(
                         value
                     } else if let Ok(uuid_val) = row.try_get::<Option<Uuid>, _>(col_idx) {
                         uuid_val.map(|u| u.to_string())
+                    } else if let Ok(interval_val) =
+                        row.try_get::<Option<sqlx::postgres::types::PgInterval>, _>(col_idx)
+                    {
+                        interval_val.map(|iv| format_pg_interval(&iv))
                     } else {
                         match row.try_get_raw(col_idx) {
                             Ok(raw) if !raw.is_null() => {
@@ -563,22 +550,27 @@ pub fn build_array_from_rows(
             }
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
-            let values: Vec<Option<i128>> = rows
+            let values: Vec<Option<IntervalMonthDayNano>> = rows
                 .iter()
                 .map(|row| {
                     match row.try_get::<Option<sqlx::postgres::types::PgInterval>, _>(col_idx) {
                         Ok(Some(interval)) => {
                             // PostgreSQL interval: months, days, microseconds
-                            let months = interval.months as i128;
-                            let days = interval.days as i128;
-                            let nanos = (interval.microseconds as i128) * 1000;
+                            let months = interval.months;
+                            let days = interval.days;
 
-                            // Arrow IntervalMonthDayNano layout:
-                            // [0-31 bits]: days
-                            // [32-63 bits]: months
-                            // [64-127 bits]: nanoseconds
-                            let value =
-                                (nanos << 64) | ((months & 0xFFFFFFFF) << 32) | (days & 0xFFFFFFFF);
+                            let nanos = interval
+                                .microseconds
+                                .checked_mul(1_000) // 微秒 * 1000 = 纳秒
+                                .unwrap_or_else(|| {
+                                    warn!(
+                                        "Row : Microseconds overflow: {}, using 0",
+                                        interval.microseconds
+                                    );
+                                    0
+                                });
+
+                            let value = IntervalMonthDayNanoType::make_value(months, days, nanos);
                             Some(value)
                         }
                         Ok(None) => None,
@@ -587,13 +579,8 @@ pub fn build_array_from_rows(
                 })
                 .collect();
 
-            let primitive_values: Vec<i128> = values.iter().map(|v| v.unwrap_or(0)).collect();
-            let null_buffer: Vec<bool> = values.iter().map(|v| v.is_some()).collect();
+            let array = IntervalMonthDayNanoArray::from_iter(values.into_iter());
 
-            let array = IntervalMonthDayNanoArray::new(
-                ScalarBuffer::from(Buffer::from_vec(primitive_values)),
-                Some(NullBuffer::from(null_buffer)),
-            );
             Ok(Arc::new(array))
         }
         DataType::List(field) => {
@@ -869,4 +856,70 @@ pub fn rows_to_record_batch(rows: &[PgRow], schema: &Schema) -> Result<RecordBat
     })?;
 
     Ok(ret)
+}
+
+fn format_pg_interval(interval: &sqlx::postgres::types::PgInterval) -> String {
+    let mut parts = Vec::new();
+
+    if interval.months != 0 {
+        let years = interval.months / 12;
+        let months = interval.months % 12;
+        if years != 0 {
+            parts.push(format!(
+                "{} year{}",
+                years,
+                if years.abs() > 1 { "s" } else { "" }
+            ));
+        }
+        if months != 0 {
+            parts.push(format!(
+                "{} mon{}",
+                months,
+                if months.abs() > 1 { "s" } else { "" }
+            ));
+        }
+    }
+
+    if interval.days != 0 {
+        parts.push(format!(
+            "{} day{}",
+            interval.days,
+            if interval.days.abs() > 1 { "s" } else { "" }
+        ));
+    }
+
+    if interval.microseconds != 0 {
+        let total_seconds = interval.microseconds / 1_000_000;
+        let microseconds = interval.microseconds % 1_000_000;
+        let is_negative = interval.microseconds < 0;
+        let abs_seconds = total_seconds.abs();
+        let hours = abs_seconds / 3600;
+        let minutes = (abs_seconds % 3600) / 60;
+        let seconds = abs_seconds % 60;
+
+        if microseconds != 0 {
+            parts.push(format!(
+                "{}{:02}:{:02}:{:02}.{:06}",
+                if is_negative { "-" } else { "" },
+                hours,
+                minutes,
+                seconds,
+                microseconds.abs()
+            ));
+        } else {
+            parts.push(format!(
+                "{}{:02}:{:02}:{:02}",
+                if is_negative { "-" } else { "" },
+                hours,
+                minutes,
+                seconds
+            ));
+        }
+    }
+
+    if parts.is_empty() {
+        "00:00:00".to_string()
+    } else {
+        parts.join(" ")
+    }
 }

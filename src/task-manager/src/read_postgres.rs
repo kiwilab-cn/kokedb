@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Context;
 use arrow::datatypes::*;
 use datafusion::parquet;
 use futures_util::TryStreamExt;
@@ -22,11 +22,17 @@ pub struct PostgresToParquetConverter {
 }
 
 impl PostgresToParquetConverter {
-    pub async fn new(dsn: &str) -> Result<Self> {
+    pub async fn new(dsn: &str) -> Result<Self, TaskError> {
         let pool = PgPoolOptions::new()
             .max_connections(10)
             .connect(dsn)
-            .await?;
+            .await
+            .map_err(|x| {
+                TaskError::DatabaseError(format!(
+                    "Failed to create connection pool to postgresql with error: {}",
+                    x
+                ))
+            })?;
 
         Ok(Self {
             pool,
@@ -51,7 +57,7 @@ impl PostgresToParquetConverter {
         pg_rows: &Vec<PgRow>,
         props: &WriterProperties,
         arrow_schema: Arc<Schema>,
-    ) -> Result<()> {
+    ) -> Result<(), TaskError> {
         if pg_rows.is_empty() {
             warn!("Found empty pg_rows when write parquet.");
             return Ok(());
@@ -61,39 +67,43 @@ impl PostgresToParquetConverter {
         let random_parquet_name = Uuid::new_v4().to_string()[..8].to_string();
         let parquet_file_name = format!("{}/{}.parquet", output_path, random_parquet_name);
 
-        let file = File::create(parquet_file_name.clone())?;
-
-        let batch = rows_to_record_batch(&pg_rows, &arrow_schema)?;
-
+        let batch = rows_to_record_batch(&pg_rows, &arrow_schema).map_err(|x| {
+            TaskError::RecordBatchError(format!(
+                "Failed to translate pgrow to record batch with error: {}",
+                x
+            ))
+        })?;
         info!(
-            "RecordBatch created: {} rows, {} columns",
+            "RecordBatch created: {} rows, {} columns to file: {}",
             batch.num_rows(),
-            batch.num_columns()
+            batch.num_columns(),
+            &parquet_file_name,
         );
 
-        if batch.schema().as_ref() != arrow_schema.as_ref() {
-            error!(
-                "Schema mismatch!\nExpected: {:?}\nGot: {:?}",
-                arrow_schema,
-                batch.schema()
-            );
-        }
-
+        let file = File::create(parquet_file_name.clone())?;
         let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props.clone()))
-            .context("Failed to create Parquet writer")?;
+            .context("Failed to create Parquet writer")
+            .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
 
-        info!("Writing batch to {}", parquet_file_name);
+        info!("Writing batch to {}", &parquet_file_name);
         writer
             .write(&batch)
-            .context(format!("Failed to write batch to: {}", &parquet_file_name))?;
+            .context(format!("Failed to write batch to: {}", &parquet_file_name))
+            .map_err(|e| {
+                error!("Failed to write batch to parquet file with error: {:?}", e);
+                TaskError::WriteParquetError(e.to_string())
+            })?;
 
         info!("Closing writer");
-        writer.close().context(format!(
-            "Failed to close writer for: {}",
-            &parquet_file_name
-        ))?;
+        writer
+            .close()
+            .context(format!(
+                "Failed to close writer for: {}",
+                &parquet_file_name
+            ))
+            .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
 
-        info!("Successfully wrote parquet file: {}", parquet_file_name);
+        info!("Successfully wrote parquet file: {}", &parquet_file_name);
         Ok(())
     }
 
@@ -101,7 +111,7 @@ impl PostgresToParquetConverter {
         &self,
         table_name: &str,
         output_path: &str,
-    ) -> Result<Arc<Schema>> {
+    ) -> Result<Arc<Schema>, TaskError> {
         let schema = self.get_table_schema(table_name).await?;
         let arrow_schema = Arc::new(schema);
 
@@ -115,11 +125,16 @@ impl PostgresToParquetConverter {
         let mut rows = sqlx::query(&query).fetch(&self.pool);
         let mut pg_rows = Vec::with_capacity(self.batch_size);
 
-        while let Some(row) = rows.try_next().await? {
+        while let Some(row) = rows
+            .try_next()
+            .await
+            .map_err(|x| TaskError::DatabaseError(x.to_string()))?
+        {
             pg_rows.push(row);
             if pg_rows.len() >= self.batch_size {
                 self.write_parquet_file(output_path, &pg_rows, &props, arrow_schema.clone())
-                    .await?;
+                    .await
+                    .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
 
                 pg_rows.clear();
             }
@@ -127,7 +142,8 @@ impl PostgresToParquetConverter {
 
         if !pg_rows.is_empty() {
             self.write_parquet_file(output_path, &pg_rows, &props, arrow_schema.clone())
-                .await?;
+                .await
+                .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
         }
 
         info!("Successfully converted to {}", output_path);
@@ -154,11 +170,12 @@ pub async fn convert_postgres_to_parquet(
     dsn: &str,
     remote_table: &str,
     output_path: &str,
-) -> Result<Arc<Schema>> {
+) -> Result<Arc<Schema>, TaskError> {
     let converter = PostgresToParquetConverter::new(dsn).await?;
     let schema = converter
         .convert_table_to_parquet(remote_table, output_path)
-        .await?;
+        .await
+        .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
 
     Ok(schema)
 }
@@ -170,7 +187,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_conversion() -> Result<()> {
+    async fn test_conversion() -> Result<(), TaskError> {
         let dsn = "postgresql://postgres:123456@192.168.0.227:25432/postgres";
         let table_name = "public.test1";
         let output_path = "/tmp/test1/";

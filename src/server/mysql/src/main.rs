@@ -78,11 +78,19 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         let cache_key = get_plan_hash(&plan)?;
 
         let mut batch_stream = if cache.inner.contains(&cache_key) {
+            info!(
+                "Success hitted the cache with key: {}, get result from the cache.",
+                &cache_key
+            );
             cache
                 .get(cache_key)
                 .await
                 .map_err(|e| MysqlServerError::from(e))?
         } else {
+            info!(
+                "Failed to found cache key: {}, query from the kokedb.",
+                &cache_key
+            );
             let query_stream = query(ctx, &plan, cache_key)
                 .await
                 .map_err(|e| MysqlServerError::from(e))?;
