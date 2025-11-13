@@ -1,6 +1,6 @@
 [workspace.package]
-name = "kokedb"
 version = "0.1.0"
+authors = ["Zerry <zerix.os@gmail.com>"]
 edition = "2021"
 
 [workspace]
@@ -18,8 +18,8 @@ members = [
   "src/python-udf",
   "src/data-source",
   "src/task-manager",
-  "src/meta"
-]
+  "src/meta",
+  "src/cache"]
 default-members = ["src/server/mysql"]
 
 
@@ -48,6 +48,7 @@ kokedb-python-udf = { path = "src/python-udf" }
 kokedb-data-source = { path = "src/data-source" }
 kokedb-task-manager = { path = "src/task-manager" }
 kokedb-meta = { path = "src/meta" }
+kokedb-cache = { path = "src/cache" }
 
 
 
@@ -160,3 +161,6 @@ anyhow = "1.0.99"
 tokio-cron-scheduler = "0.14.0"
 hex = "0.4"
 xxhash-rust = { version = "0.8.15", features = ["xxh3",] }
+
+foyer = "0.20"
+zstd = "0.13.3"

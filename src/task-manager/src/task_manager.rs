@@ -8,6 +8,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_common::env::get_env_as;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -62,11 +63,25 @@ pub enum TaskType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TaskConfig {
+    DataSyncTaskConfig(CacheTableTaskConfig),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheTableTaskConfig {
     pub dsn: String,
     pub source_table: String,
     pub local_table: String,
     pub catalog_name: String,
+    pub batch_size: Option<usize>,
+    pub timeout_seconds: Option<usize>,
+    pub priority: TaskPriority,
+    pub additional_params: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResultRefreshTaskConfig {
+    pub sql_id: u64,
     pub batch_size: Option<usize>,
     pub timeout_seconds: Option<usize>,
     pub priority: TaskPriority,
@@ -140,12 +155,15 @@ pub struct TaskManager {
 }
 
 impl TaskManager {
-    pub async fn new() -> Result<Self, TaskError> {
+    pub async fn new(cache: LruResultCache) -> Result<Self, TaskError> {
         let config: TaskManagerConfig = TaskManagerConfig::default();
-        Self::new_with(config).await
+        Self::new_with(config, cache).await
     }
 
-    pub async fn new_with(config: TaskManagerConfig) -> Result<Self, TaskError> {
+    pub async fn new_with(
+        config: TaskManagerConfig,
+        cache: LruResultCache,
+    ) -> Result<Self, TaskError> {
         let (task_queue_tx, task_queue_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
@@ -161,12 +179,16 @@ impl TaskManager {
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
-        task_manager.start_scheduler(shutdown_rx).await;
+        task_manager.start_scheduler(shutdown_rx, cache).await;
 
         Ok(task_manager)
     }
 
-    async fn start_scheduler(&self, mut shutdown_rx: mpsc::UnboundedReceiver<()>) {
+    async fn start_scheduler(
+        &self,
+        mut shutdown_rx: mpsc::UnboundedReceiver<()>,
+        cache: LruResultCache,
+    ) {
         let tasks = self.tasks.clone();
         let task_handles = self.task_handles.clone();
         let executor = self.executor.clone();
@@ -207,6 +229,7 @@ impl TaskManager {
                             let task_handles_clone = task_handles.clone();
                             let executor_clone = executor.clone();
                             let active_tasks_clone = active_tasks.clone();
+                            let cache = cache.clone();
 
                             let handle = tokio::spawn(async move {
                                 let task_id_for_callback = task_id.clone();
@@ -217,7 +240,7 @@ impl TaskManager {
                                     }
                                 });
 
-                                let result = executor_clone.execute(task_config.clone(), Some(progress_callback)).await;
+                                let result = executor_clone.execute(task_config.clone(), cache.clone(),  Some(progress_callback)).await;
 
                                 match result {
                                     Ok(_) => {
@@ -235,7 +258,7 @@ impl TaskManager {
                                             if task.retry_count < max_retries {
                                                 task.retry_count += 1;
                                                 task.status = TaskStatus::Pending;
-                                                info!("Task {} failed, retrying ({}/{})", task_id, task.retry_count, max_retries);
+                                                info!("Task {} failed with error: {}, retrying ({}/{})", task_id, &e, task.retry_count, max_retries);
                                             }
                                         }
                                     }
@@ -541,6 +564,7 @@ impl TaskManager {
 mod tests {
     use std::collections::HashMap;
 
+    use kokedb_cache::foyer_hybrid::LruResultCache;
     use log::info;
 
     use crate::task_manager::{CacheTableTaskConfig, TaskManager, TaskManagerConfig, TaskPriority};
@@ -548,7 +572,8 @@ mod tests {
     #[tokio::test]
     async fn test_task_manager_run_task() {
         let config = TaskManagerConfig::default();
-        let task_manager = TaskManager::new_with(config).await.unwrap();
+        let cache = LruResultCache::new(100, 100).await.unwrap();
+        let task_manager = TaskManager::new_with(config, cache).await.unwrap();
         let runtime_info = task_manager.get_runtime_info();
         info!("Runtime Info: {:?}", runtime_info);
 

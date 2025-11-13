@@ -14,6 +14,7 @@ use kokedb_common_datafusion::utils::rename_logical_plan;
 use kokedb_data_source::default_registry;
 use kokedb_data_source::formats::remote_table::{PostgreSQLConfig, PostgreSQLTableProvider};
 use kokedb_python_udf::udf::pyspark_unresolved_udf::PySparkUnresolvedUDF;
+use log::error;
 
 use crate::error::{PlanError, PlanResult};
 use crate::extension::source::rename::RenameTableProvider;
@@ -48,6 +49,19 @@ impl PlanResolver<'_> {
         }
 
         let reference: Vec<String> = name.clone().into();
+        let ret = self
+            .ctx
+            .extension::<CatalogManager>()?
+            .save_hash_key(&reference, self.cache_key)
+            .await;
+        if ret.is_err() {
+            error!(
+                "Failed to save table:{:?} hash key with error: {:?}",
+                &reference,
+                ret.err()
+            );
+        }
+
         let status = self
             .ctx
             .extension::<CatalogManager>()?

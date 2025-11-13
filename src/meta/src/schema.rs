@@ -1,4 +1,4 @@
-use std::{io::Cursor, sync::Arc};
+use std::{fmt::Display, io::Cursor, sync::Arc};
 
 use arrow::ipc::{reader::FileReader, writer::FileWriter};
 use arrow_schema::{ArrowError, Schema};
@@ -10,6 +10,12 @@ pub struct SchemaTable<'a> {
     pub table: &'a str,
     pub arrow_schema: Arc<Schema>,
     pub local_path: &'a str,
+}
+
+impl Display for SchemaTable<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.catalog, self.schema, self.table)
+    }
 }
 
 pub fn schema_to_binary(schema: Arc<Schema>) -> Result<Vec<u8>, ArrowError> {

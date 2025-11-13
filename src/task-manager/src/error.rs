@@ -24,4 +24,8 @@ pub enum TaskError {
     QueueFull,
     #[error("Invalid task argument: {0}")]
     InvalideTaskArgment(String),
+    #[error("Record batch error: {0}")]
+    RecordBatchError(String),
+    #[error("Write parquet error: {0}")]
+    WriteParquetError(String),
 }

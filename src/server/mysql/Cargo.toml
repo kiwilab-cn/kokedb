@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 kokedb-common.workspace = true
 kokedb-query.workspace = true
+kokedb-cache.workspace = true
 
 opensrv-mysql = "0.7.0"
 tokio.workspace = true
@@ -14,6 +15,7 @@ async-trait.workspace = true
 datafusion.workspace = true
 log.workspace = true
 thiserror.workspace = true
+futures.workspace = true
 
 [[bin]]
 path = "src/main.rs"

@@ -1,0 +1,18 @@
+[package]
+name = "kokedb-cache"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+foyer.workspace = true
+bytes.workspace = true
+zstd.workspace = true
+arrow.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+datafusion.workspace = true
+
+
+[lints]
+workspace = true

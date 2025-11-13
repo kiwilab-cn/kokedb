@@ -1,6 +1,7 @@
+use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_common::file::get_remote_catalog_parent_local_path;
 use kokedb_meta::{catalog_list::PostgreSQLMetaCatalogProviderList, schema::SchemaTable};
-use log::info;
+use log::{error, info};
 
 use crate::{
     error::TaskError, read_postgres::convert_postgres_to_parquet,
@@ -12,6 +13,7 @@ pub trait TaskExecutor: Send + Sync {
     async fn execute(
         &self,
         config: CacheTableTaskConfig,
+        cache: LruResultCache,
         progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError>;
 }
@@ -23,6 +25,7 @@ impl TaskExecutor for DataSyncExecutor {
     async fn execute(
         &self,
         config: CacheTableTaskConfig,
+        cache: LruResultCache,
         _progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError> {
         info!("Received task: {:?}", &config);
@@ -69,11 +72,32 @@ impl TaskExecutor for DataSyncExecutor {
 
         postgresql_catalog
             .save_table_schema(&schema_info)
+            .await
             .map_err(|_x| {
                 TaskError::DatabaseError(
                     "Failed to save table schema to meta postgresql server.".to_string(),
                 )
             })?;
+
+        // find all cache key link with the table.
+        let table_cache_key_list = postgresql_catalog
+            .get_table_cache_key(&schema_info)
+            .await
+            .map_err(|_x| {
+                TaskError::DatabaseError(
+                    "Failed to save table schema to meta postgresql server.".to_string(),
+                )
+            })?;
+
+        if let Some(cache_key_list) = table_cache_key_list {
+            for cache_key in cache_key_list {
+                let ret = cache.delete(cache_key).await;
+                if ret.is_err() {
+                    error!("Failed to delete table: {} key from cache.", schema_info);
+                }
+            }
+        }
+
         Ok(())
     }
 }

@@ -86,4 +86,30 @@ impl CatalogManager {
         }
         self.get_view(reference).await
     }
+
+    pub async fn save_hash_key<T: AsRef<str>>(
+        &self,
+        table: &[T],
+        cache_key: u64,
+    ) -> CatalogResult<()> {
+        let (provider, database, table) = self.resolve_object(table)?;
+        let catalog = provider.get_name();
+        let schema = database.head;
+
+        let remote_catalog = {
+            let state = self.state()?;
+            state.dynamic_catalog_list.clone()
+        };
+
+        remote_catalog
+            .save_table_cache_key(catalog, &schema, &table, cache_key)
+            .await
+            .map_err(|x| {
+                CatalogError::External(format!(
+                    "Failed to save table cache key with error:{}",
+                    x.to_string()
+                ))
+            })?;
+        Ok(())
+    }
 }

@@ -35,3 +35,6 @@ sqlx.workspace = true
 rust_decimal.workspace = true
 chrono.workspace = true
 hex.workspace = true
+
+xxhash-rust.workspace = true
+log.workspace = true

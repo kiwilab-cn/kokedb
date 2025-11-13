@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use datafusion::catalog::CatalogProviderList;
+use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_common_datafusion::extension::SessionExtension;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::task_manager::TaskManager;
@@ -23,12 +24,13 @@ pub mod view;
 /// Each catalog has a name and a corresponding [`CatalogProvider`] instance.
 pub struct CatalogManager {
     state: Arc<Mutex<CatalogManagerState>>,
+    pub result_cache: LruResultCache,
     pub(super) temporary_views: TemporaryViewManager,
 }
 
 pub(super) struct CatalogManagerState {
     pub(super) catalogs: HashMap<Arc<str>, Arc<dyn CatalogProvider>>,
-    pub(super) dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
+    pub dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
     pub(super) catalog_task_manager: Arc<TaskManager>,
     pub(super) catalog_task_scheduler: Arc<JobScheduler>,
     pub(super) default_catalog: Arc<str>,
@@ -41,6 +43,7 @@ pub struct CatalogManagerOptions {
     pub dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
     pub catalog_task_manager: Arc<TaskManager>,
     pub catalog_task_scheduler: Arc<JobScheduler>,
+    pub result_cache: LruResultCache,
     pub default_catalog: String,
     pub default_database: Vec<String>,
     pub global_temporary_database: Vec<String>,
@@ -67,13 +70,14 @@ impl CatalogManager {
             default_catalog: options.default_catalog.into(),
             default_database: options.default_database.try_into()?,
             global_temporary_database: options.global_temporary_database.try_into()?,
-            dynamic_catalog_list: options.dynamic_catalog_list,
             catalog_task_manager: options.catalog_task_manager.clone(),
+            dynamic_catalog_list: options.dynamic_catalog_list,
             catalog_task_scheduler: options.catalog_task_scheduler.clone(),
         };
         Ok(CatalogManager {
             state: Arc::new(Mutex::new(state)),
             temporary_views: Default::default(),
+            result_cache: options.result_cache.clone(),
         })
     }
 

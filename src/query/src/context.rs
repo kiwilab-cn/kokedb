@@ -5,6 +5,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_common::plan_datafusion_err;
+use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_catalog::{
     manager::{CatalogManager, CatalogManagerOptions},
     provider::CatalogProvider,
@@ -15,7 +16,9 @@ use tokio_cron_scheduler::JobScheduler;
 
 use crate::mem_catalog::MemoryCatalogProvider;
 
-pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::error::Error>> {
+pub async fn create_session_context(
+    result_cache: LruResultCache,
+) -> Result<SessionContext, Box<dyn std::error::Error>> {
     let runtime = Arc::new(RuntimeEnv::default());
     let default_catalog = "kokedb".to_string();
     let default_database = vec!["public".to_string()];
@@ -32,7 +35,7 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
     let catalog_list = Arc::new(PostgreSQLMetaCatalogProviderList::new().await.unwrap());
     catalog_list.init_db().await?;
 
-    let task_manager = TaskManager::new().await?;
+    let task_manager = TaskManager::new(result_cache.clone()).await?;
     let task_scheduler = JobScheduler::new().await?;
     task_scheduler.start().await?;
 
@@ -44,6 +47,7 @@ pub async fn create_session_context() -> Result<SessionContext, Box<dyn std::err
         dynamic_catalog_list: catalog_list.clone(),
         catalog_task_manager: Arc::new(task_manager),
         catalog_task_scheduler: Arc::new(task_scheduler),
+        result_cache: result_cache.clone(),
     };
 
     let catalog_manager = CatalogManager::new(options)
