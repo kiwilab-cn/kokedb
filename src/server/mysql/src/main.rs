@@ -193,22 +193,15 @@ async fn try_get_from_cache(cache: &Cache, cache_key: CacheKey) -> Option<BatchS
     }
 }
 
-// Execute query and setup caching
-async fn execute_query_with_cache(
-    ctx: Arc<Context>,
-    plan: &Plan,
-    cache_key: CacheKey,
+fn should_cache_plan(plan: &Plan) -> bool {
+    matches!(plan, Plan::Query(_))
+}
+
+fn spawn_cache_task(
     cache: Cache,
-) -> Result<BatchStream, String> {
-    let query_stream = query(ctx, plan, cache_key)
-        .await
-        .map_err(|e| format!("Query execution error: {}", e))?;
-
-    let schema = query_stream.schema();
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-    // Spawn background task to collect and cache results
-    let cache_clone = cache.clone();
+    cache_key: CacheKey,
+    rx: tokio::sync::mpsc::UnboundedReceiver<RecordBatch>,
+) {
     tokio::spawn(async move {
         let mut collected_batches = Vec::new();
         let mut receiver = rx;
@@ -226,11 +219,34 @@ async fn execute_query_with_cache(
             "Collected {} batches, inserting to cache",
             collected_batches.len()
         );
-        match cache_clone.insert(cache_key, &collected_batches).await {
+        match cache.insert(cache_key, &collected_batches).await {
             Ok(()) => info!("Successfully cached query results"),
             Err(e) => error!("Failed to cache query results: {}", e),
         }
     });
+}
+
+// Execute query and setup caching
+async fn execute_query_with_cache(
+    ctx: Arc<Context>,
+    plan: &Plan,
+    cache_key: CacheKey,
+    cache: Cache,
+) -> Result<BatchStream, String> {
+    info!("Not hitted cache, execute query from kokedb");
+    let query_stream = query(ctx, plan, cache_key)
+        .await
+        .map_err(|e| format!("Query execution error: {}", e))?;
+
+    if !should_cache_plan(plan) {
+        return Ok(query_stream);
+    }
+
+    let schema = query_stream.schema();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    // Spawn background task to collect and cache results
+    let _ret = spawn_cache_task(cache, cache_key, rx);
 
     // Adapt stream to send batches to caching task
     let adapted_stream = query_stream.map(move |batch_result| {
@@ -253,9 +269,11 @@ async fn get_batch_stream(
     plan: &Plan,
     cache_key: CacheKey,
 ) -> Result<BatchStream, String> {
-    // Try cache first
-    if let Some(stream) = try_get_from_cache(cache, cache_key).await {
-        return Ok(stream);
+    // Try cache first, command plan not need cache.
+    if should_cache_plan(plan) {
+        if let Some(stream) = try_get_from_cache(cache, cache_key).await {
+            return Ok(stream);
+        }
     }
 
     // Cache miss or error, execute query
