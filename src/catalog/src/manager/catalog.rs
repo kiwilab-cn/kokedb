@@ -94,7 +94,7 @@ impl CatalogManager {
         dsn: &str,
         catalog: &str,
     ) -> CatalogResult<uuid::Uuid> {
-        let schedule_interval_min: u32 = get_env_as("KOKEDB_CACHE_JOB_INTERVAL", 60u32); // 1 hour
+        let schedule_interval_min: u32 = get_env_as("KOKEDB_CACHE_JOB_INTERVAL", 30u32); // minutes
 
         let state = self
             .state()

@@ -1,5 +1,8 @@
 use kokedb_cache::foyer_hybrid::LruResultCache;
-use kokedb_common::file::get_remote_catalog_parent_local_path;
+use kokedb_common::{
+    env::get_env_as,
+    file::{cleanup_old_directories, get_remote_catalog_parent_local_path},
+};
 use kokedb_meta::{catalog_list::PostgreSQLMetaCatalogProviderList, schema::SchemaTable};
 use log::{error, info};
 
@@ -33,14 +36,14 @@ impl TaskExecutor for DataSyncExecutor {
         let catalog = &config.catalog_name;
         let source_table = &config.source_table;
         let local_table = &config.local_table;
-
-        let local_path = format!(
-            "{}/{}/{}/{}",
+        let table_base_path = format!(
+            "{}/{}/{}",
             get_remote_catalog_parent_local_path(),
             catalog,
             local_table.replace('.', "/"),
-            uuid::Uuid::new_v4()
         );
+
+        let local_path = format!("{}/{}", &table_base_path, uuid::Uuid::new_v4());
 
         let (schema, table) = local_table
             .split_once('.')
@@ -96,6 +99,17 @@ impl TaskExecutor for DataSyncExecutor {
                     error!("Failed to delete table: {} key from cache.", schema_info);
                 }
             }
+        }
+
+        let cache_versions = get_env_as("CACHE_KEEP_NUM", 3usize);
+        if let Err(x) =
+            cleanup_old_directories(&table_base_path, cache_versions, Some(&local_path)).await
+        {
+            error!(
+                "Failed to clean table path: {} with error: {}",
+                &table_base_path,
+                x.to_string()
+            );
         }
 
         Ok(())

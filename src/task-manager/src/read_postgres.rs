@@ -63,7 +63,7 @@ impl PostgresToParquetConverter {
             return Ok(());
         }
 
-        let _ = ensure_dir_exists(output_path)?;
+        let _ = ensure_dir_exists(output_path).await?;
         let random_parquet_name = Uuid::new_v4().to_string()[..8].to_string();
         let parquet_file_name = format!("{}/{}.parquet", output_path, random_parquet_name);
 
