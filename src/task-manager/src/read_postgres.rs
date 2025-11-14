@@ -3,8 +3,7 @@ use arrow::datatypes::*;
 use datafusion::parquet;
 use futures_util::TryStreamExt;
 use kokedb_common::{
-    env::get_env_as,
-    file::{cleanup_old_directories, ensure_dir_exists},
+    file::ensure_dir_exists,
     table::postgresql::{get_postgresql_table_schema, rows_to_record_batch},
 };
 use log::{error, info, warn};
@@ -64,7 +63,7 @@ impl PostgresToParquetConverter {
             return Ok(());
         }
 
-        let _ = ensure_dir_exists(output_path)?;
+        let _ = ensure_dir_exists(output_path).await?;
         let random_parquet_name = Uuid::new_v4().to_string()[..8].to_string();
         let parquet_file_name = format!("{}/{}.parquet", output_path, random_parquet_name);
 
