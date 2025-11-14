@@ -3,7 +3,8 @@ use arrow::datatypes::*;
 use datafusion::parquet;
 use futures_util::TryStreamExt;
 use kokedb_common::{
-    file::ensure_dir_exists,
+    env::get_env_as,
+    file::{cleanup_old_directories, ensure_dir_exists},
     table::postgresql::{get_postgresql_table_schema, rows_to_record_batch},
 };
 use log::{error, info, warn};
