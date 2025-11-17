@@ -100,7 +100,8 @@ impl PlanResolver<'_> {
                     ],
                 };
 
-                let table_provider = if !is_cached {
+                // TODO: should added field to dispatch remote / local catalog;
+                let table_provider = if !is_cached && dsn.is_some() {
                     let schema_name = if database.is_empty() {
                         None
                     } else {
