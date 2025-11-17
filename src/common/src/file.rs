@@ -53,7 +53,7 @@ pub async fn cleanup_old_directories(
             let except_path_buf = PathBuf::from(except);
             if path == except_path_buf {
                 keep_count = keep_count.saturating_sub(1);
-                log::info!(
+                log::debug!(
                     "Skipping excluded directory: {}/{:?}",
                     dir_path,
                     path.file_name().unwrap_or_default()
