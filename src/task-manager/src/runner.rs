@@ -112,6 +112,11 @@ impl TaskExecutor for DataSyncExecutor {
             );
         }
 
+        info!(
+            "Success sync table {}.{}.{} data to path {}",
+            &catalog, &schema, &table, &local_path
+        );
+
         Ok(())
     }
 }

@@ -6,7 +6,7 @@ use kokedb_common::{
     file::ensure_dir_exists,
     table::postgresql::{get_postgresql_table_schema, rows_to_record_batch},
 };
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use std::fs::File;
@@ -144,7 +144,10 @@ impl PostgresToParquetConverter {
                 .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
         }
 
-        info!("Successfully converted to {}", output_path);
+        info!(
+            "Successfully converted table {} to {}",
+            table_name, output_path
+        );
         Ok(arrow_schema)
     }
 
