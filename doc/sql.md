@@ -3,42 +3,39 @@
 
 ## DDL
 
-- CREATE CATALOGS
+- CREATE CATALOG
 
+Supports creating catalogs from PostgreSQL databases. MySQL and Oracle support coming soon.
 
+1. **default**  
 ```sql
 create catalog demo using postgresql://postgres:123456@127.00.1:25432/postgres;
 ```
+Cache policy is smart by default if not set.
 
+2. **smart**  
 ```sql
 create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="smart");
 ```
+Cache hot tables which are queried frequently **in the past 7 days**. If there are none, cache the top 10 tables.
 
+3. **all**  
 ```sql
 create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="all");
 ```
+Cache all tables from the remote catalog.
 
+4. **topk**  
 ```sql
 create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="topk", k="10");
 ```
+Cache the top N tables in the remote catalog, where "top" is determined by table size and row count.
 
+5. **select**  
 ```sql
 create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="select", table_set="test.newtable,public.newtable");
 ```
-  
-Cache policy is smart by default if not set.
-
-1. **smart**  
-Cache hot tables which are queried frequently in the past 7 days. If there are none, cache the top 10 tables.
-
-2. **all**  
-Cache all tables from the remote catalog.
-
-3. **topk**  
-Cache the top N tables in the remote catalog, where "top" is determined by table size and row count.
-
-4. **select**  
-Cache the tables which are in the table_set.
+Cache the tables which are in the **table_set**.
 
 - SHOW CATALOGS
 
