@@ -3,20 +3,30 @@
 
 ## DDL
 
-- SHOW CATALOGS
-
 - CREATE CATALOGS
 
-- SHOW DATABASES
 
 ```sql
 create catalog demo using postgresql://postgres:123456@127.00.1:25432/postgres;
-create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="smart");
-create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="all");
-create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="topk", k="10");
-create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="select", table_set="test.newtable,public.newtable");
-  
 ```
+
+```sql
+create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="smart");
+```
+
+```sql
+create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="all");
+```
+
+```sql
+create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="topk", k="10");
+```
+
+```sql
+create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postgres with properties(cache_policy="select", table_set="test.newtable,public.newtable");
+```
+  
+Cache policy is smart by default if not set.
 
 1. **smart**  
 Cache hot tables which are queried frequently in the past 7 days. If there are none, cache the top 10 tables.
@@ -30,10 +40,13 @@ Cache the top N tables in the remote catalog, where "top" is determined by table
 4. **select**  
 Cache the tables which are in the table_set.
 
+- SHOW CATALOGS
+
+- SHOW DATABASES
+
 - SHOW TABLES
 
 - SHOW COLUMNS
-
 
 
 ## DML
