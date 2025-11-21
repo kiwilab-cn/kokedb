@@ -18,16 +18,16 @@ create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postg
   
 ```
 
-1. smart
-Cache hot tables which are queried frequently. If there are none, cache the top 10 tables.
+1. **smart**  
+Cache hot tables which are queried frequently in the past 7 days. If there are none, cache the top 10 tables.
 
-2. all
+2. **all**  
 Cache all tables from the remote catalog.
 
-3. topk
+3. **topk**  
 Cache the top N tables in the remote catalog, where "top" is determined by table size and row count.
 
-4. select
+4. **select**  
 Cache the tables which are in the table_set.
 
 - SHOW TABLES
