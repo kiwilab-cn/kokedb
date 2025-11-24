@@ -11,6 +11,7 @@ use crate::resolver::state::PlanResolverState;
 use crate::resolver::PlanResolver;
 use kokedb_catalog::provider::RemoteDatabaseType;
 
+mod cache;
 mod catalog;
 mod explain;
 mod function;

@@ -351,6 +351,7 @@ pub enum Statement {
         is: Is,
         value: CommentValue,
     },
+    ShowCachePolicies {},
 }
 
 #[derive(Debug, Clone, TreeParser)]
