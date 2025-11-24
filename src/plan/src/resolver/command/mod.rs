@@ -290,6 +290,9 @@ impl PlanResolver<'_> {
             CommandNode::CommentOnColumn { .. } => {
                 Err(PlanError::todo("CommandNode::CommentOnColumn"))
             }
+            CommandNode::ListCachePolicies => {
+                Err(PlanError::todo("CommandNode::ListCachePolicies"))
+            }
         }
     }
 

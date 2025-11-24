@@ -513,6 +513,7 @@ pub enum CommandNode {
         column: ObjectName,
         value: Option<String>,
     },
+    ListCachePolicies,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

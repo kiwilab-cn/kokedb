@@ -14,11 +14,11 @@ use crate::ast::keywords::{
     Extended, External, Fields, Fileformat, First, For, Format, Formatted, From, Function,
     Functions, Generated, Global, If, In, Inpath, Inputformat, Insert, Into, Is, Items, Keys, Lazy,
     Like, Lines, Load, Local, Location, Map, Matched, Merge, Name, Noscan, Not, Null, On, Options,
-    Or, Outputformat, Overwrite, Partition, Partitioned, Partitions, Properties, Purge, Recover,
-    Refresh, Rename, Replace, Restrict, Row, Schema, Schemas, Serde, Serdeproperties, Set, Show,
-    Sorted, Source, Statistics, Stored, Table, Tables, Target, Tblproperties, Temp, Temporary,
-    Terminated, Then, Time, To, Type, Uncache, Unset, Update, Use, Using, Values, Verbose, View,
-    Views, When, With, Zone,
+    Or, Outputformat, Overwrite, Partition, Partitioned, Partitions, Policies, Properties, Purge,
+    Recover, Refresh, Rename, Replace, Restrict, Row, Schema, Schemas, Serde, Serdeproperties, Set,
+    Show, Sorted, Source, Statistics, Stored, Table, Tables, Target, Tblproperties, Temp,
+    Temporary, Terminated, Then, Time, To, Type, Uncache, Unset, Update, Use, Using, Values,
+    Verbose, View, Views, When, With, Zone,
 };
 use crate::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
 use crate::ast::operator::{
@@ -351,7 +351,11 @@ pub enum Statement {
         is: Is,
         value: CommentValue,
     },
-    ShowCachePolicies {},
+    ShowCachePolicies {
+        show: Show,
+        cache: Cache,
+        policies: Policies,
+    },
 }
 
 #[derive(Debug, Clone, TreeParser)]

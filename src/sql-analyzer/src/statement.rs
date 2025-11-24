@@ -972,6 +972,14 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::ShowCachePolicies {
+            show: _,
+            cache: _,
+            policies: _,
+        } => {
+            let node = spec::CommandNode::ListCachePolicies;
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
     }
 }
 
