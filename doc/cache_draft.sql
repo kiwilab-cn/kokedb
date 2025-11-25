@@ -687,5 +687,570 @@ FROM CATALOG catalog_name
   GROUP BY dt
   HAVING max_time > ${last_refresh_time}
 
-策略3: 日
+策略3: 日志表优化(APPEND模式专用)
+  -- 日志表特点: 通常只往最新1-2个分区写入
+  -- 系统策略: 只扫描最新分区 + 可能的延迟分区
+  scan_partitions = [today, yesterday]
+  
+  -- 自动清理过期分区
+  DELETE FROM cache WHERE dt < CURRENT_DATE - ${cache_days}
+
+用户配置示例(完全一致):
+
+-- 非分区表
+CREATE CACHE TASK users_cache
+ON TABLE catalog.db.users
+WITH (
+    incremental_mode = 'UPSERT',
+    incremental_key = 'user_id',
+    incremental_column = 'update_time'
+);
+
+-- 分区表(配置完全相同!)
+CREATE CACHE TASK orders_cache
+ON TABLE catalog.db.orders  -- PARTITIONED BY (dt)
+WITH (
+    incremental_mode = 'UPSERT',
+    incremental_key = 'order_id',
+    incremental_column = 'update_time',
+    cache_partitions = 'dt >= CURRENT_DATE - INTERVAL 30 DAY'
+);
+
+系统自动处理分区优化:
+  - 自动检测 dt 是分区字段
+  - 自动添加分区过滤: AND dt IN (changed_partitions)
+  - 自动清理过期分区: DELETE WHERE dt < ...
+  - 用户无需关心这些细节!
+
+
+=============================================================================
+四、自动检测机制 (推荐使用)
+=============================================================================
+
+系统可以自动检测表的元数据,简化配置。
+
+自动检测内容:
+  1. 分区信息: 是否分区表、分区字段
+  2. 主键: PRIMARY KEY 或 UNIQUE KEY
+  3. 时间戳字段: update_time, updated_at, modify_time 等
+  4. 推荐增量模式: 基于表特征自动推荐
+
+启用自动检测:
 */
+
+CREATE CACHE TASK auto_task
+ON TABLE catalog.db.orders
+WITH (
+    enable_incremental = true,
+    auto_detect = true,                 -- 启用自动检测
+    cache_partitions = 'dt >= CURRENT_DATE - INTERVAL 30 DAY'
+);
+
+/*
+系统自动配置为:
+  incremental_key = 'order_id'         (自动检测到主键)
+  incremental_column = 'update_time'   (自动检测到时间戳)
+  incremental_mode = 'UPSERT'          (自动推荐)
+  partition_columns = ['dt']           (自动检测到分区)
+
+查看检测结果:
+*/
+
+SHOW TABLE METADATA FROM catalog.db.orders;
+/*
+输出示例:
++------------------+----------------------------------+
+| Property         | Value                            |
++------------------+----------------------------------+
+| is_partitioned   | true                             |
+| partition_columns| [dt]                             |
+| primary_key      | [order_id]                       |
+| detected_timestamp_columns | [update_time, create_time] |
+| recommended_incremental_mode | UPSERT                |
++------------------+----------------------------------+
+*/
+
+
+-- ============================================================================
+-- 实战场景示例
+-- ============================================================================
+
+/*
+=============================================================================
+场景1: 订单表 - 分区表 + UPSERT模式 + 跨分区更新
+=============================================================================
+
+业务特点:
+  - 按下单日期分区 (dt)
+  - 订单状态会更新 (pending → paid → shipped → completed)
+  - 订单可能在创建后几天才更新状态
+  
+示例数据:
+  order_id | user_id | status    | create_time         | update_time         | dt
+  ---------|---------|-----------|---------------------|---------------------|----------
+  1001     | 5001    | completed | 2024-01-01 10:00:00 | 2024-01-05 15:30:00 | 20240101
+  1002     | 5002    | shipped   | 2024-01-02 11:00:00 | 2024-01-04 09:20:00 | 20240102
+  1003     | 5003    | pending   | 2024-01-05 14:00:00 | 2024-01-05 14:00:00 | 20240105
+  
+问题: 订单1001在 dt=20240101 分区创建,但在 dt=20240105 更新状态
+*/
+
+-- 配置
+CREATE CACHE TASK orders_cache
+ON TABLE hive_catalog.dw.orders
+WITH (
+    enable_incremental = true,
+    incremental_mode = 'UPSERT',              -- 支持跨分区更新
+    incremental_key = 'order_id',
+    incremental_column = 'update_time',       -- 关键: 捕获所有更新
+    cache_partitions = 'dt >= CURRENT_DATE - INTERVAL 30 DAY'
+);
+
+-- 首次全量加载
+REFRESH CACHE FROM TABLE hive_catalog.dw.orders WITH (mode = 'FULL');
+-- 加载最近30天所有订单
+
+-- 增量刷新 (假设当前时间: 2024-01-05 16:00:00, last_refresh_time: 2024-01-05 08:00:00)
+REFRESH CACHE FROM TABLE hive_catalog.dw.orders;
+
+/*
+执行逻辑:
+  Step 1: 检测变更分区
+    changed_partitions = ['20240101', '20240102', '20240104', '20240105']
+    (系统检测这些分区在 08:00-16:00 间有数据变化)
+  
+  Step 2: 生成增量SQL
+    SELECT * FROM orders
+    WHERE update_time > '2024-01-05 08:00:00'
+      AND dt IN ('20240101', '20240102', '20240104', '20240105')
+    
+    返回:
+    order_id=1001, status=completed (dt=20240101,但刚更新)
+    order_id=1002, status=shipped   (dt=20240102,状态变化)
+    order_id=1003, status=pending   (dt=20240105,新订单)
+  
+  Step 3: MERGE到缓存 (支持跨分区更新)
+    MERGE INTO cache_orders USING incremental_data
+    ON cache_orders.order_id = incremental_data.order_id
+    WHEN MATCHED THEN UPDATE SET status = incremental_data.status, ...
+    WHEN NOT MATCHED THEN INSERT VALUES (...)
+    
+    结果:
+    - order_id=1001 的状态被更新为 completed
+    - order_id=1002 的状态被更新为 shipped
+    - order_id=1003 被插入为新订单
+
+关键点:
+  ✓ update_time 捕获了所有变更(包括跨分区的)
+  ✓ 分区过滤优化了扫描性能(只扫描4个分区而非30个)
+  ✓ MERGE逻辑确保数据一致性
+*/
+
+
+/*
+=============================================================================
+场景2: 访问日志表 - 分区表 + APPEND模式 + 只追加
+=============================================================================
+
+业务特点:
+  - 按日期分区 (dt)
+  - 只追加新日志,不更新历史数据
+  - 可能有1-2天的数据延迟
+  
+示例数据:
+  log_id | user_id | action | log_time            | dt
+  -------|---------|--------|---------------------|----------
+  10001  | 5001    | click  | 2024-01-04 23:55:00 | 20240104
+  10002  | 5002    | view   | 2024-01-05 00:05:00 | 20240105
+  10003  | 5003    | click  | 2024-01-05 10:30:00 | 20240105
+*/
+
+-- 配置
+CREATE CACHE TASK logs_cache
+ON TABLE hive_catalog.logs.access_logs
+WITH (
+    enable_incremental = true,
+    incremental_mode = 'APPEND',              -- 只追加
+    incremental_column = 'log_time',          -- 无需主键
+    cache_partitions = 'dt >= CURRENT_DATE - INTERVAL 7 DAY'
+);
+
+-- 首次全量加载
+REFRESH CACHE FROM TABLE hive_catalog.logs.access_logs WITH (mode = 'FULL');
+
+-- 增量刷新 (假设当前: 2024-01-05 12:00:00, last_refresh_time: 2024-01-05 08:00:00)
+REFRESH CACHE FROM TABLE hive_catalog.logs.access_logs;
+
+/*
+执行逻辑:
+  Step 1: 日志表优化(只扫描最新分区)
+    系统识别: 这是日志表,通常只有最新1-2个分区有新数据
+    scan_partitions = ['20240104', '20240105']  -- 只扫描最近2天
+    
+  Step 2: 生成增量SQL
+    SELECT * FROM access_logs
+    WHERE log_time > '2024-01-05 08:00:00'
+      AND dt IN ('20240104', '20240105')
+    
+    返回:
+    log_id=10003 (08:00之后的新日志)
+  
+  Step 3: INSERT到缓存 (APPEND模式)
+    INSERT INTO cache_logs
+    SELECT * FROM incremental_data;
+    -- 直接插入,无需MERGE
+  
+  Step 4: 清理过期分区
+    DELETE FROM cache_logs
+    WHERE dt < CURRENT_DATE - INTERVAL 7 DAY;
+    -- 自动清理8天前的数据
+
+关键点:
+  ✓ APPEND模式最简单,性能最好
+  ✓ 系统自动只扫描最新分区
+  ✓ 自动清理过期数据
+*/
+
+
+/*
+=============================================================================
+场景3: 用户表 - 非分区表 + UPSERT模式
+=============================================================================
+
+业务特点:
+  - 非分区表
+  - 用户信息会更新(昵称、头像、状态等)
+  - 有新用户注册
+*/
+
+-- 配置
+CREATE CACHE TASK users_cache
+ON TABLE mysql_catalog.app.users
+WITH (
+    enable_incremental = true,
+    incremental_mode = 'UPSERT',
+    incremental_key = 'user_id',
+    incremental_column = 'update_time'
+);
+
+-- 首次全量加载
+REFRESH CACHE FROM TABLE mysql_catalog.app.users WITH (mode = 'FULL');
+
+-- 增量刷新
+REFRESH CACHE FROM TABLE mysql_catalog.app.users;
+
+/*
+执行逻辑:
+  Step 1: 生成增量SQL (无分区,逻辑简单)
+    SELECT * FROM users
+    WHERE update_time > '2024-01-05 08:00:00'
+  
+  Step 2: MERGE到缓存
+    MERGE INTO cache_users USING incremental_data
+    ON cache_users.user_id = incremental_data.user_id
+    WHEN MATCHED THEN UPDATE
+    WHEN NOT MATCHED THEN INSERT
+
+关键点:
+  ✓ 非分区表配置最简单
+  ✓ 增量逻辑与分区表完全一致
+*/
+
+
+/*
+=============================================================================
+场景4: 用户画像表 - 分区表 + 自定义模式 + 只缓存有效数据
+=============================================================================
+
+业务特点:
+  - 按日期分区,每天全量更新
+  - 有软删除标记 (is_deleted)
+  - 只想缓存有效用户,节省空间
+*/
+
+-- 配置
+CREATE CACHE TASK user_profile_cache
+ON TABLE hive_catalog.dw.user_profile_daily
+WITH (
+    enable_incremental = true,
+    incremental_mode = 'CUSTOM',
+    incremental_query = '''
+        SELECT * FROM ${table}
+        WHERE update_time > ${last_refresh_time}
+          AND is_deleted = 0
+          AND dt >= CURRENT_DATE - INTERVAL 30 DAY
+    '''
+);
+
+/*
+说明:
+  - CUSTOM模式允许完全自定义增量逻辑
+  - 过滤 is_deleted = 0,只缓存有效数据
+  - 自定义分区过滤逻辑
+*/
+
+
+/*
+=============================================================================
+场景5: 事实表 - 分区表 + 混合刷新策略
+=============================================================================
+
+业务需求:
+  - 按月分区
+  - 当月分区会更新,历史月份不变
+  - 需要缓存最近3个月数据
+  
+策略: 当月增量 + 历史全量
+*/
+
+-- 配置
+CREATE CACHE TASK fact_sales_cache
+ON TABLE hive_catalog.dw.fact_sales
+WITH (
+    enable_incremental = true,
+    incremental_mode = 'UPSERT',
+    incremental_key = 'sale_id',
+    incremental_column = 'update_time',
+    cache_partitions = 'month >= DATE_FORMAT(DATE_SUB(CURRENT_DATE, 90), "yyyyMM")'
+);
+
+-- 日常增量刷新(只更新当月分区)
+REFRESH CACHE FROM TABLE hive_catalog.dw.fact_sales;
+
+-- 月初: 全量刷新上月分区(确保历史数据准确)
+REFRESH CACHE FROM TABLE hive_catalog.dw.fact_sales
+WITH (
+    mode = 'FULL',
+    partitions = 'month=202401'  -- 重建上月分区
+);
+
+
+-- ============================================================================
+-- 最佳实践决策树
+-- ============================================================================
+
+/*
+步骤1: 确定增量模式 (incremental_mode)
+
+  表数据是否会UPDATE?
+  ├─ 否 (只INSERT)
+  │  └─ 使用 APPEND 模式
+  │     - 日志表、事件流
+  │     - 只需 incremental_column
+  │     - 性能最好
+  │
+  └─ 是 (有UPDATE)
+     ├─ 标准业务逻辑
+     │  └─ 使用 UPSERT 模式 (推荐)
+     │     - 订单表、用户表
+     │     - 需要 incremental_key + incremental_column
+     │     - 支持跨分区更新
+     │
+     └─ 复杂业务逻辑(软删除、多条件过滤等)
+        └─ 使用 CUSTOM 模式
+           - 完全自定义增量SQL
+           - 灵活但复杂
+
+
+步骤2: 配置分区范围 (cache_partitions)
+
+  是否为分区表?
+  ├─ 否 (非分区表)
+  │  └─ 不需要配置 cache_partitions
+  │
+  └─ 是 (分区表)
+     ├─ 缓存最近N天/月
+     │  └─ cache_partitions = 'dt >= CURRENT_DATE - INTERVAL 30 DAY'
+     │
+     ├─ 缓存固定时间范围
+     │  └─ cache_partitions = 'dt>=20240101,dt<=20240131'
+     │
+     └─ 缓存所有分区
+        └─ 不配置 cache_partitions (默认全部)
+
+
+步骤3: 选择刷新模式 (REFRESH mode)
+
+  首次加载?
+  ├─ 是
+  │  └─ 使用 FULL 模式
+  │     REFRESH CACHE ... WITH (mode = 'FULL')
+  │
+  └─ 否 (日常刷新)
+     ├─ 正常情况
+     │  └─ 使用 INCREMENTAL 模式 (默认)
+     │     REFRESH CACHE ...
+     │
+     └─ 特殊情况(数据修复、缓存损坏)
+        └─ 使用 FULL 模式
+           REFRESH CACHE ... WITH (mode = 'FULL')
+
+
+步骤4: 是否启用自动检测 (可选)
+
+  表结构清晰(有主键、标准时间戳字段)?
+  ├─ 是
+  │  └─ 启用 auto_detect = true
+  │     - 系统自动配置所有参数
+  │     - 配置最简单
+  │
+  └─ 否 (特殊命名、复杂结构)
+     └─ 手动指定所有参数
+        - incremental_key
+        - incremental_column
+        - incremental_mode
+*/
+
+
+-- ============================================================================
+-- 常见问题 FAQ
+-- ============================================================================
+
+/*
+Q1: APPEND 和 UPSERT 如何选择?
+A1: 
+  - 数据只INSERT不UPDATE → APPEND
+  - 数据会UPDATE → UPSERT
+  - 不确定时建议用 UPSERT(更安全)
+
+Q2: 分区表是否需要特殊配置?
+A2: 
+  - 不需要!配置与非分区表完全一致
+  - 系统自动检测分区并优化性能
+  - 只需指定 cache_partitions 限定缓存范围
+
+Q3: 如何处理软删除(is_deleted)?
+A3: 
+  方案1 (推荐,简单): 使用 UPSERT,缓存所有数据
+    - 查询时过滤: SELECT * FROM cache WHERE is_deleted = 0
+  
+  方案2 (节省空间): 使用 CUSTOM,只缓存有效数据
+    - incremental_query 中过滤: WHERE is_deleted = 0
+    - 缺点: 无法查询历史删除记录
+
+Q4: 什么时候用 FULL 模式刷新?
+A4:
+  - 首次加载缓存 (必须)
+  - 数据修复或一致性问题
+  - 源表结构变更
+  - 定期重建(建议每周/月,在低峰期)
+
+Q5: 分区表增量刷新会扫描所有分区吗?
+A5:
+  - 不会!系统自动优化
+  - 只扫描检测到有变化的分区
+  - 比如: 30天的缓存范围,可能只扫描2-3个变更分区
+
+Q6: 跨分区更新如何工作?
+A6:
+  - UPSERT 模式天然支持
+  - 示例: 订单在 dt=20240101 创建,在 dt=20240105 更新状态
+  - 增量SQL会扫描所有缓存范围内的分区,但只更新变化的记录
+
+Q7: 如何验证缓存配置是否正确?
+A7:
+  -- 查看任务配置
+  DESCRIBE CACHE TASK task_name;
+  
+  -- 查看自动检测结果
+  SHOW TABLE METADATA FROM catalog.db.table;
+  
+  -- 查看执行计划(不实际执行)
+  EXPLAIN REFRESH CACHE FROM TABLE catalog.db.table;
+
+Q8: 增量刷新失败如何排查?
+A8:
+  -- 查看失败任务
+  SHOW FAILED CACHE TASKS WHERE task_name = 'xxx';
+  
+  -- 查看执行历史
+  SHOW CACHE TASK HISTORY FROM task_name LIMIT 50;
+  
+  -- 验证数据一致性
+  VALIDATE CACHE FROM TABLE catalog.db.table;
+
+Q9: 如何优化大表的首次加载?
+A9:
+  -- 方式1: 分批加载分区
+  REFRESH CACHE FROM TABLE orders 
+  WITH (mode = 'FULL', partitions = 'dt>=20240101,dt<=20240107');
+  
+  REFRESH CACHE FROM TABLE orders 
+  WITH (mode = 'FULL', partitions = 'dt>=20240108,dt<=20240114');
+  
+  -- 方式2: 并行加载
+  REFRESH CACHE FROM TABLE orders 
+  WITH (mode = 'FULL', parallel = 8);
+
+Q10: 定时任务如何配置?
+A10:
+  -- 创建定时任务
+  CREATE CACHE TASK orders_cache
+  ON TABLE catalog.db.orders
+  WITH (
+      refresh_mode = 'SCHEDULED',     -- 定时模式
+      refresh_interval = '10m',       -- 每10分钟刷新
+      incremental_mode = 'UPSERT',
+      ...
+  );
+  
+  -- 系统会自动按计划增量刷新
+  -- 无需手动触发 REFRESH CACHE
+*/
+
+
+-- ============================================================================
+-- 完整配置示例总结
+-- ============================================================================
+
+-- 1. 日志表(分区表 + APPEND)
+CREATE CACHE TASK logs_cache
+ON TABLE catalog.logs.access_logs
+WITH (
+    enable_incremental = true,
+    incremental_mode = 'APPEND',
+    incremental_column = 'log_time',
+    cache_partitions = 'dt >= CURRENT_DATE - INTERVAL 7 DAY',
+    refresh_interval = '5m',
+    refresh_mode = 'SCHEDULED'
+);
+
+-- 2. 订单表(分区表 + UPSERT)
+CREATE CACHE TASK orders_cache
+ON TABLE catalog.dw.orders
+WITH (
+    enable_incremental = true,
+    incremental_mode = 'UPSERT',
+    incremental_key = 'order_id',
+    incremental_column = 'update_time',
+    cache_partitions = 'dt >= CURRENT_DATE - INTERVAL 30 DAY',
+    refresh_interval = '10m',
+    refresh_mode = 'SCHEDULED'
+);
+
+-- 3. 用户表(非分区表 + UPSERT)
+CREATE CACHE TASK users_cache
+ON TABLE catalog.app.users
+WITH (
+    enable_incremental = true,
+    incremental_mode = 'UPSERT',
+    incremental_key = 'user_id',
+    incremental_column = 'update_time',
+    refresh_interval = '15m',
+    refresh_mode = 'SCHEDULED'
+);
+
+-- 4. 自动检测配置(最简单)
+CREATE CACHE TASK auto_cache
+ON TABLE catalog.db.any_table
+WITH (
+    enable_incremental = true,
+    auto_detect = true,
+    cache_partitions = 'dt >= CURRENT_DATE - INTERVAL 30 DAY',
+    refresh_interval = '10m',
+    refresh_mode = 'SCHEDULED'
+);
+
+-- ============================================================================
+-- 结束
+-- ============================================================================
