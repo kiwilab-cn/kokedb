@@ -70,8 +70,6 @@ cargo run
 
 ## Usage
 
-(Example usage snippets. Basic steps:)
-
 1. Start postgresql meta server.  
 ```sehll
 sudo docker run -d --name test-postgres -e POSTGRES_PASSWORD=123456 -e PGDATA=/var/lib/postgresql/data/pgdata  -v /opt/postgresql/data:/var/lib/postgresql/data -p 0.0.0.0:25432:5432 postgres:17.6
