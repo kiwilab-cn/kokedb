@@ -196,6 +196,7 @@ impl TaskManager {
         let max_concurrent = self.config.max_concurrent_tasks;
         let max_retries = self.config.max_retries;
         let task_queue_rx = self.task_queue_rx.clone();
+        let task_queue_tx = self.task_queue_tx.clone();
         let is_shutting_down = self.is_shutting_down.clone();
 
         tokio::spawn(async move {
@@ -229,6 +230,7 @@ impl TaskManager {
                             let task_handles_clone = task_handles.clone();
                             let executor_clone = executor.clone();
                             let active_tasks_clone = active_tasks.clone();
+                            let retry_tx = task_queue_tx.clone();
                             let cache = cache.clone();
 
                             let handle = tokio::spawn(async move {
@@ -251,7 +253,10 @@ impl TaskManager {
                                         }
                                     }
                                     Err(e) => {
-                                        if let Some(mut task) = tasks_clone.get_mut(&task_id) {
+                                        // Decide whether to retry while holding the entry briefly,
+                                        // then release the lock before any await to avoid holding
+                                        // a DashMap guard across suspension points.
+                                        let retry = if let Some(mut task) = tasks_clone.get_mut(&task_id) {
                                             task.status = TaskStatus::Failed;
                                             task.error_message = Some(e.to_string());
 
@@ -259,7 +264,40 @@ impl TaskManager {
                                                 task.retry_count += 1;
                                                 task.status = TaskStatus::Pending;
                                                 info!("Task {} failed with error: {}, retrying ({}/{})", task_id, &e, task.retry_count, max_retries);
+                                                Some(task.retry_count)
+                                            } else {
+                                                None
                                             }
+                                        } else {
+                                            None
+                                        };
+
+                                        // Re-enqueue with capped exponential backoff so a
+                                        // persistently failing task does not hot-loop the queue.
+                                        // The backoff runs in a detached task so this worker
+                                        // frees its concurrency slot immediately instead of
+                                        // sleeping while holding it.
+                                        if let Some(attempt) = retry {
+                                            let backoff_secs = (1u64 << attempt.min(6)).min(60);
+                                            let retry_tx = retry_tx.clone();
+                                            let tasks_retry = tasks_clone.clone();
+                                            let retry_id = task_id.clone();
+                                            let retry_config = task_config.clone();
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
+                                                let requeued = retry_tx.send(TaskWrapper {
+                                                    id: retry_id.clone(),
+                                                    config: retry_config,
+                                                });
+                                                if requeued.is_ok() {
+                                                    if let Some(mut task) = tasks_retry.get_mut(&retry_id) {
+                                                        task.status = TaskStatus::Queued;
+                                                        task.queued_at = Some(Utc::now());
+                                                    }
+                                                } else if let Some(mut task) = tasks_retry.get_mut(&retry_id) {
+                                                    task.status = TaskStatus::Failed;
+                                                }
+                                            });
                                         }
                                     }
                                 }
@@ -289,8 +327,6 @@ impl TaskManager {
         }
 
         let task_id = Uuid::new_v4().to_string();
-
-        if matches!(config.priority, TaskPriority::Normal) && config.additional_params.is_empty() {}
 
         let metadata = TaskMetadata {
             id: task_id.clone(),

@@ -264,7 +264,7 @@ impl ExecutionPlan for PostgreSQLExec {
     }
 
     fn name(&self) -> &str {
-        todo!()
+        "PostgreSQLExec"
     }
 }
 

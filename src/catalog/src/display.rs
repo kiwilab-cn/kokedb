@@ -10,6 +10,16 @@ pub struct SingleValueDisplay<T> {
     pub value: T,
 }
 
+/// One row of `SHOW CACHE POLICIES` output. The cache policy is independent of
+/// the catalog display dialect, so it is represented with a concrete struct
+/// rather than an associated type on [`CatalogDisplay`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachePolicyDisplay {
+    pub catalog: String,
+    pub db_type: String,
+    pub cache_policy: String,
+}
+
 /// A trait for displaying catalog information in a structured format.
 /// This is useful for defining output schemas and producing outputs
 /// for various SQL catalog commands.

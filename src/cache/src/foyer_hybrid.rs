@@ -9,9 +9,14 @@ use foyer::{
 
 use crate::{codec::RecordBatchCodec, error::CacheError};
 
+/// Default zstd compression level used when `RESULT_CACHE_ZSTD_LEVEL` is unset.
+/// Level 3 balances ratio and CPU cost for cached Arrow IPC payloads.
+const DEFAULT_ZSTD_LEVEL: i32 = 3;
+
 #[derive(Clone)]
 pub struct LruResultCache {
     pub inner: Arc<HybridCache<u64, Vec<u8>>>,
+    compression_level: i32,
 }
 
 impl LruResultCache {
@@ -19,6 +24,11 @@ impl LruResultCache {
         let cache_dir =
             std::env::var("RESULT_CACHE_DIR").unwrap_or("/tmp/kokedb-cache".to_string());
         let cache_path = Path::new(&cache_dir);
+
+        let compression_level = std::env::var("RESULT_CACHE_ZSTD_LEVEL")
+            .ok()
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or(DEFAULT_ZSTD_LEVEL);
 
         let device = FsDeviceBuilder::new(cache_path)
             .with_capacity(disk_size * 1024 * 1024)
@@ -50,11 +60,12 @@ impl LruResultCache {
 
         Ok(Self {
             inner: Arc::new(hybrid_cache),
+            compression_level,
         })
     }
 
     pub async fn insert(&self, key: u64, batches: &[RecordBatch]) -> Result<(), CacheError> {
-        let encode = RecordBatchCodec::encode(batches, 3)?;
+        let encode = RecordBatchCodec::encode(batches, self.compression_level)?;
         let _ret = self.inner.insert(key, encode);
 
         Ok(())
