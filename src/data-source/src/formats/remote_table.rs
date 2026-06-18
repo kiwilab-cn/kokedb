@@ -264,7 +264,7 @@ impl ExecutionPlan for PostgreSQLExec {
     }
 
     fn name(&self) -> &str {
-        todo!()
+        "PostgreSQLExec"
     }
 }
 
@@ -344,10 +344,12 @@ mod tests {
     use log::info;
 
     #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via `make integration-test`"]
     async fn test_postgresql_table_provider() -> Result<()> {
+        let connection_string = std::env::var("KOKEDB_TEST_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".to_string());
         let config = PostgreSQLConfig {
-            connection_string: "postgresql://postgres:123456@192.168.0.227:25432/postgres"
-                .to_string(),
+            connection_string,
             table_name: "newtable".to_string(),
             schema_name: Some("test".to_string()),
         };

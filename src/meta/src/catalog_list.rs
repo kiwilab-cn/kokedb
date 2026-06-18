@@ -296,6 +296,30 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(cache_policy)
     }
 
+    /// Returns `(catalog_name, db_type, cache_policy)` for every registered
+    /// catalog in a single query. Used by `SHOW CACHE POLICIES`.
+    pub async fn list_cache_policies(&self) -> Result<Vec<(String, String, String)>> {
+        let sql =
+            "SELECT name, db_type, cache_policy FROM system.catalog ORDER BY name;";
+
+        let rows = sqlx::query(sql)
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        let policies = rows
+            .into_iter()
+            .map(|row| {
+                let name: String = row.try_get("name").unwrap_or_default();
+                let db_type: String = row.try_get("db_type").unwrap_or_default();
+                let cache_policy: String = row.try_get("cache_policy").unwrap_or_default();
+                (name, db_type, cache_policy)
+            })
+            .collect();
+
+        Ok(policies)
+    }
+
     pub fn create_catalog(
         &self,
         catalog: &str,

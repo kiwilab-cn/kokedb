@@ -15,12 +15,12 @@ pub struct RecordBatchCodec;
 
 impl RecordBatchCodec {
     pub fn encode(batches: &[RecordBatch], compression_level: i32) -> Result<Vec<u8>, CacheError> {
-        if batches.is_empty() {
-            return Ok(vec![]);
-        }
+        let schema = match batches.first() {
+            Some(batch) => batch.schema(),
+            None => return Ok(vec![]),
+        };
 
         let mut buffer = Vec::new();
-        let schema = batches.first().unwrap().schema();
         let mut writer = FileWriter::try_new(&mut buffer, &schema).map_err(|x| {
             CacheError::Internal(format!("Failed to new FileWriter with error: {x}"))
         })?;

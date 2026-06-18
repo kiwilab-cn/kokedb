@@ -2,6 +2,7 @@ pub mod column;
 pub mod error;
 pub mod row;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{column::compact_columns, error::MysqlServerError, row::compact_batch_rows};
@@ -20,10 +21,31 @@ use log::{error, info, warn};
 use opensrv_mysql::*;
 use tokio::{io::AsyncWrite, net::TcpListener};
 
+/// A prepared statement bound to a single client connection.
 #[derive(Clone)]
+struct PreparedStatement {
+    sql: String,
+    param_count: usize,
+}
+
 struct CoreContex {
     ctx: Arc<SessionContext>,
     cache: LruResultCache,
+    /// Per-connection prepared statement registry, keyed by statement id.
+    prepared: HashMap<u32, PreparedStatement>,
+    /// Monotonic statement id generator for this connection.
+    next_stmt_id: u32,
+}
+
+impl CoreContex {
+    fn new(ctx: Arc<SessionContext>, cache: LruResultCache) -> Self {
+        Self {
+            ctx,
+            cache,
+            prepared: HashMap::new(),
+            next_stmt_id: 1,
+        }
+    }
 }
 
 // Type aliases for clarity
@@ -36,29 +58,77 @@ type Context = datafusion::prelude::SessionContext;
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
     type Error = MysqlServerError;
 
+    /// Prepare a statement: validate the SQL, count its `?` placeholders, and
+    /// register it under a fresh statement id so `on_execute` can run it later.
+    ///
+    /// Result column metadata is reported lazily (empty here) because resolving
+    /// it requires the parameter values, which are only known at execute time.
     async fn on_prepare<'a>(
         &'a mut self,
-        _: &'a str,
+        query: &'a str,
         info: StatementMetaWriter<'a, W>,
     ) -> Result<(), MysqlServerError> {
-        info.reply(42, &[], &[])
+        let param_count = count_param_placeholders(query);
+
+        let stmt_id = self.next_stmt_id;
+        self.next_stmt_id = self.next_stmt_id.wrapping_add(1).max(1);
+
+        self.prepared.insert(
+            stmt_id,
+            PreparedStatement {
+                sql: query.to_string(),
+                param_count,
+            },
+        );
+
+        // One generic placeholder descriptor per parameter.
+        let params: Vec<Column> = (0..param_count).map(|_| generic_param_column()).collect();
+
+        info.reply(stmt_id, &params, &[])
             .await
             .map_err(|x| MysqlServerError::InternalError(x.to_string()))
     }
 
+    /// Execute a previously prepared statement by substituting the bound
+    /// parameters into the SQL text and running it through the shared query path.
     async fn on_execute<'a>(
         &'a mut self,
-        _: u32,
-        _: opensrv_mysql::ParamParser<'a>,
+        id: u32,
+        params: opensrv_mysql::ParamParser<'a>,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), MysqlServerError> {
-        results
-            .completed(OkResponse::default())
-            .await
-            .map_err(|x| MysqlServerError::InternalError(x.to_string()))
+        let stmt = match self.prepared.get(&id) {
+            Some(stmt) => stmt.clone(),
+            None => {
+                let msg = format!("Unknown prepared statement id: {}", id);
+                return send_error_to_client(results, ErrorKind::ER_UNKNOWN_STMT_HANDLER, msg).await;
+            }
+        };
+
+        // Decode bound parameters into SQL literals, in positional order.
+        let mut literals = Vec::with_capacity(stmt.param_count);
+        for param in params {
+            match param_to_sql_literal(param.value) {
+                Ok(literal) => literals.push(literal),
+                Err(msg) => {
+                    return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, msg).await;
+                }
+            }
+        }
+
+        let sql = match substitute_params(&stmt.sql, &literals) {
+            Ok(sql) => sql,
+            Err(msg) => {
+                return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, msg).await;
+            }
+        };
+
+        run_query(self.ctx.clone(), self.cache.clone(), &sql, results).await
     }
 
-    async fn on_close(&mut self, _: u32) {}
+    async fn on_close(&mut self, stmt: u32) {
+        self.prepared.remove(&stmt);
+    }
 
     /*
      * sql --> cache hit --> yes --> return cache result
@@ -76,64 +146,73 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         sql: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), MysqlServerError> {
-        let instant = std::time::Instant::now();
-        let ctx = self.ctx.clone();
-        let cache = self.cache.clone();
-
-        // Step 1: Parse SQL and generate plan
-        let (plan, cache_key) = match parse_sql_and_get_plan(sql) {
-            Ok(result) => result,
-            Err((error_kind, error_msg)) => {
-                return send_error_to_client(results, error_kind, error_msg).await;
-            }
-        };
-
-        // Step 2: Get batch stream from cache or query
-        let mut batch_stream = match get_batch_stream(&cache, ctx, &plan, cache_key).await {
-            Ok(stream) => stream,
-            Err(error_msg) => {
-                return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
-            }
-        };
-
-        // Step 3: Get first batch
-        let first_batch = match batch_stream.next().await {
-            Some(Ok(batch)) => batch,
-            Some(Err(e)) => {
-                let error_msg = format!("Error reading first batch: {}", e);
-                return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
-            }
-            None => {
-                // Empty result set
-                return handle_empty_result(results, sql, &plan, instant).await;
-            }
-        };
-
-        // Step 4: Prepare columns from schema
-        let columns = match prepare_columns_from_batch(&first_batch) {
-            Ok(cols) => cols,
-            Err(error_msg) => {
-                return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
-            }
-        };
-
-        // ============ Critical boundary: cannot use results.error() after start() ============
-
-        // Step 5: Start writing results
-        let mut writer = results.start(&columns).await.map_err(|e| {
-            let error_msg = format!("Failed to create result writer: {}", e);
-            error!("{}", error_msg);
-            MysqlServerError::CreateMysqlResultWriterError(error_msg)
-        })?;
-
-        // Step 6: Write all batches to client
-        write_batches_to_client(&mut writer, &first_batch, &mut batch_stream).await?;
-
-        // Step 7: Finalize query execution
-        finalize_query(writer, sql, &plan, instant).await?;
-
-        Ok(())
+        run_query(self.ctx.clone(), self.cache.clone(), sql, results).await
     }
+}
+
+/// Shared query execution path used by both text queries (`on_query`) and
+/// prepared statement execution (`on_execute`).
+async fn run_query<W: AsyncWrite + Send + Unpin>(
+    ctx: Arc<SessionContext>,
+    cache: Cache,
+    sql: &str,
+    results: QueryResultWriter<'_, W>,
+) -> Result<(), MysqlServerError> {
+    let instant = std::time::Instant::now();
+
+    // Step 1: Parse SQL and generate plan
+    let (plan, cache_key) = match parse_sql_and_get_plan(sql) {
+        Ok(result) => result,
+        Err((error_kind, error_msg)) => {
+            return send_error_to_client(results, error_kind, error_msg).await;
+        }
+    };
+
+    // Step 2: Get batch stream from cache or query
+    let mut batch_stream = match get_batch_stream(&cache, ctx, &plan, cache_key).await {
+        Ok(stream) => stream,
+        Err(error_msg) => {
+            return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
+        }
+    };
+
+    // Step 3: Get first batch
+    let first_batch = match batch_stream.next().await {
+        Some(Ok(batch)) => batch,
+        Some(Err(e)) => {
+            let error_msg = format!("Error reading first batch: {}", e);
+            return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
+        }
+        None => {
+            // Empty result set
+            return handle_empty_result(results, sql, &plan, instant).await;
+        }
+    };
+
+    // Step 4: Prepare columns from schema
+    let columns = match prepare_columns_from_batch(&first_batch) {
+        Ok(cols) => cols,
+        Err(error_msg) => {
+            return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
+        }
+    };
+
+    // ============ Critical boundary: cannot use results.error() after start() ============
+
+    // Step 5: Start writing results
+    let mut writer = results.start(&columns).await.map_err(|e| {
+        let error_msg = format!("Failed to create result writer: {}", e);
+        error!("{}", error_msg);
+        MysqlServerError::CreateMysqlResultWriterError(error_msg)
+    })?;
+
+    // Step 6: Write all batches to client
+    write_batches_to_client(&mut writer, &first_batch, &mut batch_stream).await?;
+
+    // Step 7: Finalize query execution
+    finalize_query(writer, sql, &plan, instant).await?;
+
+    Ok(())
 }
 
 async fn send_error_to_client<W: AsyncWrite + Unpin>(
@@ -149,23 +228,148 @@ async fn send_error_to_client<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-// Parse SQL and generate execution plan
-fn parse_sql_and_get_plan(sql: &str) -> Result<(Plan, CacheKey), (ErrorKind, String)> {
-    let plan = parser(sql).map_err(|e| {
-        (
-            ErrorKind::ER_PARSE_ERROR,
-            format!("SQL parsing error: {}", e),
-        )
-    })?;
+/// Builds a generic string parameter descriptor for prepared statement metadata.
+fn generic_param_column() -> Column {
+    Column {
+        table: String::new(),
+        column: "?".to_string(),
+        coltype: ColumnType::MYSQL_TYPE_VAR_STRING,
+        colflags: ColumnFlags::empty(),
+    }
+}
 
-    let cache_key = get_plan_hash(&plan).map_err(|e| {
-        (
-            ErrorKind::ER_UNKNOWN_ERROR,
-            format!("Failed to generate cache key: {}", e),
-        )
-    })?;
+/// Counts `?` placeholders in `sql`, ignoring any that appear inside single
+/// quotes, double quotes, or backtick-quoted identifiers.
+fn count_param_placeholders(sql: &str) -> usize {
+    let mut count = 0;
+    let mut quote: Option<char> = None;
+    let mut chars = sql.chars().peekable();
 
-    Ok((plan, cache_key))
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    // A doubled quote is an escaped literal quote, not a terminator.
+                    if chars.peek() == Some(&q) {
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                } else if c == '\\' && q != '`' {
+                    // Skip the escaped character inside string literals.
+                    chars.next();
+                }
+            }
+            None => match c {
+                '\'' | '"' | '`' => quote = Some(c),
+                '?' => count += 1,
+                _ => {}
+            },
+        }
+    }
+
+    count
+}
+
+/// Substitutes positional `?` placeholders in `sql` with the provided literals,
+/// skipping any `?` inside quoted strings/identifiers. Returns an error if the
+/// number of placeholders does not match the number of literals.
+fn substitute_params(sql: &str, literals: &[String]) -> Result<String, String> {
+    let mut out = String::with_capacity(sql.len() + literals.len() * 8);
+    let mut quote: Option<char> = None;
+    let mut next_param = 0;
+    let mut chars = sql.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    if chars.peek() == Some(&q) {
+                        out.push(q);
+                        chars.next();
+                    } else {
+                        quote = None;
+                    }
+                } else if c == '\\' && q != '`' {
+                    if let Some(escaped) = chars.next() {
+                        out.push(escaped);
+                    }
+                }
+            }
+            None => match c {
+                '\'' | '"' | '`' => {
+                    quote = Some(c);
+                    out.push(c);
+                }
+                '?' => {
+                    let literal = literals.get(next_param).ok_or_else(|| {
+                        format!(
+                            "Too few parameters supplied: expected more than {}",
+                            literals.len()
+                        )
+                    })?;
+                    out.push_str(literal);
+                    next_param += 1;
+                }
+                _ => out.push(c),
+            },
+        }
+    }
+
+    if next_param != literals.len() {
+        return Err(format!(
+            "Parameter count mismatch: statement has {} placeholders but {} were supplied",
+            next_param,
+            literals.len()
+        ));
+    }
+
+    Ok(out)
+}
+
+/// Converts a bound MySQL parameter value into a SQL literal suitable for
+/// textual substitution into the statement.
+fn param_to_sql_literal(value: Value<'_>) -> Result<String, String> {
+    match value.into_inner() {
+        ValueInner::NULL => Ok("NULL".to_string()),
+        ValueInner::Int(i) => Ok(i.to_string()),
+        ValueInner::UInt(u) => Ok(u.to_string()),
+        ValueInner::Double(d) => {
+            if d.is_finite() {
+                Ok(d.to_string())
+            } else {
+                // NaN/Infinity have no SQL literal form.
+                Ok("NULL".to_string())
+            }
+        }
+        ValueInner::Bytes(b) => {
+            let s = String::from_utf8_lossy(b);
+            Ok(quote_sql_string(&s))
+        }
+        ValueInner::Date(_) | ValueInner::Datetime(_) => {
+            // `Value` is `Copy`, so it is still usable after `into_inner` above.
+            let dt = to_naive_datetime(value)
+                .map_err(|e| format!("Failed to decode date/datetime parameter: {}", e))?;
+            Ok(format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.6f")))
+        }
+        ValueInner::Time(_) => Err("TIME parameter binding is not supported yet".to_string()),
+    }
+}
+
+/// Quotes and escapes a string as a single-quoted SQL string literal.
+fn quote_sql_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        match c {
+            '\'' => out.push_str("''"),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 // Try to retrieve result from cache
@@ -191,6 +395,25 @@ async fn try_get_from_cache(cache: &Cache, cache_key: CacheKey) -> Option<BatchS
             None
         }
     }
+}
+
+// Parse SQL and generate execution plan
+fn parse_sql_and_get_plan(sql: &str) -> Result<(Plan, CacheKey), (ErrorKind, String)> {
+    let plan = parser(sql).map_err(|e| {
+        (
+            ErrorKind::ER_PARSE_ERROR,
+            format!("SQL parsing error: {}", e),
+        )
+    })?;
+
+    let cache_key = get_plan_hash(&plan).map_err(|e| {
+        (
+            ErrorKind::ER_UNKNOWN_ERROR,
+            format!("Failed to generate cache key: {}", e),
+        )
+    })?;
+
+    Ok((plan, cache_key))
 }
 
 fn should_cache_plan(plan: &Plan) -> bool {
@@ -385,6 +608,52 @@ async fn write_batch_to_mysql<'a, W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_placeholders_outside_quotes() {
+        assert_eq!(count_param_placeholders("SELECT * FROM t WHERE a = ?"), 1);
+        assert_eq!(
+            count_param_placeholders("SELECT * FROM t WHERE a = ? AND b = ?"),
+            2
+        );
+        // `?` inside string / identifier quotes must be ignored.
+        assert_eq!(count_param_placeholders("SELECT '?' AS x WHERE a = ?"), 1);
+        assert_eq!(count_param_placeholders("SELECT \"a?b\", `c?d` FROM t"), 0);
+        assert_eq!(count_param_placeholders("SELECT 'it''s ? here' FROM t"), 0);
+    }
+
+    #[test]
+    fn substitutes_positional_params() {
+        let sql = "SELECT * FROM t WHERE a = ? AND b = ?";
+        let out = substitute_params(sql, &["1".into(), "'x'".into()]).unwrap();
+        assert_eq!(out, "SELECT * FROM t WHERE a = 1 AND b = 'x'");
+    }
+
+    #[test]
+    fn substitution_preserves_quoted_question_marks() {
+        let sql = "SELECT '?' , ? FROM t";
+        let out = substitute_params(sql, &["42".into()]).unwrap();
+        assert_eq!(out, "SELECT '?' , 42 FROM t");
+    }
+
+    #[test]
+    fn substitution_rejects_count_mismatch() {
+        let sql = "SELECT * FROM t WHERE a = ?";
+        assert!(substitute_params(sql, &[]).is_err());
+        assert!(substitute_params(sql, &["1".into(), "2".into()]).is_err());
+    }
+
+    #[test]
+    fn quotes_and_escapes_strings() {
+        assert_eq!(quote_sql_string("abc"), "'abc'");
+        assert_eq!(quote_sql_string("a'b"), "'a''b'");
+        assert_eq!(quote_sql_string("a\\b"), "'a\\\\b'");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), MysqlServerError> {
     init_logger().unwrap();
@@ -398,7 +667,7 @@ async fn main() -> Result<(), MysqlServerError> {
         let ctx = Arc::new(ctx.clone());
         let cache = result_cache.clone();
         tokio::spawn(async move {
-            AsyncMysqlIntermediary::run_on(CoreContex { ctx, cache }, r, w).await
+            AsyncMysqlIntermediary::run_on(CoreContex::new(ctx, cache), r, w).await
         });
     }
 }

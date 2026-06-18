@@ -7,6 +7,7 @@ use kokedb_task_manager::error::TaskError;
 use log::{error, info};
 use tokio_cron_scheduler::Job;
 
+use crate::display::CachePolicyDisplay;
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::provider::CreateCatalogOptions;
@@ -37,6 +38,26 @@ impl CatalogManager {
             .filter(|name| match_pattern(name.as_ref(), pattern))
             .cloned()
             .collect::<Vec<_>>())
+    }
+
+    /// Lists the cache policy of every registered catalog (backs `SHOW CACHE POLICIES`).
+    pub async fn list_cache_policies(&self) -> CatalogResult<Vec<CachePolicyDisplay>> {
+        // Clone the Arc out of the guard so the mutex is released before awaiting.
+        let dynamic_catalog_list = self.state()?.dynamic_catalog_list.clone();
+        let rows = dynamic_catalog_list
+            .list_cache_policies()
+            .await
+            .map_err(|e| {
+                CatalogError::External(format!("Failed to list cache policies: {e}"))
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|(catalog, db_type, cache_policy)| CachePolicyDisplay {
+                catalog,
+                db_type,
+                cache_policy,
+            })
+            .collect())
     }
 
     pub fn create_catalog(

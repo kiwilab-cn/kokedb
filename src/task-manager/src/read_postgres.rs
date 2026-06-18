@@ -85,7 +85,6 @@ impl PostgresToParquetConverter {
             .context("Failed to create Parquet writer")
             .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
 
-        info!("Writing batch to {}", &parquet_file_name);
         writer
             .write(&batch)
             .context(format!("Failed to write batch to: {}", &parquet_file_name))
@@ -94,7 +93,6 @@ impl PostgresToParquetConverter {
                 TaskError::WriteParquetError(e.to_string())
             })?;
 
-        info!("Closing writer");
         writer
             .close()
             .context(format!(
@@ -146,7 +144,10 @@ impl PostgresToParquetConverter {
                 .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
         }
 
-        info!("Successfully converted to {}", output_path);
+        info!(
+            "Successfully converted table {} to {}",
+            table_name, output_path
+        );
         Ok(arrow_schema)
     }
 
@@ -187,8 +188,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via `make integration-test`"]
     async fn test_conversion() -> Result<(), TaskError> {
-        let dsn = "postgresql://postgres:123456@192.168.0.227:25432/postgres";
+        let dsn = std::env::var("KOKEDB_TEST_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".to_string());
+        let dsn = dsn.as_str();
         let table_name = "public.test1";
         let output_path = "/tmp/test1/";
 

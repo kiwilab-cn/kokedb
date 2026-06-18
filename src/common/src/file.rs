@@ -38,7 +38,7 @@ pub async fn cleanup_old_directories(
     mut keep_count: usize,
     except_path: Option<&str>,
 ) -> io::Result<()> {
-    log::info!("Starting cleanup for directory: {}", dir_path);
+    log::debug!("Starting cleanup for directory: {}", dir_path);
 
     // Read all entries in the directory
     let mut entries = fs::read_dir(dir_path).await?;
@@ -53,8 +53,9 @@ pub async fn cleanup_old_directories(
             let except_path_buf = PathBuf::from(except);
             if path == except_path_buf {
                 keep_count = keep_count.saturating_sub(1);
-                log::info!(
-                    "Skipping excluded directory: {:?}",
+                log::debug!(
+                    "Skipping excluded directory: {}/{:?}",
+                    dir_path,
                     path.file_name().unwrap_or_default()
                 );
                 continue;
@@ -77,7 +78,11 @@ pub async fn cleanup_old_directories(
         }
     }
 
-    log::info!("Found {} directories in total", directories.len());
+    log::debug!(
+        "Found path: {} {} directories in total",
+        dir_path,
+        directories.len()
+    );
 
     // Sort directories by creation time (newest first)
     directories.sort_by(|a, b| b.1.cmp(&a.1));
@@ -87,16 +92,18 @@ pub async fn cleanup_old_directories(
         let to_delete = &directories[keep_count..];
 
         log::info!(
-            "Keeping {} newest directories, deleting {} old directories",
+            "Keeping {} newest directories, deleting {} old directories in path: {}",
             keep_count,
-            to_delete.len()
+            to_delete.len(),
+            dir_path,
         );
 
         for (path, created_time) in to_delete {
             match fs::remove_dir_all(&path).await {
                 Ok(_) => {
                     log::info!(
-                        "Successfully deleted directory: {:?} (created at: {})",
+                        "Successfully deleted directory: {}/{:?} (created at: {})",
+                        dir_path,
                         path.file_name().unwrap_or_default(),
                         created_time.format("%Y-%m-%d %H:%M:%S")
                     );
@@ -108,12 +115,13 @@ pub async fn cleanup_old_directories(
         }
     } else {
         log::info!(
-            "Only {} directories found, no cleanup needed (keeping {})",
+            "Only {} directories found in path: {}, no cleanup needed (keeping {})",
             directories.len(),
+            dir_path,
             keep_count
         );
     }
 
-    log::info!("Cleanup completed for directory: {}", dir_path);
+    log::debug!("Cleanup completed for directory: {}", dir_path);
     Ok(())
 }

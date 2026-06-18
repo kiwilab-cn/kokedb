@@ -70,22 +70,43 @@ cargo run
 
 ## Usage
 
-(Example usage snippets. Basic steps:)
+A `Makefile` wraps the local-dev workflow (run `make help` for all targets).
 
-1. Start postgresql meta server.  
-```sehll
-sudo docker run -d --name test-postgres -e POSTGRES_PASSWORD=123456 -e PGDATA=/var/lib/postgresql/data/pgdata  -v /opt/postgresql/data:/var/lib/postgresql/data -p 0.0.0.0:25432:5432 postgres:17.6
+1. Start the PostgreSQL meta + source database (creates the `kokedb` meta DB and
+   seeds integration-test fixtures; waits until healthy):
+```shell
+make up
+```
+If host port 25432 is already in use, override it: `make up PG_PORT=25433`.
+
+2. Start the KokeDB server (host process, connects to the DB started above):
+```shell
+make run
 ```
 
-2. Start the KokeDB server.  
+3. Connect via MySQL client:
 ```shell
-cargo run
+make mysql        # or: mysql -h 127.0.0.1 -P 3306 -u root
 ```
-3. Connect via MySQL client and create remote table.  
+
+4. Execute SQL queries.
+
+### Lifecycle & tests
+
 ```shell
-mysql -h 127.0.0.1 -P 3306 -u root
+make ps                # container + health status
+make logs              # tail DB logs
+make psql              # psql shell on the meta `kokedb` DB
+make down              # stop the DB (keeps the data volume)
+make reset             # wipe the DB volume + local cache dirs (fresh state)
+make test              # DB-free unit tests
+make integration-test  # spin up the DB and run the DB-backed tests against it
 ```
-4. Execute sql queries.  
+
+Manual equivalent of `make up` (if you prefer raw Docker):
+```shell
+docker run -d --name test-postgres -e POSTGRES_PASSWORD=123456 -e PGDATA=/var/lib/postgresql/data/pgdata -v /opt/postgresql/data:/var/lib/postgresql/data -p 0.0.0.0:25432:5432 postgres:17.6
+```
 
 Example query:  
 ```sql

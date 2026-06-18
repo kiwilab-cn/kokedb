@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 use serde_arrow::to_arrow;
 
-use crate::display::{CatalogDisplay, EmptyDisplay, SingleValueDisplay};
+use crate::display::{CachePolicyDisplay, CatalogDisplay, EmptyDisplay, SingleValueDisplay};
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::provider::{
@@ -32,6 +32,7 @@ pub enum CatalogCommand {
     ListCatalogs {
         pattern: Option<String>,
     },
+    ListCachePolicies,
     CurrentDatabase,
     SetCurrentDatabase {
         database: Vec<String>,
@@ -136,6 +137,7 @@ impl CatalogCommand {
             CatalogCommand::CurrentCatalog => "CurrentCatalog",
             CatalogCommand::SetCurrentCatalog { .. } => "SetCurrentCatalog",
             CatalogCommand::ListCatalogs { .. } => "ListCatalogs",
+            CatalogCommand::ListCachePolicies => "ListCachePolicies",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
@@ -168,6 +170,9 @@ impl CatalogCommand {
         let fields = match self {
             CatalogCommand::ListCatalogs { .. } => {
                 Vec::<FieldRef>::from_type::<D::Catalog>(TracingOptions::default())
+            }
+            CatalogCommand::ListCachePolicies => {
+                Vec::<FieldRef>::from_type::<CachePolicyDisplay>(TracingOptions::default())
             }
             CatalogCommand::GetDatabase { .. } | CatalogCommand::ListDatabases { .. } => {
                 Vec::<FieldRef>::from_type::<D::Database>(TracingOptions::default())
@@ -245,6 +250,10 @@ impl CatalogCommand {
                     .into_iter()
                     .map(|x| D::catalog(x.to_string()))
                     .collect::<Vec<_>>();
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::ListCachePolicies => {
+                let rows = manager.list_cache_policies().await?;
                 build_record_batch(schema, &rows)
             }
             CatalogCommand::CurrentDatabase => {
