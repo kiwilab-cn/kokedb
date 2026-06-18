@@ -601,20 +601,33 @@ mod tests {
     use std::collections::HashMap;
 
     use kokedb_cache::foyer_hybrid::LruResultCache;
+    use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
     use log::info;
 
     use crate::task_manager::{CacheTableTaskConfig, TaskManager, TaskManagerConfig, TaskPriority};
 
     #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via `make integration-test`"]
     async fn test_task_manager_run_task() {
+        // Ensure the meta store schema exists (the server does this on startup;
+        // here we do it explicitly so the sync task's metadata writes succeed).
+        PostgreSQLMetaCatalogProviderList::new()
+            .await
+            .unwrap()
+            .init_db()
+            .await
+            .unwrap();
+
         let config = TaskManagerConfig::default();
         let cache = LruResultCache::new(100, 100).await.unwrap();
         let task_manager = TaskManager::new_with(config, cache).await.unwrap();
         let runtime_info = task_manager.get_runtime_info();
         info!("Runtime Info: {:?}", runtime_info);
 
+        let dsn = std::env::var("KOKEDB_TEST_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".to_string());
         let task_config = CacheTableTaskConfig {
-            dsn: "postgresql://root:12345@192.168.0.227:25432/postgres".to_string(),
+            dsn,
             source_table: "public.demo".to_string(),
             local_table: "public.demo".to_string(),
             batch_size: Some(1000),
@@ -627,7 +640,7 @@ mod tests {
         task_manager.add_task(task_config).await.unwrap();
 
         task_manager
-            .wait_for_all_tasks(Some(tokio::time::Duration::from_secs(3)))
+            .wait_for_all_tasks(Some(tokio::time::Duration::from_secs(60)))
             .await
             .unwrap();
 

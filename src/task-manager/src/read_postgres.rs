@@ -188,8 +188,11 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via `make integration-test`"]
     async fn test_conversion() -> Result<(), TaskError> {
-        let dsn = "postgresql://postgres:123456@192.168.0.227:25432/postgres";
+        let dsn = std::env::var("KOKEDB_TEST_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".to_string());
+        let dsn = dsn.as_str();
         let table_name = "public.test1";
         let output_path = "/tmp/test1/";
 

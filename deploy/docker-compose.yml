@@ -1,0 +1,39 @@
+# Local-dev infrastructure for kokedb.
+#
+#   make up      # start PostgreSQL (meta store + integration-test source) in background
+#   make ps      # show status / health
+#   make down    # stop + remove the container (keeps the data volume)
+#   make reset   # stop + wipe the data volume AND local cache dirs (fresh state)
+#
+# The kokedb MySQL server itself runs on the host via `make run` (it links
+# pyo3/libpython and is fastest to iterate as a host `cargo run`). This compose
+# only provides its PostgreSQL dependency, reachable at 127.0.0.1:25432.
+
+name: kokedb
+
+services:
+  postgres:
+    image: postgres:17.6
+    container_name: kokedb-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "123456"
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      # host:container — override the host port with PG_PORT if 25432 is taken.
+      - "${PG_PORT:-25432}:5432"
+    volumes:
+      - kokedb-pgdata:/var/lib/postgresql/data
+      # First-init scripts: create the `kokedb` meta DB + seed test fixtures.
+      - ./deploy/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  kokedb-pgdata:
