@@ -1786,4 +1786,31 @@ mod drop_catalog_tests {
             ("demo".to_string(), true)
         );
     }
+
+    /// Round-trips a CREATE CATALOG DSN through parse + analyze and returns the
+    /// reconstructed connection string.
+    fn catalog_dsn(sql: &str) -> String {
+        let plan = from_ast_statement(parse_one_statement(sql).unwrap()).unwrap();
+        match plan {
+            spec::Plan::Command(c) => match c.node {
+                spec::CommandNode::CreateCatalog { definition, .. } => definition.dsn,
+                _ => panic!("expected CreateCatalog command node"),
+            },
+            _ => panic!("expected a command plan"),
+        }
+    }
+
+    #[test]
+    fn dsn_accepts_ip_and_hostnames() {
+        for dsn in [
+            "postgresql://postgres:123456@192.168.0.227:25432/postgres",
+            "postgresql://postgres:123456@postgres:5432/postgres",
+            "postgresql://u:p@localhost:5432/mydb",
+            "postgresql://u:p@db.example.com:5432/mydb",
+            "postgresql://u:p@my-db.rds.amazonaws.com:5432/mydb",
+        ] {
+            let sql = format!("CREATE CATALOG c USING {dsn}");
+            assert_eq!(catalog_dsn(&sql), dsn, "DSN round-trip mismatch");
+        }
+    }
 }
