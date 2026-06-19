@@ -2,6 +2,7 @@ pub mod column;
 pub mod error;
 pub mod metrics;
 pub mod row;
+pub mod singleflight;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,6 +78,8 @@ struct CoreContex {
     cache: LruResultCache,
     /// Optional auth credentials shared across connections (read once at startup).
     auth: Option<Arc<AuthConfig>>,
+    /// Process-wide single-flight registry for cache-miss de-duplication.
+    sf: Arc<singleflight::Singleflight>,
     /// Per-connection prepared statement registry, keyed by statement id.
     prepared: HashMap<u32, PreparedStatement>,
     /// Monotonic statement id generator for this connection.
@@ -84,11 +87,17 @@ struct CoreContex {
 }
 
 impl CoreContex {
-    fn new(ctx: Arc<SessionContext>, cache: LruResultCache, auth: Option<Arc<AuthConfig>>) -> Self {
+    fn new(
+        ctx: Arc<SessionContext>,
+        cache: LruResultCache,
+        auth: Option<Arc<AuthConfig>>,
+        sf: Arc<singleflight::Singleflight>,
+    ) -> Self {
         Self {
             ctx,
             cache,
             auth,
+            sf,
             prepared: HashMap::new(),
             next_stmt_id: 1,
         }
@@ -195,7 +204,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
             }
         };
 
-        run_query(self.ctx.clone(), self.cache.clone(), &sql, results).await
+        run_query(self.ctx.clone(), self.cache.clone(), self.sf.clone(), &sql, results).await
     }
 
     async fn on_close(&mut self, stmt: u32) {
@@ -243,7 +252,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         sql: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), MysqlServerError> {
-        run_query(self.ctx.clone(), self.cache.clone(), sql, results).await
+        run_query(self.ctx.clone(), self.cache.clone(), self.sf.clone(), sql, results).await
     }
 }
 
@@ -252,6 +261,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
 async fn run_query<W: AsyncWrite + Send + Unpin>(
     ctx: Arc<SessionContext>,
     cache: Cache,
+    sf: Arc<singleflight::Singleflight>,
     sql: &str,
     results: QueryResultWriter<'_, W>,
 ) -> Result<(), MysqlServerError> {
@@ -267,7 +277,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     };
 
     // Step 2: Get batch stream from cache or query
-    let mut batch_stream = match get_batch_stream(&cache, ctx, &plan, cache_key).await {
+    let mut batch_stream = match get_batch_stream(&cache, &sf, ctx, &plan, cache_key).await {
         Ok(stream) => stream,
         Err(error_msg) => {
             return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
@@ -523,8 +533,12 @@ fn spawn_cache_task(
     cache: Cache,
     cache_key: CacheKey,
     rx: tokio::sync::mpsc::UnboundedReceiver<RecordBatch>,
+    // Held until the cache write completes; dropping it wakes single-flight
+    // waiters so they can read the freshly-cached result.
+    owner: Option<singleflight::OwnerGuard>,
 ) {
     tokio::spawn(async move {
+        let _owner = owner;
         let mut collected_batches = Vec::new();
         let mut receiver = rx;
 
@@ -554,8 +568,10 @@ async fn execute_query_with_cache(
     plan: &Plan,
     cache_key: CacheKey,
     cache: Cache,
+    owner: Option<singleflight::OwnerGuard>,
 ) -> Result<BatchStream, String> {
     info!("Not hitted cache, execute query from kokedb");
+    // On error the `owner` guard drops here, releasing any single-flight waiters.
     let query_stream = query(ctx, plan, cache_key)
         .await
         .map_err(|e| format!("Query execution error: {}", e))?;
@@ -568,7 +584,7 @@ async fn execute_query_with_cache(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Spawn background task to collect and cache results
-    let _ret = spawn_cache_task(cache, cache_key, rx);
+    spawn_cache_task(cache, cache_key, rx, owner);
 
     // Adapt stream to send batches to caching task
     let adapted_stream = query_stream.map(move |batch_result| {
@@ -584,24 +600,59 @@ async fn execute_query_with_cache(
     )))
 }
 
-// Get or create batch stream from cache or query
+// How long a waiter blocks for the in-flight owner before falling back to
+// re-checking the cache itself (safety net against a lost wakeup).
+const SINGLEFLIGHT_WAIT_SECS: u64 = 10;
+
+// Get or create batch stream from cache or query.
+//
+// For cacheable plans this single-flights concurrent misses on the same key:
+// the first caller executes while the rest wait and then serve from the cache.
 async fn get_batch_stream(
     cache: &Cache,
+    sf: &Arc<singleflight::Singleflight>,
     ctx: Arc<Context>,
     plan: &Plan,
     cache_key: CacheKey,
 ) -> Result<BatchStream, String> {
-    // Try cache first, command plan not need cache.
-    if should_cache_plan(plan) {
+    if !should_cache_plan(plan) {
+        // Commands and non-cacheable plans bypass the cache entirely.
+        return execute_query_with_cache(ctx, plan, cache_key, cache.clone(), None).await;
+    }
+
+    loop {
         if let Some(stream) = try_get_from_cache(cache, cache_key).await {
             metrics::inc_cache_hit();
             return Ok(stream);
         }
-        metrics::inc_cache_miss();
-    }
 
-    // Cache miss or error, execute query
-    execute_query_with_cache(ctx, plan, cache_key, cache.clone()).await
+        match sf.claim(cache_key) {
+            singleflight::Claim::Owner(guard) => {
+                // We own this key: execute and populate the cache. The guard is
+                // moved into the cache-writer task so waiters are released once
+                // the result is cached (or immediately if execution fails).
+                metrics::inc_cache_miss();
+                return execute_query_with_cache(ctx, plan, cache_key, cache.clone(), Some(guard))
+                    .await;
+            }
+            singleflight::Claim::Waiter(notify) => {
+                // Register the wakeup before re-checking the cache to avoid a
+                // lost notification, then await it (bounded by a safety timeout).
+                let notified = notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(stream) = try_get_from_cache(cache, cache_key).await {
+                    metrics::inc_cache_hit();
+                    return Ok(stream);
+                }
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(SINGLEFLIGHT_WAIT_SECS)) => {}
+                }
+                // Loop: re-check the cache (normally a hit now).
+            }
+        }
+    }
 }
 
 // Handle empty result set
@@ -812,12 +863,14 @@ async fn main() -> Result<(), MysqlServerError> {
     // Heavy services (meta store, task manager, scheduler, sync jobs) are created
     // once and shared; each connection gets its own lightweight session context.
     let shared = init_shared_services(result_cache.clone()).await.unwrap();
+    let singleflight = singleflight::Singleflight::new();
 
     loop {
         let (stream, _) = listener.accept().await?;
         let (r, w) = stream.into_split();
         let cache = result_cache.clone();
         let auth = auth.clone();
+        let sf = singleflight.clone();
         let ctx = match create_session_context(&shared) {
             Ok(ctx) => Arc::new(ctx),
             Err(e) => {
@@ -830,7 +883,7 @@ async fn main() -> Result<(), MysqlServerError> {
                 .active_connections
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ =
-                AsyncMysqlIntermediary::run_on(CoreContex::new(ctx, cache, auth), r, w).await;
+                AsyncMysqlIntermediary::run_on(CoreContex::new(ctx, cache, auth, sf), r, w).await;
             metrics::METRICS
                 .active_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
