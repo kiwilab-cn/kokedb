@@ -20,7 +20,7 @@ use kokedb_sql_parser::ast::statement::{
 };
 
 use crate::data_type::from_ast_data_type;
-use crate::dsn::from_ast_database_jdbc_dsn;
+use crate::dsn::{from_ast_database_jdbc_dsn, validate_dsn_scheme};
 use crate::error::{SqlError, SqlResult};
 use crate::expression::{from_ast_expression, from_ast_identifier_list, from_ast_object_name};
 use crate::query::from_ast_query;
@@ -73,10 +73,20 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
                 comment,
                 properties,
             } = clauses.try_into()?;
+            // Accept either the structured bare DSN or a quoted string literal
+            // (the latter allows URL-special characters in credentials).
+            let dsn = match dsn {
+                Either::Left(structured) => from_ast_database_jdbc_dsn(structured)?,
+                Either::Right(literal) => {
+                    let raw = from_ast_string(literal)?;
+                    validate_dsn_scheme(&raw)?;
+                    raw
+                }
+            };
             let node = spec::CommandNode::CreateCatalog {
                 catalog: name.into(),
                 definition: spec::CatalogDefinition {
-                    dsn: from_ast_database_jdbc_dsn(dsn)?,
+                    dsn,
                     comment: comment.map(from_ast_string).transpose()?,
                     properties: properties
                         .map(from_ast_property_list)
@@ -1813,6 +1823,23 @@ mod drop_catalog_tests {
             plan,
             spec::Plan::Command(c) if matches!(c.node, spec::CommandNode::ListFunctions { .. })
         ));
+    }
+
+    #[test]
+    fn dsn_accepts_quoted_string_with_special_chars() {
+        // Quoted DSN passes through verbatim, so percent-encoded credentials
+        // (e.g. `@` -> `%40`, `/` -> `%2F`) survive for sqlx to decode.
+        let dsn = "postgresql://user:p%40ss%2Fw0rd@db.example.com:5432/mydb";
+        let sql = format!("CREATE CATALOG c USING '{dsn}'");
+        assert_eq!(catalog_dsn(&sql), dsn);
+    }
+
+    #[test]
+    fn dsn_rejects_unsupported_quoted_scheme() {
+        let plan = from_ast_statement(
+            parse_one_statement("CREATE CATALOG c USING 'sqlite:///tmp/x.db'").unwrap(),
+        );
+        assert!(plan.is_err(), "unsupported scheme should be rejected");
     }
 
     #[test]

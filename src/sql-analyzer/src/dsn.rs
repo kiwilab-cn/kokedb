@@ -28,6 +28,20 @@ fn either_label_value(part: &Either<Ident, NumberLiteral>) -> String {
     }
 }
 
+const SUPPORTED_DSN_SCHEMES: [&str; 3] = ["postgresql://", "mysql://", "oracle://"];
+
+/// Validates the scheme of a DSN provided as a raw (quoted) string. Does not
+/// echo the DSN in errors, since it may contain credentials.
+pub fn validate_dsn_scheme(dsn: &str) -> SqlResult<()> {
+    if SUPPORTED_DSN_SCHEMES.iter().any(|s| dsn.starts_with(s)) {
+        Ok(())
+    } else {
+        Err(SqlError::NotSupported(
+            "Unsupported DSN scheme (expected postgresql://, mysql://, or oracle://)".to_string(),
+        ))
+    }
+}
+
 pub fn from_ast_database_jdbc_dsn(dsn: DatabaseJdbcDsn) -> SqlResult<String> {
     let support_schema = vec![
         "postgresql".to_string(),
