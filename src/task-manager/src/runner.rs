@@ -29,9 +29,17 @@ impl TaskExecutor for DataSyncExecutor {
         &self,
         config: CacheTableTaskConfig,
         cache: LruResultCache,
-        _progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
+        progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError> {
+        // Report coarse progress at the natural milestones of a sync.
+        let report = |p: f32| {
+            if let Some(cb) = progress_callback.as_ref() {
+                cb(p);
+            }
+        };
+
         info!("Received task: {:?}", &config);
+        report(0.05);
         let dsn = config.dsn;
         let catalog = &config.catalog_name;
         let source_table = &config.source_table;
@@ -58,6 +66,7 @@ impl TaskExecutor for DataSyncExecutor {
                     x
                 ))
             })?;
+        report(0.8);
 
         let postgresql_catalog = PostgreSQLMetaCatalogProviderList::new()
             .await
@@ -81,6 +90,7 @@ impl TaskExecutor for DataSyncExecutor {
                     "Failed to save table schema to meta postgresql server.".to_string(),
                 )
             })?;
+        report(0.85);
 
         // find all cache key link with the table.
         let table_cache_key_list = postgresql_catalog
@@ -100,6 +110,7 @@ impl TaskExecutor for DataSyncExecutor {
                 }
             }
         }
+        report(0.95);
 
         let cache_versions = get_env_as("CACHE_KEEP_NUM", 3usize);
         if let Err(x) =
@@ -112,6 +123,7 @@ impl TaskExecutor for DataSyncExecutor {
             );
         }
 
+        report(1.0);
         info!(
             "Success sync table {}.{}.{} data to path {}",
             &catalog, &schema, &table, &local_path
