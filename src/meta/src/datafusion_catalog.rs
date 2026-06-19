@@ -22,14 +22,17 @@ use crate::catalog_list::{CatalogInfo, PostgreSQLMetaCatalogProviderList};
 pub struct PostgreSQLCatalogProvider {
     catalog_info: CatalogInfo,
     remote_pool: PgPool,
+    /// Shared meta-store connection pool (reused on hot paths).
+    meta_pool: PgPool,
     schema_cache: DashMap<String, Arc<dyn SchemaProvider>>,
 }
 
 impl PostgreSQLCatalogProvider {
-    pub fn new(catalog_info: CatalogInfo, remote_pool: PgPool) -> Self {
+    pub fn new(catalog_info: CatalogInfo, remote_pool: PgPool, meta_pool: PgPool) -> Self {
         Self {
             catalog_info,
             remote_pool,
+            meta_pool,
             schema_cache: DashMap::new(),
         }
     }
@@ -78,6 +81,7 @@ impl CatalogProvider for PostgreSQLCatalogProvider {
             self.catalog_info.clone(),
             name.to_string(),
             self.remote_pool.clone(),
+            self.meta_pool.clone(),
         ));
 
         self.schema_cache
@@ -108,15 +112,25 @@ pub struct PostgreSQLSchemaProvider {
     catalog_info: CatalogInfo,
     schema_name: String,
     remote_pool: PgPool,
-    table_cache: DashMap<String, Arc<dyn TableProvider>>,
+    /// Shared meta-store connection pool (reused on hot paths).
+    meta_pool: PgPool,
+    /// Cached listing tables, versioned by snapshot `local_path` so a re-synced
+    /// table is rebuilt only when its snapshot actually changes.
+    table_cache: DashMap<String, (String, Arc<dyn TableProvider>)>,
 }
 
 impl PostgreSQLSchemaProvider {
-    fn new(catalog_info: CatalogInfo, schema_name: String, remote_pool: PgPool) -> Self {
+    fn new(
+        catalog_info: CatalogInfo,
+        schema_name: String,
+        remote_pool: PgPool,
+        meta_pool: PgPool,
+    ) -> Self {
         Self {
             catalog_info,
             schema_name,
             remote_pool,
+            meta_pool,
             table_cache: DashMap::new(),
         }
     }
@@ -139,22 +153,15 @@ impl PostgreSQLSchemaProvider {
         Ok(table_names)
     }
 
-    async fn create_listing_table(
-        &self,
-        table_name: &str,
-        meta_client: &PostgreSQLMetaCatalogProviderList,
+    fn build_listing_table(
+        schema: Arc<datafusion::arrow::datatypes::Schema>,
+        table_path: &str,
     ) -> Result<Arc<dyn TableProvider>> {
-        let (schema, table_path) = meta_client
-            .get_table_schema(&self.catalog_info.name, &self.schema_name, table_name)
-            .await?;
         let file_format: Arc<dyn datafusion::datasource::file_format::FileFormat> =
             Arc::new(ParquetFormat::default());
-
         let listing_options = ListingOptions::new(file_format);
-
-        let table_url = ListingTableUrl::parse(&table_path)
+        let table_url = ListingTableUrl::parse(table_path)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-
         let config = ListingTableConfig::new(table_url)
             .with_listing_options(listing_options)
             .with_schema(schema);
@@ -186,41 +193,48 @@ impl SchemaProvider for PostgreSQLSchemaProvider {
         let schema = self.schema_name.clone();
         let dsn = self.catalog_info.dsn.clone();
 
-        let meta_client = PostgreSQLMetaCatalogProviderList::new().await?;
-        let today = chrono::Local::now().naive_local().date();
+        // Reuse the shared meta pool instead of opening a new connection.
+        let meta_client = PostgreSQLMetaCatalogProviderList::from_pool(self.meta_pool.clone());
 
-        let ret = meta_client
-            .save_table_daily_stats(&catalog, &schema, &name, today)
-            .await;
-        if ret.is_err() {
-            error!(
-                "Failed to store table daily stats to meta db with error: {:?}",
-                ret.err().unwrap()
-            );
+        // Record daily query stats off the hot path (fire-and-forget).
+        {
+            let meta_pool = self.meta_pool.clone();
+            let (c, s, n) = (catalog.clone(), schema.clone(), name.to_string());
+            tokio::spawn(async move {
+                let today = chrono::Local::now().naive_local().date();
+                let client = PostgreSQLMetaCatalogProviderList::from_pool(meta_pool);
+                if let Err(e) = client.save_table_daily_stats(&c, &s, &n, today).await {
+                    error!("Failed to store table daily stats: {:?}", e);
+                }
+            });
         }
 
-        let is_cached = meta_client
-            .check_table_is_cached(&catalog, &schema, name)
-            .await?;
+        // One meta lookup yields both "is this table cached?" and the current
+        // snapshot path. An empty path means it is not cached -> read remote.
+        let (arrow_schema, local_path) =
+            meta_client.get_table_schema(&catalog, &schema, name).await?;
 
-        if is_cached {
-            match self.create_listing_table(name, &meta_client).await {
-                Ok(table) => {
-                    self.table_cache
-                        .insert(name.to_string(), Arc::clone(&table));
-                    Ok(Some(table))
-                }
-                Err(e) => Err(e),
-            }
-        } else {
+        if local_path.is_empty() {
             let config = PostgreSQLConfig {
-                connection_string: dsn.clone(),
+                connection_string: dsn,
                 table_name: name.to_string(),
-                schema_name: Some(schema.clone()),
+                schema_name: Some(schema),
             };
             let remote_table = PostgreSQLTableProvider::new(config).await?;
-            Ok(Some(Arc::new(remote_table)))
+            return Ok(Some(Arc::new(remote_table)));
         }
+
+        // Reuse the cached listing table if it points at the current snapshot;
+        // otherwise rebuild (and re-list parquet files) only because it changed.
+        if let Some(entry) = self.table_cache.get(name) {
+            if entry.0 == local_path {
+                return Ok(Some(entry.1.clone()));
+            }
+        }
+        let table = Self::build_listing_table(arrow_schema, &local_path)?;
+        self.table_cache
+            .insert(name.to_string(), (local_path, Arc::clone(&table)));
+        Ok(Some(table))
     }
 
     fn register_table(
@@ -228,11 +242,14 @@ impl SchemaProvider for PostgreSQLSchemaProvider {
         name: String,
         table: Arc<dyn TableProvider>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
-        Ok(self.table_cache.insert(name, table))
+        Ok(self
+            .table_cache
+            .insert(name, (String::new(), table))
+            .map(|(_, v)| v))
     }
 
     fn deregister_table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
-        Ok(self.table_cache.remove(name).map(|(_, v)| v))
+        Ok(self.table_cache.remove(name).map(|(_, (_, v))| v))
     }
 
     fn table_exist(&self, name: &str) -> bool {

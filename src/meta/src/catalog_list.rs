@@ -55,6 +55,16 @@ impl PostgreSQLMetaCatalogProviderList {
         })
     }
 
+    /// Wraps an existing meta connection pool without opening a new one. Used on
+    /// hot paths (e.g. table resolution) to reuse the shared pool instead of
+    /// reconnecting per query.
+    pub fn from_pool(local_pool: PgPool) -> Self {
+        Self {
+            local_pool,
+            catalog_cache: DashMap::new(),
+        }
+    }
+
     pub async fn init_db(&self) -> Result<()> {
         let mut tx = self
             .local_pool
@@ -736,8 +746,13 @@ impl CatalogProviderList for PostgreSQLMetaCatalogProviderList {
             tokio::runtime::Handle::current().block_on(async {
                 if let Ok(catalog_info) = self.get_catalog(name).await {
                     if let Ok(remote_pool) = PgPool::connect(&catalog_info.dsn).await {
-                        let provider: Arc<dyn CatalogProvider> =
-                            Arc::new(PostgreSQLCatalogProvider::new(catalog_info, remote_pool));
+                        let provider: Arc<dyn CatalogProvider> = Arc::new(
+                            PostgreSQLCatalogProvider::new(
+                                catalog_info,
+                                remote_pool,
+                                self.local_pool.clone(),
+                            ),
+                        );
 
                         self.catalog_cache
                             .insert(name.to_string(), Arc::clone(&provider));
