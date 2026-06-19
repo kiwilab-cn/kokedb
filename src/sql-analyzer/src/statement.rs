@@ -482,7 +482,13 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
-        Statement::ShowFunctions { .. } => Err(SqlError::todo("SHOW FUNCTIONS")),
+        Statement::ShowFunctions { .. } => {
+            let node = spec::CommandNode::ListFunctions {
+                database: None,
+                pattern: None,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::Explain {
             explain: _,
             format,
@@ -1798,6 +1804,15 @@ mod drop_catalog_tests {
             },
             _ => panic!("expected a command plan"),
         }
+    }
+
+    #[test]
+    fn parse_show_functions() {
+        let plan = from_ast_statement(parse_one_statement("SHOW FUNCTIONS").unwrap()).unwrap();
+        assert!(matches!(
+            plan,
+            spec::Plan::Command(c) if matches!(c.node, spec::CommandNode::ListFunctions { .. })
+        ));
     }
 
     #[test]

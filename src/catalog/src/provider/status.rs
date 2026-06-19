@@ -100,6 +100,16 @@ impl TableKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionStatus {
+    pub name: String,
+    pub catalog: Option<String>,
+    pub namespace: Option<Vec<String>>,
+    pub description: Option<String>,
+    pub class_name: String,
+    pub is_temporary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableColumnStatus {
     pub name: String,
     pub data_type: DataType,
