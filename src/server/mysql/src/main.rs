@@ -1,5 +1,6 @@
 pub mod column;
 pub mod error;
+pub mod metrics;
 pub mod row;
 
 use std::collections::HashMap;
@@ -255,6 +256,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     results: QueryResultWriter<'_, W>,
 ) -> Result<(), MysqlServerError> {
     let instant = std::time::Instant::now();
+    metrics::inc_queries();
 
     // Step 1: Parse SQL and generate plan
     let (plan, cache_key) = match parse_sql_and_get_plan(sql) {
@@ -317,6 +319,7 @@ async fn send_error_to_client<W: AsyncWrite + Unpin>(
     error_msg: String,
 ) -> Result<(), MysqlServerError> {
     error!("{}", error_msg);
+    metrics::inc_query_error();
     results
         .error(error_kind, error_msg.as_bytes())
         .await
@@ -591,8 +594,10 @@ async fn get_batch_stream(
     // Try cache first, command plan not need cache.
     if should_cache_plan(plan) {
         if let Some(stream) = try_get_from_cache(cache, cache_key).await {
+            metrics::inc_cache_hit();
             return Ok(stream);
         }
+        metrics::inc_cache_miss();
     }
 
     // Cache miss or error, execute query
@@ -796,6 +801,13 @@ async fn main() -> Result<(), MysqlServerError> {
         warn!("MySQL authentication disabled (set KOKEDB_MYSQL_PASSWORD to enable)");
     }
 
+    // Prometheus metrics endpoint (best-effort; non-fatal if it can't bind).
+    let metrics_addr =
+        std::env::var("KOKEDB_METRICS_ADDR").unwrap_or_else(|_| "0.0.0.0:9090".to_string());
+    if !metrics_addr.is_empty() {
+        tokio::spawn(metrics::serve_metrics(metrics_addr));
+    }
+
     let result_cache = LruResultCache::new(2000, 40000).await?;
     // Heavy services (meta store, task manager, scheduler, sync jobs) are created
     // once and shared; each connection gets its own lightweight session context.
@@ -814,7 +826,14 @@ async fn main() -> Result<(), MysqlServerError> {
             }
         };
         tokio::spawn(async move {
-            AsyncMysqlIntermediary::run_on(CoreContex::new(ctx, cache, auth), r, w).await
+            metrics::METRICS
+                .active_connections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let _ =
+                AsyncMysqlIntermediary::run_on(CoreContex::new(ctx, cache, auth), r, w).await;
+            metrics::METRICS
+                .active_connections
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         });
     }
 }

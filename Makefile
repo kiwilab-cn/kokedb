@@ -14,9 +14,11 @@ DB_SERVICE      ?= postgres
 SERVER_SERVICE  ?= kokedb-server
 PG_PORT         ?= 25432
 MYSQL_PORT      ?= 3306
+METRICS_PORT    ?= 9090
 # Exported so docker-compose can interpolate the host port bindings.
 export PG_PORT
 export MYSQL_PORT
+export METRICS_PORT
 
 # Connection strings for HOST-side tests (containers use in-network DSNs).
 PG_META_DSN     ?= postgresql://postgres:123456@127.0.0.1:$(PG_PORT)/kokedb
