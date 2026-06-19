@@ -360,6 +360,10 @@ pub enum CommandNode {
         #[serde(flatten)]
         definition: CatalogDefinition,
     },
+    DropCatalog {
+        catalog: Identifier,
+        if_exists: bool,
+    },
     // commands
     CreateDatabase {
         database: ObjectName,

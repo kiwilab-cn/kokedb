@@ -52,6 +52,12 @@ pub enum Statement {
         dsn: DatabaseJdbcDsn,
         clauses: Vec<CreateCatalogClause>,
     },
+    DropCatalog {
+        drop: Drop,
+        catalog: Catalog,
+        if_exists: Option<(If, Exists)>,
+        name: Either<Ident, StringLiteral>,
+    },
     UseDatabase {
         r#use: Use,
         database: Either<Database, Schema>,

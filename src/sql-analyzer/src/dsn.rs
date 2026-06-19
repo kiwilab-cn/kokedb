@@ -1,9 +1,32 @@
+use either::Either;
 use kokedb_sql_parser::{
-    ast::{dsn::DatabaseJdbcDsn, statement::PropertyValue},
+    ast::{
+        dsn::{DatabaseJdbcDsn, HostLabel},
+        identifier::Ident,
+        literal::NumberLiteral,
+        statement::PropertyValue,
+    },
     string::StringValue,
 };
 
 use crate::error::{SqlError, SqlResult};
+
+/// Reconstructs one dot-separated host label, rejoining hyphenated parts.
+fn host_label_to_string(label: &HostLabel) -> String {
+    let mut out = either_label_value(&label.head);
+    for part in &label.tail {
+        out.push('-');
+        out.push_str(&either_label_value(&part.part));
+    }
+    out
+}
+
+fn either_label_value(part: &Either<Ident, NumberLiteral>) -> String {
+    match part {
+        Either::Left(ident) => ident.value.clone(),
+        Either::Right(num) => num.value.clone(),
+    }
+}
 
 pub fn from_ast_database_jdbc_dsn(dsn: DatabaseJdbcDsn) -> SqlResult<String> {
     let support_schema = vec![
@@ -35,7 +58,7 @@ pub fn from_ast_database_jdbc_dsn(dsn: DatabaseJdbcDsn) -> SqlResult<String> {
         .server
         .host
         .items()
-        .map(|x| x.value.clone())
+        .map(host_label_to_string)
         .collect::<Vec<String>>();
 
     let mut dsn_str = format!(

@@ -97,8 +97,10 @@ test: ## Run DB-free unit tests on the host (integration tests are #[ignore]d)
 	cargo test --workspace
 
 integration-test: up-db ## Start the DB and run the DB-backed (#[ignore]d) tests against it (host)
+	# --test-threads=1: DB tests share one database and run concurrent DDL
+	# (init_db), so they must be serialized.
 	PG_META_DSN="$(PG_META_DSN)" KOKEDB_TEST_DSN="$(KOKEDB_TEST_DSN)" \
-		cargo test --workspace -- --include-ignored
+		cargo test --workspace -- --include-ignored --test-threads=1
 itest: integration-test ## Alias for `make integration-test`
 
 clean: ## cargo clean + stop/wipe the whole stack

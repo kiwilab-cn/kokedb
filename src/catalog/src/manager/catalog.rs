@@ -194,11 +194,52 @@ impl CatalogManager {
             ))
         })?;
 
+        // Remember the job id so `DROP CATALOG` can stop it later.
+        if let Ok(mut jobs) = self.scheduler_jobs.lock() {
+            jobs.insert(catalog.to_string(), job_uuid);
+        }
+
         info!(
             "Successfully added scheduled sync job for catalog '{}' (UUID: {})",
             catalog, job_uuid
         );
 
         Ok(job_uuid)
+    }
+
+    /// Drops a catalog: stops its background sync job, removes its registration
+    /// from the meta store, and evicts it from the provider cache.
+    pub async fn drop_catalog(&self, catalog: &str, if_exists: bool) -> CatalogResult<()> {
+        // Stop the scheduled sync job, if we have its id.
+        let job_id = self
+            .scheduler_jobs
+            .lock()
+            .ok()
+            .and_then(|mut jobs| jobs.remove(catalog));
+        if let Some(job_id) = job_id {
+            let scheduler = self.state()?.catalog_task_scheduler.clone();
+            if let Err(e) = scheduler.remove(&job_id).await {
+                error!(
+                    "Failed to remove scheduler job for catalog '{}': {}",
+                    catalog, e
+                );
+            }
+        }
+
+        // Remove the registration (and provider cache entry) from the meta store.
+        let dynamic_catalog_list = self.state()?.dynamic_catalog_list.clone();
+        let deleted = dynamic_catalog_list
+            .delete_catalog(catalog)
+            .await
+            .map_err(|e| {
+                CatalogError::External(format!("Failed to drop catalog '{}': {}", catalog, e))
+            })?;
+
+        if !deleted && !if_exists {
+            return Err(CatalogError::NotFound("catalog", catalog.to_string()));
+        }
+
+        info!("Dropped catalog '{}'", catalog);
+        Ok(())
     }
 }

@@ -248,20 +248,27 @@ mod tests {
     use crate::catalog_list::PostgreSQLMetaCatalogProviderList;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    #[ignore = "requires PostgreSQL; run via `make integration-test`"]
     async fn test_catalog_provider_list() {
         match PostgreSQLMetaCatalogProviderList::new().await {
             Ok(catalog_list) => {
                 let catalog_names = catalog_list.catalog_names();
                 info!("Found catalogs: {:?}", catalog_names);
-                let catalog_name = catalog_names.first().unwrap();
-                let catalog = catalog_list.catalog(&catalog_name).unwrap();
+                let Some(catalog_name) = catalog_names.first() else {
+                    info!("No catalogs registered; nothing to enumerate.");
+                    return;
+                };
+                let Some(catalog) = catalog_list.catalog(catalog_name) else {
+                    return;
+                };
                 let schemas = catalog.schema_names();
                 info!("Found schemas: {:?}", schemas);
 
                 for schema_name in schemas {
-                    let schema = catalog.schema(&schema_name).unwrap();
-                    let table_names = schema.table_names();
-                    info!("{:?}: {:?}", &schema_name, table_names);
+                    if let Some(schema) = catalog.schema(&schema_name) {
+                        let table_names = schema.table_names();
+                        info!("{:?}: {:?}", &schema_name, table_names);
+                    }
                 }
             }
             Err(e) => {

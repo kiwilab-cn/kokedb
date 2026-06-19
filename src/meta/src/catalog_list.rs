@@ -22,6 +22,19 @@ pub struct CatalogInfo {
     pub dsn: String,
 }
 
+/// Persisted incremental-sync state for a single cached table.
+#[derive(Debug, Clone, Default)]
+pub struct TableSyncState {
+    pub watermark_column: Option<String>,
+    /// Comma-separated primary key columns, if any.
+    pub pk_columns: Option<String>,
+    /// Last synced max watermark value, serialized as text.
+    pub last_watermark: Option<String>,
+    pub sync_mode: String,
+    /// Number of consecutive incremental runs since the last full refresh.
+    pub incremental_runs: i32,
+}
+
 #[derive(Debug)]
 pub struct PostgreSQLMetaCatalogProviderList {
     local_pool: PgPool,
@@ -123,6 +136,20 @@ impl PostgreSQLMetaCatalogProviderList {
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(catalog, schema, table_name)
+            );
+            "#,
+            r#"
+            CREATE TABLE IF NOT EXISTS system.table_sync_state (
+                catalog VARCHAR(255) NOT NULL,
+                schema_name VARCHAR(255) NOT NULL,
+                table_name VARCHAR(255) NOT NULL,
+                watermark_column VARCHAR(255),
+                pk_columns VARCHAR(1024),
+                last_watermark VARCHAR(64),
+                sync_mode VARCHAR(16) NOT NULL DEFAULT 'full',
+                incremental_runs INTEGER NOT NULL DEFAULT 0,
+                last_sync_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (catalog, schema_name, table_name)
             );
             "#,
         ];
@@ -296,6 +323,70 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(cache_policy)
     }
 
+    /// Reads the persisted incremental-sync state for a table, if any.
+    pub async fn get_table_sync_state(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<TableSyncState>> {
+        let sql = "SELECT watermark_column, pk_columns, last_watermark, sync_mode, \
+            incremental_runs FROM system.table_sync_state \
+            WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
+
+        let row = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(row.map(|row| TableSyncState {
+            watermark_column: row.try_get("watermark_column").ok(),
+            pk_columns: row.try_get("pk_columns").ok(),
+            last_watermark: row.try_get("last_watermark").ok(),
+            sync_mode: row.try_get("sync_mode").unwrap_or_default(),
+            incremental_runs: row.try_get("incremental_runs").unwrap_or(0),
+        }))
+    }
+
+    /// Upserts the incremental-sync state for a table after a sync run.
+    pub async fn upsert_table_sync_state(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        state: &TableSyncState,
+    ) -> Result<()> {
+        let sql = "INSERT INTO system.table_sync_state \
+            (catalog, schema_name, table_name, watermark_column, pk_columns, \
+             last_watermark, sync_mode, incremental_runs, last_sync_at) \
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CURRENT_TIMESTAMP) \
+            ON CONFLICT (catalog, schema_name, table_name) DO UPDATE SET \
+                watermark_column = EXCLUDED.watermark_column, \
+                pk_columns = EXCLUDED.pk_columns, \
+                last_watermark = EXCLUDED.last_watermark, \
+                sync_mode = EXCLUDED.sync_mode, \
+                incremental_runs = EXCLUDED.incremental_runs, \
+                last_sync_at = CURRENT_TIMESTAMP;";
+
+        sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(&state.watermark_column)
+            .bind(&state.pk_columns)
+            .bind(&state.last_watermark)
+            .bind(&state.sync_mode)
+            .bind(state.incremental_runs)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(())
+    }
+
     /// Returns `(catalog_name, db_type, cache_policy)` for every registered
     /// catalog in a single query. Used by `SHOW CACHE POLICIES`.
     pub async fn list_cache_policies(&self) -> Result<Vec<(String, String, String)>> {
@@ -346,6 +437,11 @@ impl PostgreSQLMetaCatalogProviderList {
 
         let ret = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
+                // Validate the DSN by actually connecting before persisting, so a
+                // bad DSN fails CREATE CATALOG instead of leaving a broken entry.
+                let probe = PgPool::connect(dsn).await?;
+                probe.close().await;
+
                 sqlx::query(insert_sql)
                     .bind(catalog)
                     .bind(dsn)
@@ -359,6 +455,18 @@ impl PostgreSQLMetaCatalogProviderList {
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Ok(ret.rows_affected().is_eq(1))
+    }
+
+    /// Removes a catalog registration and drops it from the provider cache.
+    pub async fn delete_catalog(&self, name: &str) -> Result<bool> {
+        let sql = "DELETE FROM system.catalog WHERE name = $1;";
+        let ret = sqlx::query(sql)
+            .bind(name)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        self.catalog_cache.remove(name);
+        Ok(ret.rows_affected() > 0)
     }
 
     pub async fn save_table_schema(&self, schema_info: &SchemaTable<'_>) -> Result<bool> {

@@ -1,7 +1,8 @@
 use std::{
-    collections::HashMap,
+    cmp::Ordering as CmpOrdering,
+    collections::{BinaryHeap, HashMap},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -12,7 +13,10 @@ use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_common::env::get_env_as;
 use log::info;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, Mutex, Notify},
+    task::JoinHandle,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -139,6 +143,65 @@ pub struct TaskManagerStats {
 struct TaskWrapper {
     id: String,
     config: CacheTableTaskConfig,
+    priority: TaskPriority,
+    /// Monotonic enqueue sequence; breaks priority ties in FIFO order.
+    seq: u64,
+}
+
+// Ordering for the priority queue (a max-heap): higher `priority` is popped
+// first; among equal priorities the smaller `seq` (enqueued earlier) is popped
+// first, giving stable FIFO behaviour within a priority level.
+impl Ord for TaskWrapper {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.priority
+            .cmp(&other.priority)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+impl PartialOrd for TaskWrapper {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for TaskWrapper {
+    fn eq(&self, other: &Self) -> bool {
+        self.priority == other.priority && self.seq == other.seq
+    }
+}
+impl Eq for TaskWrapper {}
+
+/// Shared priority queue of pending tasks plus a notifier the scheduler waits on.
+#[derive(Clone)]
+struct TaskQueue {
+    heap: Arc<Mutex<BinaryHeap<TaskWrapper>>>,
+    notify: Arc<Notify>,
+    seq: Arc<AtomicU64>,
+}
+
+impl TaskQueue {
+    fn new() -> Self {
+        Self {
+            heap: Arc::new(Mutex::new(BinaryHeap::new())),
+            notify: Arc::new(Notify::new()),
+            seq: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Enqueue a task and wake the scheduler.
+    async fn push(&self, id: String, config: CacheTableTaskConfig, priority: TaskPriority) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        self.heap.lock().await.push(TaskWrapper {
+            id,
+            config,
+            priority,
+            seq,
+        });
+        self.notify.notify_one();
+    }
+
+    async fn pop(&self) -> Option<TaskWrapper> {
+        self.heap.lock().await.pop()
+    }
 }
 
 #[derive(Clone)]
@@ -148,8 +211,7 @@ pub struct TaskManager {
     task_handles: Arc<DashMap<String, JoinHandle<()>>>,
     executor: Arc<dyn TaskExecutor>,
     active_tasks: Arc<AtomicUsize>,
-    task_queue_tx: mpsc::UnboundedSender<TaskWrapper>,
-    task_queue_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<TaskWrapper>>>,
+    queue: TaskQueue,
     shutdown_tx: Option<mpsc::UnboundedSender<()>>,
     is_shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -164,7 +226,6 @@ impl TaskManager {
         config: TaskManagerConfig,
         cache: LruResultCache,
     ) -> Result<Self, TaskError> {
-        let (task_queue_tx, task_queue_rx) = mpsc::unbounded_channel();
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
         let task_manager = Self {
@@ -173,8 +234,7 @@ impl TaskManager {
             task_handles: Arc::new(DashMap::new()),
             executor: Arc::new(DataSyncExecutor),
             active_tasks: Arc::new(AtomicUsize::new(0)),
-            task_queue_tx,
-            task_queue_rx: Arc::new(tokio::sync::Mutex::new(task_queue_rx)),
+            queue: TaskQueue::new(),
             shutdown_tx: Some(shutdown_tx),
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -195,28 +255,39 @@ impl TaskManager {
         let active_tasks = self.active_tasks.clone();
         let max_concurrent = self.config.max_concurrent_tasks;
         let max_retries = self.config.max_retries;
-        let task_queue_rx = self.task_queue_rx.clone();
-        let task_queue_tx = self.task_queue_tx.clone();
+        let queue = self.queue.clone();
         let is_shutting_down = self.is_shutting_down.clone();
 
         tokio::spawn(async move {
-            let mut queue_rx = task_queue_rx.lock().await;
-
             loop {
-                tokio::select! {
-                    _ = shutdown_rx.recv() => {
-                        is_shutting_down.store(true, Ordering::Relaxed);
-                        info!("Task scheduler received shutdown signal");
-                        break;
-                    }
+                if is_shutting_down.load(Ordering::Relaxed) {
+                    break;
+                }
 
-                    task_wrapper = queue_rx.recv() => {
-                        if let Some(task_wrapper) = task_wrapper {
-                            if active_tasks.load(Ordering::Relaxed) >= max_concurrent {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                continue;
+                // Respect the concurrency cap before pulling more work; a freed
+                // slot is picked up on the next iteration.
+                if active_tasks.load(Ordering::Relaxed) >= max_concurrent {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+
+                // Pop the highest-priority ready task, or wait until one arrives
+                // (or shutdown is signalled).
+                let task_wrapper = match queue.pop().await {
+                    Some(tw) => tw,
+                    None => {
+                        tokio::select! {
+                            _ = shutdown_rx.recv() => {
+                                is_shutting_down.store(true, Ordering::Relaxed);
+                                info!("Task scheduler received shutdown signal");
+                                break;
                             }
+                            _ = queue.notify.notified() => continue,
+                        }
+                    }
+                };
 
+                {
                             if let Some(mut task) = tasks.get_mut(&task_wrapper.id) {
                                 task.status = TaskStatus::Running;
                                 task.started_at = Some(Utc::now());
@@ -230,7 +301,7 @@ impl TaskManager {
                             let task_handles_clone = task_handles.clone();
                             let executor_clone = executor.clone();
                             let active_tasks_clone = active_tasks.clone();
-                            let retry_tx = task_queue_tx.clone();
+                            let retry_queue = queue.clone();
                             let cache = cache.clone();
 
                             let handle = tokio::spawn(async move {
@@ -279,23 +350,19 @@ impl TaskManager {
                                         // sleeping while holding it.
                                         if let Some(attempt) = retry {
                                             let backoff_secs = (1u64 << attempt.min(6)).min(60);
-                                            let retry_tx = retry_tx.clone();
+                                            let retry_queue = retry_queue.clone();
                                             let tasks_retry = tasks_clone.clone();
                                             let retry_id = task_id.clone();
                                             let retry_config = task_config.clone();
+                                            let retry_priority = retry_config.priority;
                                             tokio::spawn(async move {
                                                 tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
-                                                let requeued = retry_tx.send(TaskWrapper {
-                                                    id: retry_id.clone(),
-                                                    config: retry_config,
-                                                });
-                                                if requeued.is_ok() {
-                                                    if let Some(mut task) = tasks_retry.get_mut(&retry_id) {
-                                                        task.status = TaskStatus::Queued;
-                                                        task.queued_at = Some(Utc::now());
-                                                    }
-                                                } else if let Some(mut task) = tasks_retry.get_mut(&retry_id) {
-                                                    task.status = TaskStatus::Failed;
+                                                retry_queue
+                                                    .push(retry_id.clone(), retry_config, retry_priority)
+                                                    .await;
+                                                if let Some(mut task) = tasks_retry.get_mut(&retry_id) {
+                                                    task.status = TaskStatus::Queued;
+                                                    task.queued_at = Some(Utc::now());
                                                 }
                                             });
                                         }
@@ -307,8 +374,6 @@ impl TaskManager {
                             });
 
                             task_handles.insert(task_wrapper.id, handle);
-                        }
-                    }
                 }
             }
         });
@@ -344,14 +409,8 @@ impl TaskManager {
 
         self.tasks.insert(task_id.clone(), metadata);
 
-        let task_wrapper = TaskWrapper {
-            id: task_id.clone(),
-            config,
-        };
-
-        if let Err(_) = self.task_queue_tx.send(task_wrapper) {
-            return Err(TaskError::QueueFull);
-        }
+        let priority = config.priority;
+        self.queue.push(task_id.clone(), config, priority).await;
 
         if let Some(mut task) = self.tasks.get_mut(&task_id) {
             task.status = TaskStatus::Queued;
@@ -604,7 +663,41 @@ mod tests {
     use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
     use log::info;
 
-    use crate::task_manager::{CacheTableTaskConfig, TaskManager, TaskManagerConfig, TaskPriority};
+    use crate::task_manager::{
+        CacheTableTaskConfig, TaskManager, TaskManagerConfig, TaskPriority, TaskQueue,
+    };
+
+    fn cfg(priority: TaskPriority) -> CacheTableTaskConfig {
+        let mut c = CacheTableTaskConfig::new(
+            "kokedb".to_string(),
+            "dsn".to_string(),
+            "public.t".to_string(),
+            "public.t".to_string(),
+        );
+        c.priority = priority;
+        c
+    }
+
+    #[tokio::test]
+    async fn priority_queue_pops_highest_priority_then_fifo() {
+        let q = TaskQueue::new();
+        // Enqueue out of priority order; same priority must stay FIFO by seq.
+        q.push("low".into(), cfg(TaskPriority::Low), TaskPriority::Low)
+            .await;
+        q.push("crit1".into(), cfg(TaskPriority::Critical), TaskPriority::Critical)
+            .await;
+        q.push("normal".into(), cfg(TaskPriority::Normal), TaskPriority::Normal)
+            .await;
+        q.push("crit2".into(), cfg(TaskPriority::Critical), TaskPriority::Critical)
+            .await;
+
+        let mut order = Vec::new();
+        while let Some(tw) = q.pop().await {
+            order.push(tw.id);
+        }
+        // Critical first (FIFO within: crit1 before crit2), then Normal, then Low.
+        assert_eq!(order, vec!["crit1", "crit2", "normal", "low"]);
+    }
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL; run via `make integration-test`"]

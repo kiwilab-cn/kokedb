@@ -26,6 +26,9 @@ pub struct CatalogManager {
     state: Arc<Mutex<CatalogManagerState>>,
     pub result_cache: LruResultCache,
     pub(super) temporary_views: TemporaryViewManager,
+    /// Maps a catalog name to its scheduled sync job id, so `DROP CATALOG` can
+    /// stop the background job it started.
+    pub(super) scheduler_jobs: Arc<Mutex<HashMap<String, uuid::Uuid>>>,
 }
 
 pub(super) struct CatalogManagerState {
@@ -78,6 +81,7 @@ impl CatalogManager {
             state: Arc::new(Mutex::new(state)),
             temporary_views: Default::default(),
             result_cache: options.result_cache.clone(),
+            scheduler_jobs: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
