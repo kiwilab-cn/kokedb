@@ -12,10 +12,14 @@ use kokedb_catalog::{
     provider::CatalogProvider,
 };
 use kokedb_common_datafusion::extension::SessionExtensionAccessor;
+use futures::StreamExt;
+use kokedb_common::spec::Plan;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
+use kokedb_task_manager::runner::ResultRefresher;
 use kokedb_task_manager::task_manager::TaskManager;
 use tokio_cron_scheduler::JobScheduler;
 
+use crate::binder::{parser, query};
 use crate::mem_catalog::MemoryCatalogProvider;
 
 const DEFAULT_CATALOG: &str = "kokedb";
@@ -68,7 +72,81 @@ pub async fn init_shared_services(
         .await
         .map_err(|e| plan_datafusion_err!("Failed to init catalog jobs: {e}"))?;
 
+    // Wire proactive result refresh: after a table sync invalidates cached
+    // query results, the task manager re-runs and re-caches them via this.
+    let refresher = Arc::new(CacheRefresher {
+        shared: shared.clone(),
+    });
+    shared.task_manager.set_result_refresher(refresher);
+
     Ok(shared)
+}
+
+/// Re-executes and re-caches query results after a source table changes
+/// (the proactive "materialized view" refresh). Lives in the query layer
+/// because it needs the full execution path; injected into the task manager.
+struct CacheRefresher {
+    shared: SharedServices,
+}
+
+#[async_trait::async_trait]
+impl ResultRefresher for CacheRefresher {
+    async fn refresh(&self, cache_keys: Vec<u64>) {
+        // A fresh context picks up the just-synced snapshots.
+        let ctx = match create_session_context(&self.shared) {
+            Ok(ctx) => Arc::new(ctx),
+            Err(e) => {
+                log::error!("Result refresh: failed to build session context: {e}");
+                return;
+            }
+        };
+        for key in cache_keys {
+            if let Err(e) = self.refresh_one(&ctx, key).await {
+                log::warn!("Failed to refresh cached result {key}: {e}");
+            }
+        }
+    }
+}
+
+impl CacheRefresher {
+    async fn refresh_one(&self, ctx: &Arc<SessionContext>, key: u64) -> Result<(), String> {
+        let sql = self
+            .shared
+            .catalog_list
+            .get_sql_text_by_hash(key)
+            .await
+            .map_err(|e| e.to_string())?;
+        // No recorded SQL for this key — nothing to recompute (stays invalidated).
+        let Some(sql) = sql else {
+            return Ok(());
+        };
+
+        let plan = parser(&sql).map_err(|e| e.to_string())?;
+        // Only refresh cacheable query results; never re-run command plans.
+        if !matches!(plan, Plan::Query(_)) {
+            return Ok(());
+        }
+
+        let stream = query(ctx.clone(), &plan, key)
+            .await
+            .map_err(|e| e.to_string())?;
+        let batches = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+
+        if !batches.is_empty() {
+            self.shared
+                .result_cache
+                .insert(key, &batches)
+                .await
+                .map_err(|e| e.to_string())?;
+            log::info!("Proactively refreshed cached result {key}");
+        }
+        Ok(())
+    }
 }
 
 /// Builds a per-connection [`SessionContext`]. It has its own [`CatalogManager`]
@@ -131,4 +209,39 @@ fn build_catalog_manager(
 
     CatalogManager::new(options)
         .map_err(|e| plan_datafusion_err!("Failed to create catalog manager: {e}").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kokedb_cache::foyer_hybrid::LruResultCache;
+
+    // Verifies the proactive refresh path end to end (against the meta DB):
+    // record a query's SQL, then refresh its key and confirm the result is
+    // re-executed and cached.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via `make integration-test`"]
+    async fn cache_refresher_recomputes_and_caches() {
+        let cache = LruResultCache::new(64, 64).await.unwrap();
+        let shared = init_shared_services(cache.clone()).await.unwrap();
+
+        // A table-free query so the test does not depend on any catalog data.
+        let key: u64 = 0xC0FFEE;
+        shared
+            .catalog_list
+            .save_sql_stats("SELECT 1 AS x", key, 0)
+            .await
+            .unwrap();
+        assert!(!cache.inner.contains(&key), "cache should start empty");
+
+        let refresher = CacheRefresher {
+            shared: shared.clone(),
+        };
+        refresher.refresh(vec![key]).await;
+
+        assert!(
+            cache.inner.contains(&key),
+            "refresh should have recomputed and cached the result"
+        );
+    }
 }

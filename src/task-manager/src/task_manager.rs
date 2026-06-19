@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     error::TaskError,
-    runner::{DataSyncExecutor, TaskExecutor},
+    runner::{DataSyncExecutor, ResultRefresher, ResultRefresherSlot, TaskExecutor},
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -210,6 +210,9 @@ pub struct TaskManager {
     tasks: Arc<DashMap<String, TaskMetadata>>,
     task_handles: Arc<DashMap<String, JoinHandle<()>>>,
     executor: Arc<dyn TaskExecutor>,
+    /// Settable slot for the result refresher, shared with the data-sync
+    /// executor; filled by the query layer after construction.
+    refresher_slot: ResultRefresherSlot,
     active_tasks: Arc<AtomicUsize>,
     queue: TaskQueue,
     shutdown_tx: Option<mpsc::UnboundedSender<()>>,
@@ -228,11 +231,14 @@ impl TaskManager {
     ) -> Result<Self, TaskError> {
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
+        let refresher_slot: ResultRefresherSlot = Arc::new(std::sync::Mutex::new(None));
+
         let task_manager = Self {
             config: config.clone(),
             tasks: Arc::new(DashMap::new()),
             task_handles: Arc::new(DashMap::new()),
-            executor: Arc::new(DataSyncExecutor),
+            executor: Arc::new(DataSyncExecutor::new(refresher_slot.clone())),
+            refresher_slot,
             active_tasks: Arc::new(AtomicUsize::new(0)),
             queue: TaskQueue::new(),
             shutdown_tx: Some(shutdown_tx),
@@ -382,6 +388,14 @@ impl TaskManager {
     pub fn with_executor(mut self, executor: Arc<dyn TaskExecutor>) -> Self {
         self.executor = executor;
         self
+    }
+
+    /// Installs the result refresher used to proactively re-warm cached query
+    /// results after a table sync. Wired by the query layer post-construction.
+    pub fn set_result_refresher(&self, refresher: Arc<dyn ResultRefresher>) {
+        if let Ok(mut slot) = self.refresher_slot.lock() {
+            *slot = Some(refresher);
+        }
     }
 
     pub async fn add_task(&self, config: CacheTableTaskConfig) -> Result<String, TaskError> {

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Schema;
 use kokedb_cache::foyer_hybrid::LruResultCache;
@@ -36,7 +36,28 @@ pub trait TaskExecutor: Send + Sync {
     ) -> Result<(), TaskError>;
 }
 
-pub struct DataSyncExecutor;
+/// Proactively recomputes and re-caches query results. Implemented in the query
+/// layer (which owns the execution path) and injected here, so the task manager
+/// does not depend on the query crate.
+#[async_trait::async_trait]
+pub trait ResultRefresher: Send + Sync {
+    /// Re-execute and re-cache the queries behind the given result-cache keys.
+    async fn refresh(&self, cache_keys: Vec<u64>);
+}
+
+/// A settable slot for the [`ResultRefresher`], filled after the query layer is
+/// constructed (breaks the executor <-> query-context construction cycle).
+pub type ResultRefresherSlot = Arc<Mutex<Option<Arc<dyn ResultRefresher>>>>;
+
+pub struct DataSyncExecutor {
+    refresher: ResultRefresherSlot,
+}
+
+impl DataSyncExecutor {
+    pub fn new(refresher: ResultRefresherSlot) -> Self {
+        Self { refresher }
+    }
+}
 
 /// The sync strategy chosen for one run, decided from detected metadata and the
 /// persisted sync state.
@@ -237,10 +258,21 @@ impl TaskExecutor for DataSyncExecutor {
         })?;
 
         if let Some(cache_key_list) = table_cache_key_list {
-            for cache_key in cache_key_list {
-                if cache.delete(cache_key).await.is_err() {
+            // Invalidate first so a failed refresh never leaves stale results.
+            for cache_key in &cache_key_list {
+                if cache.delete(*cache_key).await.is_err() {
                     error!("Failed to delete table: {} key from cache.", schema_info);
                 }
+            }
+            // Proactively recompute and re-cache the affected queries, if a
+            // refresher has been wired in (best-effort; lazy recompute otherwise).
+            let refresher = self
+                .refresher
+                .lock()
+                .ok()
+                .and_then(|guard| guard.clone());
+            if let Some(refresher) = refresher {
+                refresher.refresh(cache_key_list).await;
             }
         }
         report(0.95);
@@ -473,7 +505,7 @@ mod tests {
         .unwrap();
 
         let cache = LruResultCache::new(64, 64).await.unwrap();
-        let exec = DataSyncExecutor;
+        let exec = DataSyncExecutor::new(Arc::new(Mutex::new(None)));
         let config = CacheTableTaskConfig::new(
             "kokedb".to_string(),
             dsn.clone(),

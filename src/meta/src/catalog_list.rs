@@ -618,6 +618,18 @@ impl PostgreSQLMetaCatalogProviderList {
         }
     }
 
+    /// Looks up the original SQL text for a cached query by its plan-hash key.
+    /// Used by proactive result refresh to re-execute and re-cache the query.
+    pub async fn get_sql_text_by_hash(&self, key: u64) -> Result<Option<String>> {
+        let sql = "SELECT sql_text FROM system.sql_stats WHERE sql_hash = $1;";
+        let row: Option<(String,)> = sqlx::query_as(sql)
+            .bind(key.to_string())
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(row.map(|(sql_text,)| sql_text))
+    }
+
     pub async fn save_sql_stats(&self, sql: &str, key: u64, cost: u64) -> Result<bool> {
         //TODO: store cache status / execute status.
         let insert_sql =
