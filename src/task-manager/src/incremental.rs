@@ -169,6 +169,7 @@ pub async fn merge_snapshot(
     out_path: &str,
     pk_columns: &[String],
     schema: Arc<Schema>,
+    sort_column: Option<&str>,
 ) -> Result<(), TaskError> {
     if pk_columns.is_empty() {
         return Err(TaskError::ExecutionFailed(
@@ -189,10 +190,17 @@ pub async fn merge_snapshot(
     // delta key — that is exactly the set of old rows not superseded by a delta.
     let anti_key = &pk_columns[0];
 
+    // Sort the merged output so the rebuilt snapshot stays clustered for pruning.
+    let order_sql = match sort_column {
+        Some(col) => format!(" ORDER BY \"{}\"", col.replace('"', "\"\"")),
+        None => String::new(),
+    };
     let sql = format!(
-        "SELECT * FROM delta \
-         UNION ALL \
-         SELECT o.* FROM old o LEFT JOIN delta d ON {on} WHERE d.\"{anti_key}\" IS NULL"
+        "SELECT * FROM (\
+            SELECT * FROM delta \
+            UNION ALL \
+            SELECT o.* FROM old o LEFT JOIN delta d ON {on} WHERE d.\"{anti_key}\" IS NULL\
+         ){order_sql}"
     );
 
     let df = ctx

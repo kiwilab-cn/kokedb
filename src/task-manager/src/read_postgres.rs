@@ -3,6 +3,7 @@ use arrow::datatypes::*;
 use datafusion::parquet;
 use futures_util::TryStreamExt;
 use kokedb_common::{
+    env::get_env_as,
     file::ensure_dir_exists,
     table::postgresql::{get_postgresql_table_schema, rows_to_record_batch},
 };
@@ -18,6 +19,10 @@ use crate::error::TaskError;
 pub struct PostgresToParquetConverter {
     pool: PgPool,
     batch_size: usize,
+    /// Parquet row-group size. Kept smaller than `batch_size` so a written file
+    /// holds several row groups, giving DataFusion finer-grained statistics
+    /// pruning for selective predicates on the sort column.
+    row_group_size: usize,
     compression: parquet::basic::Compression,
 }
 
@@ -37,12 +42,18 @@ impl PostgresToParquetConverter {
         Ok(Self {
             pool,
             batch_size: 10000,
+            row_group_size: 65536,
             compression: parquet::basic::Compression::SNAPPY,
         })
     }
 
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
+        self
+    }
+
+    pub fn with_row_group_size(mut self, row_group_size: usize) -> Self {
+        self.row_group_size = row_group_size;
         self
     }
 
@@ -110,30 +121,39 @@ impl PostgresToParquetConverter {
         table_name: &str,
         output_path: &str,
     ) -> Result<Arc<Schema>, TaskError> {
-        self.convert_table_to_parquet_where(table_name, output_path, None)
+        self.convert_table_to_parquet_where(table_name, output_path, None, None)
             .await
     }
 
-    /// Like [`convert_table_to_parquet`], but with an optional `WHERE` clause so
-    /// the caller can fetch only the rows changed since the last watermark.
+    /// Like [`convert_table_to_parquet`], but with an optional `WHERE` clause
+    /// (incremental delta fetch) and an optional sort column. Sorting clusters
+    /// the snapshot so each parquet file/row-group has a tight value range,
+    /// letting DataFusion prune them for selective predicates on that column.
     pub async fn convert_table_to_parquet_where(
         &self,
         table_name: &str,
         output_path: &str,
         where_clause: Option<&str>,
+        sort_column: Option<&str>,
     ) -> Result<Arc<Schema>, TaskError> {
         let schema = self.get_table_schema(table_name).await?;
         let arrow_schema = Arc::new(schema);
 
         let props = WriterProperties::builder()
             .set_compression(self.compression)
-            .set_max_row_group_size(self.batch_size)
+            .set_max_row_group_size(self.row_group_size)
             .build();
 
-        let query = match where_clause {
-            Some(clause) => format!("SELECT * FROM {} WHERE {}", table_name, clause),
-            None => format!("SELECT * FROM {}", table_name),
+        let where_sql = match where_clause {
+            Some(clause) => format!(" WHERE {}", clause),
+            None => String::new(),
         };
+        let order_sql = match sort_column {
+            // Identifier is quoted; it comes from PostgreSQL catalog metadata.
+            Some(col) => format!(" ORDER BY \"{}\"", col.replace('"', "\"\"")),
+            None => String::new(),
+        };
+        let query = format!("SELECT * FROM {}{}{}", table_name, where_sql, order_sql);
 
         let mut rows = sqlx::query(&query).fetch(&self.pool);
         let mut pg_rows = Vec::with_capacity(self.batch_size);
@@ -186,10 +206,16 @@ pub async fn convert_postgres_to_parquet(
     dsn: &str,
     remote_table: &str,
     output_path: &str,
+    sort_column: Option<&str>,
 ) -> Result<Arc<Schema>, TaskError> {
-    let converter = PostgresToParquetConverter::new(dsn).await?;
+    // Write fewer, larger files (default 300k rows each) so per-file overhead is
+    // small and pruning operates over multiple row groups per file.
+    let batch_size = get_env_as("KOKEDB_READ_TABLE_BATCH_SIZE", 300000usize);
+    let converter = PostgresToParquetConverter::new(dsn)
+        .await?
+        .with_batch_size(batch_size);
     let schema = converter
-        .convert_table_to_parquet(remote_table, output_path)
+        .convert_table_to_parquet_where(remote_table, output_path, None, sort_column)
         .await
         .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
 
@@ -211,7 +237,7 @@ mod tests {
         let table_name = "public.test1";
         let output_path = "/tmp/test1/";
 
-        convert_postgres_to_parquet(dsn, table_name, output_path).await?;
+        convert_postgres_to_parquet(dsn, table_name, output_path, None).await?;
 
         assert!(Path::new(output_path).exists());
         Ok(())

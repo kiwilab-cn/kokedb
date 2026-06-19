@@ -163,14 +163,20 @@ impl TaskExecutor for DataSyncExecutor {
                 watermark_column,
                 pk_columns,
             } => {
-                let arrow_schema = convert_postgres_to_parquet(&dsn, source_table, &local_path)
-                    .await
-                    .map_err(|x| {
-                        TaskError::ExecutionFailed(format!(
-                            "Failed to write postgresql table to parquet with error: {}",
-                            x
-                        ))
-                    })?;
+                // Cluster the snapshot by the watermark (or PK) column so the
+                // parquet files/row-groups prune well for selective predicates.
+                let sort_column = watermark_column
+                    .clone()
+                    .or_else(|| pk_columns.first().cloned());
+                let arrow_schema =
+                    convert_postgres_to_parquet(&dsn, source_table, &local_path, sort_column.as_deref())
+                        .await
+                        .map_err(|x| {
+                            TaskError::ExecutionFailed(format!(
+                                "Failed to write postgresql table to parquet with error: {}",
+                                x
+                            ))
+                        })?;
 
                 let last_watermark = match &watermark_column {
                     Some(col) => {
@@ -388,9 +394,17 @@ async fn run_incremental(
     ensure_dir_exists(new_local_path).await?;
 
     let where_clause = incremental::incremental_where(watermark_column, last_watermark);
-    let converter = PostgresToParquetConverter::new(dsn).await?;
+    let batch_size = get_env_as("KOKEDB_READ_TABLE_BATCH_SIZE", 300000usize);
+    let converter = PostgresToParquetConverter::new(dsn)
+        .await?
+        .with_batch_size(batch_size);
     let arrow_schema = converter
-        .convert_table_to_parquet_where(source_table, &delta_path, Some(&where_clause))
+        .convert_table_to_parquet_where(
+            source_table,
+            &delta_path,
+            Some(&where_clause),
+            Some(watermark_column),
+        )
         .await?;
 
     incremental::merge_snapshot(
@@ -399,6 +413,7 @@ async fn run_incremental(
         new_local_path,
         pk_columns,
         arrow_schema.clone(),
+        Some(watermark_column),
     )
     .await?;
 
