@@ -11,6 +11,7 @@ kokedb-task-manager.workspace = true
 kokedb-meta.workspace = true
 kokedb-plan.workspace = true
 kokedb-cache.workspace = true
+kokedb-common-datafusion.workspace = true
 
 
 datafusion.workspace = true
@@ -31,3 +32,4 @@ xxhash-rust.workspace = true
 serde_json.workspace = true
 log.workspace = true
 futures.workspace = true
+uuid.workspace = true

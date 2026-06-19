@@ -15,11 +15,54 @@ use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_common::{hash::get_plan_hash, opentelemetry::init_logger, spec::Plan};
 use kokedb_query::{
     binder::{parser, query, save_sql_history},
-    context::create_session_context,
+    context::{create_session_context, init_shared_services, use_database},
 };
 use log::{error, info, warn};
 use opensrv_mysql::*;
+use sha1::{Digest, Sha1};
 use tokio::{io::AsyncWrite, net::TcpListener};
+
+/// Optional MySQL authentication credentials, read once from the environment.
+/// When `None`, authentication is disabled (any client is accepted).
+#[derive(Clone)]
+struct AuthConfig {
+    user: String,
+    password: String,
+}
+
+impl AuthConfig {
+    /// Reads credentials from `KOKEDB_MYSQL_USER` (default `root`) and
+    /// `KOKEDB_MYSQL_PASSWORD`. Auth is only enforced when a password is set.
+    fn from_env() -> Option<Self> {
+        match std::env::var("KOKEDB_MYSQL_PASSWORD") {
+            Ok(password) if !password.is_empty() => Some(Self {
+                user: std::env::var("KOKEDB_MYSQL_USER").unwrap_or_else(|_| "root".to_string()),
+                password,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Verifies a `mysql_native_password` response:
+    ///   token == SHA1(password) XOR SHA1(salt + SHA1(SHA1(password)))
+    fn verify_native_password(&self, salt: &[u8], token: &[u8]) -> bool {
+        if token.len() != 20 {
+            return false;
+        }
+        let hash1 = Sha1::digest(self.password.as_bytes());
+        let hash2 = Sha1::digest(hash1);
+        let mut hasher = Sha1::new();
+        hasher.update(salt);
+        hasher.update(hash2);
+        let scramble = hasher.finalize();
+        // recovered = scramble XOR token should equal hash1 for a valid password.
+        scramble
+            .iter()
+            .zip(token.iter())
+            .map(|(s, t)| s ^ t)
+            .eq(hash1.iter().copied())
+    }
+}
 
 /// A prepared statement bound to a single client connection.
 #[derive(Clone)]
@@ -31,6 +74,8 @@ struct PreparedStatement {
 struct CoreContex {
     ctx: Arc<SessionContext>,
     cache: LruResultCache,
+    /// Optional auth credentials shared across connections (read once at startup).
+    auth: Option<Arc<AuthConfig>>,
     /// Per-connection prepared statement registry, keyed by statement id.
     prepared: HashMap<u32, PreparedStatement>,
     /// Monotonic statement id generator for this connection.
@@ -38,10 +83,11 @@ struct CoreContex {
 }
 
 impl CoreContex {
-    fn new(ctx: Arc<SessionContext>, cache: LruResultCache) -> Self {
+    fn new(ctx: Arc<SessionContext>, cache: LruResultCache, auth: Option<Arc<AuthConfig>>) -> Self {
         Self {
             ctx,
             cache,
+            auth,
             prepared: HashMap::new(),
             next_stmt_id: 1,
         }
@@ -57,6 +103,31 @@ type Context = datafusion::prelude::SessionContext;
 #[async_trait::async_trait]
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
     type Error = MysqlServerError;
+
+    /// Validates the client's credentials with `mysql_native_password`. When no
+    /// `KOKEDB_MYSQL_PASSWORD` is configured, all clients are accepted.
+    async fn authenticate(
+        &self,
+        _auth_plugin: &str,
+        username: &[u8],
+        salt: &[u8],
+        auth_data: &[u8],
+    ) -> bool {
+        match &self.auth {
+            None => true,
+            Some(cfg) => {
+                if username != cfg.user.as_bytes() {
+                    warn!("Auth failed: unknown user");
+                    return false;
+                }
+                let ok = cfg.verify_native_password(salt, auth_data);
+                if !ok {
+                    warn!("Auth failed: bad password for user");
+                }
+                ok
+            }
+        }
+    }
 
     /// Prepare a statement: validate the SQL, count its `?` placeholders, and
     /// register it under a fresh statement id so `on_execute` can run it later.
@@ -128,6 +199,31 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
 
     async fn on_close(&mut self, stmt: u32) {
         self.prepared.remove(&stmt);
+    }
+
+    /// Handles `USE <database>` (COM_INIT_DB): sets this connection's default
+    /// catalog. Errors if the catalog does not exist.
+    async fn on_init<'a>(
+        &'a mut self,
+        database: &'a str,
+        writer: InitWriter<'a, W>,
+    ) -> Result<(), MysqlServerError> {
+        match use_database(&self.ctx, database) {
+            Ok(()) => {
+                info!("Connection switched default catalog to '{}'", database);
+                writer
+                    .ok()
+                    .await
+                    .map_err(|e| MysqlServerError::InternalError(e.to_string()))
+            }
+            Err(msg) => {
+                warn!("USE {} failed: {}", database, msg);
+                writer
+                    .error(ErrorKind::ER_BAD_DB_ERROR, msg.as_bytes())
+                    .await
+                    .map_err(|e| MysqlServerError::InternalError(e.to_string()))
+            }
+        }
     }
 
     /*
@@ -652,22 +748,73 @@ mod tests {
         assert_eq!(quote_sql_string("a'b"), "'a''b'");
         assert_eq!(quote_sql_string("a\\b"), "'a\\\\b'");
     }
+
+    /// Computes the `mysql_native_password` token a client would send.
+    fn client_token(password: &str, salt: &[u8]) -> Vec<u8> {
+        let hash1 = Sha1::digest(password.as_bytes());
+        let hash2 = Sha1::digest(hash1);
+        let mut hasher = Sha1::new();
+        hasher.update(salt);
+        hasher.update(hash2);
+        let scramble = hasher.finalize();
+        scramble
+            .iter()
+            .zip(hash1.iter())
+            .map(|(s, h)| s ^ h)
+            .collect()
+    }
+
+    #[test]
+    fn native_password_accepts_correct_and_rejects_wrong() {
+        let cfg = AuthConfig {
+            user: "root".to_string(),
+            password: "s3cret".to_string(),
+        };
+        let salt = b"01234567890123456789";
+        let good = client_token("s3cret", salt);
+        assert!(cfg.verify_native_password(salt, &good));
+
+        let bad = client_token("wrong", salt);
+        assert!(!cfg.verify_native_password(salt, &bad));
+        // Malformed (wrong length) tokens are rejected.
+        assert!(!cfg.verify_native_password(salt, b"short"));
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), MysqlServerError> {
     init_logger().unwrap();
-    let listener = TcpListener::bind("0.0.0.0:3306").await.unwrap();
+
+    let bind_addr = std::env::var("KOKEDB_BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:3306".to_string());
+    let listener = TcpListener::bind(&bind_addr).await.unwrap();
+    info!("kokedb MySQL server listening on {}", bind_addr);
+
+    let auth = AuthConfig::from_env().map(Arc::new);
+    if auth.is_some() {
+        info!("MySQL authentication enabled");
+    } else {
+        warn!("MySQL authentication disabled (set KOKEDB_MYSQL_PASSWORD to enable)");
+    }
+
     let result_cache = LruResultCache::new(2000, 40000).await?;
-    let ctx = create_session_context(result_cache.clone()).await.unwrap();
+    // Heavy services (meta store, task manager, scheduler, sync jobs) are created
+    // once and shared; each connection gets its own lightweight session context.
+    let shared = init_shared_services(result_cache.clone()).await.unwrap();
 
     loop {
         let (stream, _) = listener.accept().await?;
         let (r, w) = stream.into_split();
-        let ctx = Arc::new(ctx.clone());
         let cache = result_cache.clone();
+        let auth = auth.clone();
+        let ctx = match create_session_context(&shared) {
+            Ok(ctx) => Arc::new(ctx),
+            Err(e) => {
+                error!("Failed to create session context for connection: {}", e);
+                continue;
+            }
+        };
         tokio::spawn(async move {
-            AsyncMysqlIntermediary::run_on(CoreContex::new(ctx, cache), r, w).await
+            AsyncMysqlIntermediary::run_on(CoreContex::new(ctx, cache, auth), r, w).await
         });
     }
 }

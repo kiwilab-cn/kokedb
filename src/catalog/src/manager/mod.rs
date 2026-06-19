@@ -46,6 +46,9 @@ pub struct CatalogManagerOptions {
     pub dynamic_catalog_list: Arc<PostgreSQLMetaCatalogProviderList>,
     pub catalog_task_manager: Arc<TaskManager>,
     pub catalog_task_scheduler: Arc<JobScheduler>,
+    /// Shared map of catalog name -> scheduled sync job id. Shared across all
+    /// per-connection managers since the scheduler itself is a singleton.
+    pub scheduler_jobs: Arc<Mutex<HashMap<String, uuid::Uuid>>>,
     pub result_cache: LruResultCache,
     pub default_catalog: String,
     pub default_database: Vec<String>,
@@ -81,7 +84,7 @@ impl CatalogManager {
             state: Arc::new(Mutex::new(state)),
             temporary_views: Default::default(),
             result_cache: options.result_cache.clone(),
-            scheduler_jobs: Arc::new(Mutex::new(HashMap::new())),
+            scheduler_jobs: options.scheduler_jobs,
         })
     }
 

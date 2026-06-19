@@ -3300,6 +3300,7 @@ dependencies = [
  "kokedb-query",
  "log",
  "opensrv-mysql",
+ "sha1",
  "thiserror 2.0.16",
  "tokio",
 ]
@@ -3395,6 +3396,7 @@ dependencies = [
  "kokedb-cache",
  "kokedb-catalog",
  "kokedb-common",
+ "kokedb-common-datafusion",
  "kokedb-meta",
  "kokedb-plan",
  "kokedb-sql-analyzer",
@@ -3404,6 +3406,7 @@ dependencies = [
  "thiserror 2.0.16",
  "tokio",
  "tokio-cron-scheduler",
+ "uuid",
  "xxhash-rust",
 ]
 
