@@ -1,0 +1,9 @@
+# Keep the build context small — the Rust target dir is multiple GB.
+target
+**/target
+.git
+dist
+.env
+mem
+*.parquet
+**/*.parquet

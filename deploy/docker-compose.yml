@@ -1,13 +1,14 @@
-# Local-dev infrastructure for kokedb.
+# Local-dev stack for kokedb — PostgreSQL + the kokedb MySQL server, both
+# containerized.
 #
-#   make up      # start PostgreSQL (meta store + integration-test source) in background
-#   make ps      # show status / health
-#   make down    # stop + remove the container (keeps the data volume)
-#   make reset   # stop + wipe the data volume AND local cache dirs (fresh state)
+#   make up      # build (if needed) + start the whole stack in background
+#   make ps      # status / health
+#   make mysql   # mysql client against the server (host 127.0.0.1:3306)
+#   make down    # stop + remove containers (keeps volumes)
+#   make reset   # stop + wipe volumes AND local cache dirs (fresh state)
 #
-# The kokedb MySQL server itself runs on the host via `make run` (it links
-# pyo3/libpython and is fastest to iterate as a host `cargo run`). This compose
-# only provides its PostgreSQL dependency, reachable at 127.0.0.1:25432.
+# postgres is reachable on the host at 127.0.0.1:25432 (for host-side tests);
+# the server reaches it in-network as host `postgres:5432`.
 
 name: kokedb
 
@@ -35,5 +36,36 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  kokedb-server:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: kokedb-server:local
+    container_name: kokedb-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # In-network DSN to the meta `kokedb` database (service name `postgres`).
+      PG_META_DSN: postgresql://postgres:123456@postgres:5432/kokedb
+      RESULT_CACHE_DIR: /data/cache
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      # host:container — override the host port with MYSQL_PORT if 3306 is taken.
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - kokedb-cache:/data/cache
+    healthcheck:
+      # python is in the runtime image; use it to TCP-probe the MySQL port.
+      test:
+        - CMD-SHELL
+        - "python3 -c \"import socket; socket.create_connection(('127.0.0.1',3306),2)\" || exit 1"
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+
 volumes:
   kokedb-pgdata:
+  kokedb-cache:

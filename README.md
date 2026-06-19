@@ -70,43 +70,39 @@ cargo run
 
 ## Usage
 
-A `Makefile` wraps the local-dev workflow (run `make help` for all targets).
+The whole stack — PostgreSQL **and** the KokeDB server — runs in Docker via a
+`Makefile` (run `make help` for all targets).
 
-1. Start the PostgreSQL meta + source database (creates the `kokedb` meta DB and
-   seeds integration-test fixtures; waits until healthy):
+1. Build (first time) and start the stack. PostgreSQL comes up first (creating
+   the `kokedb` meta DB and seeding test fixtures), then the server:
 ```shell
 make up
 ```
-If host port 25432 is already in use, override it: `make up PG_PORT=25433`.
+If host port 25432 or 3306 is in use, override: `make up PG_PORT=25433 MYSQL_PORT=3307`.
 
-2. Start the KokeDB server (host process, connects to the DB started above):
-```shell
-make run
-```
-
-3. Connect via MySQL client:
+2. Connect via MySQL client once the server is healthy (`make ps`):
 ```shell
 make mysql        # or: mysql -h 127.0.0.1 -P 3306 -u root
 ```
 
-4. Execute SQL queries.
+3. Execute SQL queries.
 
 ### Lifecycle & tests
 
 ```shell
-make ps                # container + health status
-make logs              # tail DB logs
+make ps                # containers + health status
+make logs              # tail server logs   (make logs-db for the database)
 make psql              # psql shell on the meta `kokedb` DB
-make down              # stop the DB (keeps the data volume)
-make reset             # wipe the DB volume + local cache dirs (fresh state)
-make test              # DB-free unit tests
-make integration-test  # spin up the DB and run the DB-backed tests against it
+make sh                # shell inside the server container
+make rebuild           # rebuild the server image with no cache
+make down              # stop containers (keeps volumes)
+make reset             # wipe volumes + local cache dirs (fresh state)
+make test              # DB-free unit tests (host)
+make integration-test  # start the DB and run the DB-backed tests against it (host)
 ```
 
-Manual equivalent of `make up` (if you prefer raw Docker):
-```shell
-docker run -d --name test-postgres -e POSTGRES_PASSWORD=123456 -e PGDATA=/var/lib/postgresql/data/pgdata -v /opt/postgresql/data:/var/lib/postgresql/data -p 0.0.0.0:25432:5432 postgres:17.6
-```
+The server image is defined in `deploy/Dockerfile`; the stack in
+`deploy/docker-compose.yml`.
 
 Example query:  
 ```sql
