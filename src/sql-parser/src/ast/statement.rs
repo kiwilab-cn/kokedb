@@ -49,7 +49,11 @@ pub enum Statement {
         catalog: Catalog,
         name: Either<Ident, StringLiteral>,
         using: Using,
-        dsn: DatabaseJdbcDsn,
+        // Either a bare DSN (postgresql://user:pass@host:port/db) or a quoted
+        // string literal. The quoted form lets credentials contain URL-special
+        // characters (e.g. percent-encoded `@`, `/`) that the bare grammar can't
+        // tokenize.
+        dsn: Either<DatabaseJdbcDsn, StringLiteral>,
         clauses: Vec<CreateCatalogClause>,
     },
     DropCatalog {
