@@ -110,6 +110,18 @@ impl PostgresToParquetConverter {
         table_name: &str,
         output_path: &str,
     ) -> Result<Arc<Schema>, TaskError> {
+        self.convert_table_to_parquet_where(table_name, output_path, None)
+            .await
+    }
+
+    /// Like [`convert_table_to_parquet`], but with an optional `WHERE` clause so
+    /// the caller can fetch only the rows changed since the last watermark.
+    pub async fn convert_table_to_parquet_where(
+        &self,
+        table_name: &str,
+        output_path: &str,
+        where_clause: Option<&str>,
+    ) -> Result<Arc<Schema>, TaskError> {
         let schema = self.get_table_schema(table_name).await?;
         let arrow_schema = Arc::new(schema);
 
@@ -118,7 +130,10 @@ impl PostgresToParquetConverter {
             .set_max_row_group_size(self.batch_size)
             .build();
 
-        let query = format!("SELECT * FROM {}", table_name);
+        let query = match where_clause {
+            Some(clause) => format!("SELECT * FROM {} WHERE {}", table_name, clause),
+            None => format!("SELECT * FROM {}", table_name),
+        };
 
         let mut rows = sqlx::query(&query).fetch(&self.pool);
         let mut pg_rows = Vec::with_capacity(self.batch_size);
