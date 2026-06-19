@@ -16,6 +16,7 @@ datafusion.workspace = true
 log.workspace = true
 thiserror.workspace = true
 futures.workspace = true
+sha1.workspace = true
 
 [[bin]]
 path = "src/main.rs"

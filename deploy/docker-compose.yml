@@ -50,6 +50,9 @@ services:
       PG_META_DSN: postgresql://postgres:123456@postgres:5432/kokedb
       RESULT_CACHE_DIR: /data/cache
       RUST_LOG: ${RUST_LOG:-info}
+      # MySQL auth — set KOKEDB_MYSQL_PASSWORD to enable (empty = open access).
+      KOKEDB_MYSQL_USER: ${KOKEDB_MYSQL_USER:-root}
+      KOKEDB_MYSQL_PASSWORD: ${KOKEDB_MYSQL_PASSWORD:-}
     ports:
       # host:container — override the host port with MYSQL_PORT if 3306 is taken.
       - "${MYSQL_PORT:-3306}:3306"
