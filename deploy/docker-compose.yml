@@ -53,9 +53,13 @@ services:
       # MySQL auth — set KOKEDB_MYSQL_PASSWORD to enable (empty = open access).
       KOKEDB_MYSQL_USER: ${KOKEDB_MYSQL_USER:-root}
       KOKEDB_MYSQL_PASSWORD: ${KOKEDB_MYSQL_PASSWORD:-}
+      # Prometheus metrics endpoint (in-container address).
+      KOKEDB_METRICS_ADDR: 0.0.0.0:9090
     ports:
       # host:container — override the host port with MYSQL_PORT if 3306 is taken.
       - "${MYSQL_PORT:-3306}:3306"
+      # Prometheus metrics — scrape http://127.0.0.1:${METRICS_PORT}/metrics
+      - "${METRICS_PORT:-9090}:9090"
     volumes:
       - kokedb-cache:/data/cache
     healthcheck:
