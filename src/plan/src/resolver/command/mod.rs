@@ -190,6 +190,13 @@ impl PlanResolver<'_> {
                 let catalog = String::from(catalog);
                 self.resolve_catalog_command(CatalogCommand::CreateCatalog { catalog, options })
             }
+            CommandNode::DropCatalog {
+                catalog,
+                if_exists,
+            } => self.resolve_catalog_command(CatalogCommand::DropCatalog {
+                catalog: String::from(catalog),
+                if_exists,
+            }),
             CommandNode::CreateDatabase {
                 database,
                 definition,

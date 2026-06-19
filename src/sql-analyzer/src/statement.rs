@@ -86,6 +86,22 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::DropCatalog {
+            drop: _,
+            catalog: _,
+            if_exists,
+            name,
+        } => {
+            let name = match name {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let node = spec::CommandNode::DropCatalog {
+                catalog: name.into(),
+                if_exists: if_exists.is_some(),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::UseDatabase {
             r#use: _,
             database: _,
@@ -1737,3 +1753,37 @@ fn from_ast_alter_view_operation(
 // TODO: add the following test cases as gold tests:
 //   `CREATE TABLE foo.1m(a INT)`
 //   `CREATE TABLE foo.1m(a INT) USING parquet`
+
+#[cfg(test)]
+mod drop_catalog_tests {
+    use kokedb_common::spec;
+
+    use crate::parser::parse_one_statement;
+    use crate::statement::from_ast_statement;
+
+    fn drop_catalog_node(sql: &str) -> (String, bool) {
+        let plan = from_ast_statement(parse_one_statement(sql).unwrap()).unwrap();
+        match plan {
+            spec::Plan::Command(c) => match c.node {
+                spec::CommandNode::DropCatalog { catalog, if_exists } => {
+                    (String::from(catalog), if_exists)
+                }
+                _ => panic!("expected DropCatalog command node"),
+            },
+            _ => panic!("expected a command plan"),
+        }
+    }
+
+    #[test]
+    fn parse_drop_catalog() {
+        assert_eq!(drop_catalog_node("DROP CATALOG demo"), ("demo".to_string(), false));
+    }
+
+    #[test]
+    fn parse_drop_catalog_if_exists() {
+        assert_eq!(
+            drop_catalog_node("DROP CATALOG IF EXISTS demo"),
+            ("demo".to_string(), true)
+        );
+    }
+}

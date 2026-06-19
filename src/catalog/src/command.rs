@@ -32,6 +32,10 @@ pub enum CatalogCommand {
     ListCatalogs {
         pattern: Option<String>,
     },
+    DropCatalog {
+        catalog: String,
+        if_exists: bool,
+    },
     ListCachePolicies,
     CurrentDatabase,
     SetCurrentDatabase {
@@ -137,6 +141,7 @@ impl CatalogCommand {
             CatalogCommand::CurrentCatalog => "CurrentCatalog",
             CatalogCommand::SetCurrentCatalog { .. } => "SetCurrentCatalog",
             CatalogCommand::ListCatalogs { .. } => "ListCatalogs",
+            CatalogCommand::DropCatalog { .. } => "DropCatalog",
             CatalogCommand::ListCachePolicies => "ListCachePolicies",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
@@ -209,7 +214,8 @@ impl CatalogCommand {
             | CatalogCommand::DropTable { .. }
             | CatalogCommand::DropFunction { .. }
             | CatalogCommand::DropTemporaryView { .. }
-            | CatalogCommand::DropView { .. } => {
+            | CatalogCommand::DropView { .. }
+            | CatalogCommand::DropCatalog { .. } => {
                 Vec::<FieldRef>::from_type::<SingleValueDisplay<bool>>(TracingOptions::default())
             }
         }
@@ -254,6 +260,11 @@ impl CatalogCommand {
             }
             CatalogCommand::ListCachePolicies => {
                 let rows = manager.list_cache_policies().await?;
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::DropCatalog { catalog, if_exists } => {
+                manager.drop_catalog(&catalog, if_exists).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
                 build_record_batch(schema, &rows)
             }
             CatalogCommand::CurrentDatabase => {

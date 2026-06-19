@@ -437,6 +437,11 @@ impl PostgreSQLMetaCatalogProviderList {
 
         let ret = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
+                // Validate the DSN by actually connecting before persisting, so a
+                // bad DSN fails CREATE CATALOG instead of leaving a broken entry.
+                let probe = PgPool::connect(dsn).await?;
+                probe.close().await;
+
                 sqlx::query(insert_sql)
                     .bind(catalog)
                     .bind(dsn)
@@ -450,6 +455,18 @@ impl PostgreSQLMetaCatalogProviderList {
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Ok(ret.rows_affected().is_eq(1))
+    }
+
+    /// Removes a catalog registration and drops it from the provider cache.
+    pub async fn delete_catalog(&self, name: &str) -> Result<bool> {
+        let sql = "DELETE FROM system.catalog WHERE name = $1;";
+        let ret = sqlx::query(sql)
+            .bind(name)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        self.catalog_cache.remove(name);
+        Ok(ret.rows_affected() > 0)
     }
 
     pub async fn save_table_schema(&self, schema_info: &SchemaTable<'_>) -> Result<bool> {
