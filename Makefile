@@ -34,7 +34,7 @@ CACHE_DIRS      ?= /tmp/kokedb-cache /tmp/remote_catalog
 
 .DEFAULT_GOAL := help
 .PHONY: help up up-db down reset restart ps logs logs-db psql sh mysql build rebuild \
-        wait-db test integration-test itest clean
+        wait-db test integration-test itest bench clean
 
 help: ## Show this help
 	@printf "kokedb local-dev targets:\n\n"
@@ -104,6 +104,9 @@ integration-test: up-db ## Start the DB and run the DB-backed (#[ignore]d) tests
 	PG_META_DSN="$(PG_META_DSN)" KOKEDB_TEST_DSN="$(KOKEDB_TEST_DSN)" \
 		cargo test --workspace -- --include-ignored --test-threads=1
 itest: integration-test ## Alias for `make integration-test`
+
+bench: ## Run the query-acceleration benchmark (see doc/benchmark.md)
+	./scripts/benchmark.sh
 
 clean: ## cargo clean + stop/wipe the whole stack
 	cargo clean

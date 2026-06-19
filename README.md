@@ -99,6 +99,7 @@ make down              # stop containers (keeps volumes)
 make reset             # wipe volumes + local cache dirs (fresh state)
 make test              # DB-free unit tests (host)
 make integration-test  # start the DB and run the DB-backed tests against it (host)
+make bench             # query-acceleration benchmark (see doc/benchmark.md)
 ```
 
 The server image is defined in `deploy/Dockerfile`; the stack in
