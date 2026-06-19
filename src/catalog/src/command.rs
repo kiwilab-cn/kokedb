@@ -15,9 +15,9 @@ use crate::manager::CatalogManager;
 use crate::provider::{
     CreateCatalogOptions, CreateDatabaseOptions, CreateTableOptions, CreateTemporaryViewOptions,
     CreateViewOptions, DropDatabaseOptions, DropTableOptions, DropTemporaryViewOptions,
-    DropViewOptions,
+    DropViewOptions, FunctionStatus,
 };
-use crate::utils::quote_namespace_if_needed;
+use crate::utils::{match_pattern, quote_namespace_if_needed};
 
 #[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Hash)]
 pub enum CatalogCommand {
@@ -367,14 +367,34 @@ impl CatalogCommand {
                     .collect::<Vec<_>>();
                 build_record_batch(schema, &rows)
             }
-            CatalogCommand::FunctionExists { .. } => {
-                Err(CatalogError::NotSupported("function exists".to_string()))
+            CatalogCommand::FunctionExists { function } => {
+                let target = function.last().cloned().unwrap_or_default();
+                let exists = session_function_names(ctx)
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&target));
+                let rows = vec![SingleValueDisplay { value: exists }];
+                build_record_batch(schema, &rows)
             }
-            CatalogCommand::GetFunction { .. } => {
-                Err(CatalogError::NotSupported("get function".to_string()))
+            CatalogCommand::GetFunction { function } => {
+                let target = function.last().cloned().unwrap_or_default();
+                match session_function_names(ctx)
+                    .into_iter()
+                    .find(|n| n.eq_ignore_ascii_case(&target))
+                {
+                    Some(name) => {
+                        let rows = vec![D::function(function_status(name))];
+                        build_record_batch(schema, &rows)
+                    }
+                    None => Err(CatalogError::NotFound("function", target)),
+                }
             }
-            CatalogCommand::ListFunctions { .. } => {
-                Err(CatalogError::NotSupported("list functions".to_string()))
+            CatalogCommand::ListFunctions { pattern, .. } => {
+                let rows = session_function_names(ctx)
+                    .into_iter()
+                    .filter(|n| match_pattern(n, pattern.as_deref()))
+                    .map(|name| D::function(function_status(name)))
+                    .collect::<Vec<_>>();
+                build_record_batch(schema, &rows)
             }
             CatalogCommand::DropFunction {
                 function,
@@ -434,6 +454,33 @@ impl CatalogCommand {
                 build_record_batch(schema, &rows)
             }
         }
+    }
+}
+
+/// Distinct, sorted names of all functions available in the session
+/// (built-in + registered scalar / aggregate / window functions).
+fn session_function_names(ctx: &SessionContext) -> Vec<String> {
+    let state = ctx.state();
+    let mut names: Vec<String> = state
+        .scalar_functions()
+        .keys()
+        .chain(state.aggregate_functions().keys())
+        .chain(state.window_functions().keys())
+        .cloned()
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn function_status(name: String) -> FunctionStatus {
+    FunctionStatus {
+        catalog: None,
+        namespace: None,
+        description: None,
+        class_name: name.clone(),
+        name,
+        is_temporary: false,
     }
 }
 

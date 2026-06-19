@@ -12,7 +12,9 @@ use datafusion_expr::{TableScan, UNNAMED_TABLE};
 use kokedb_catalog::command::CatalogCommand;
 use kokedb_catalog::display::CatalogDisplay;
 use kokedb_catalog::manager::CatalogManager;
-use kokedb_catalog::provider::{DatabaseStatus, TableColumnStatus, TableKind, TableStatus};
+use kokedb_catalog::provider::{
+    DatabaseStatus, FunctionStatus, TableColumnStatus, TableKind, TableStatus,
+};
 use kokedb_catalog::utils::quote_names_if_needed;
 use kokedb_common_datafusion::extension::SessionExtensionAccessor;
 
@@ -220,6 +222,17 @@ impl CatalogDisplay for SparkCatalogDisplay {
             is_partition: status.is_partition,
             is_bucket: status.is_bucket,
             is_cluster: status.is_cluster,
+        }
+    }
+
+    fn function(status: FunctionStatus) -> Self::Function {
+        Self::Function {
+            name: status.name,
+            catalog: status.catalog,
+            namespace: status.namespace,
+            description: status.description,
+            class_name: status.class_name,
+            is_temporary: status.is_temporary,
         }
     }
 }
