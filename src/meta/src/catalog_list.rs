@@ -50,6 +50,23 @@ pub struct TableSyncPolicy {
     pub score: Option<f32>,
 }
 
+/// The inferred incremental strategy for a table (Phase 2 decision layer),
+/// stored alongside the cadence in `system.table_sync_policy`.
+#[derive(Debug, Clone)]
+pub struct TableIncPolicy {
+    pub inc_mode: String,
+    /// Lifecycle: none | suggested | active | rejected.
+    pub inc_status: String,
+    /// trusted | probation | audited.
+    pub inc_tier: String,
+    pub watermark_column: Option<String>,
+    /// Comma-separated primary key columns.
+    pub pk_columns: Option<String>,
+    pub source: String,
+    pub confidence: Option<f32>,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct PostgreSQLMetaCatalogProviderList {
     local_pool: PgPool,
@@ -199,6 +216,8 @@ impl PostgreSQLMetaCatalogProviderList {
                 inc_mode VARCHAR(16) NOT NULL DEFAULT 'full',
                 inc_status VARCHAR(16) NOT NULL DEFAULT 'none',
                 inc_tier VARCHAR(16) NOT NULL DEFAULT 'audited',
+                watermark_column VARCHAR(255),
+                pk_columns VARCHAR(1024),
                 source VARCHAR(16) NOT NULL DEFAULT 'rule',
                 confidence REAL,
                 reason TEXT,
@@ -591,6 +610,89 @@ impl PostgreSQLMetaCatalogProviderList {
                 (format!("{}.{}", schema_name, table_name), per_day as f32)
             })
             .collect())
+    }
+
+    /// Upserts the inferred incremental strategy for a table. The detected fields
+    /// (mode/watermark/pk/confidence/reason/source) always refresh, but the
+    /// lifecycle `inc_status` and `inc_tier` are only seeded while still `none` —
+    /// later re-inference must not clobber an `active`/`rejected`/in-validation
+    /// decision the state machine owns.
+    pub async fn upsert_table_inc_policy(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        inc: &TableIncPolicy,
+    ) -> Result<()> {
+        let sql = "INSERT INTO system.table_sync_policy \
+            (catalog, schema_name, table_name, inc_mode, inc_status, inc_tier, \
+             watermark_column, pk_columns, source, confidence, reason, updated_at) \
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP) \
+            ON CONFLICT (catalog, schema_name, table_name) DO UPDATE SET \
+                inc_mode = EXCLUDED.inc_mode, \
+                watermark_column = EXCLUDED.watermark_column, \
+                pk_columns = EXCLUDED.pk_columns, \
+                source = EXCLUDED.source, \
+                confidence = EXCLUDED.confidence, \
+                reason = EXCLUDED.reason, \
+                inc_status = CASE WHEN system.table_sync_policy.inc_status = 'none' \
+                                  THEN EXCLUDED.inc_status \
+                                  ELSE system.table_sync_policy.inc_status END, \
+                inc_tier = CASE WHEN system.table_sync_policy.inc_status = 'none' \
+                                THEN EXCLUDED.inc_tier \
+                                ELSE system.table_sync_policy.inc_tier END, \
+                updated_at = CURRENT_TIMESTAMP;";
+
+        sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(&inc.inc_mode)
+            .bind(&inc.inc_status)
+            .bind(&inc.inc_tier)
+            .bind(&inc.watermark_column)
+            .bind(&inc.pk_columns)
+            .bind(&inc.source)
+            .bind(inc.confidence)
+            .bind(&inc.reason)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(())
+    }
+
+    /// Reads the inferred incremental strategy for a table, if one exists.
+    pub async fn get_table_inc_policy(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<TableIncPolicy>> {
+        let sql = "SELECT inc_mode, inc_status, inc_tier, watermark_column, pk_columns, \
+            source, confidence, reason FROM system.table_sync_policy \
+            WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
+
+        let row = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(row.map(|row| TableIncPolicy {
+            inc_mode: row.try_get("inc_mode").unwrap_or_else(|_| "full".to_string()),
+            inc_status: row.try_get("inc_status").unwrap_or_else(|_| "none".to_string()),
+            inc_tier: row
+                .try_get("inc_tier")
+                .unwrap_or_else(|_| "audited".to_string()),
+            watermark_column: row.try_get("watermark_column").ok(),
+            pk_columns: row.try_get("pk_columns").ok(),
+            source: row.try_get("source").unwrap_or_else(|_| "rule".to_string()),
+            confidence: row.try_get("confidence").ok(),
+            reason: row.try_get("reason").ok(),
+        }))
     }
 
     /// Returns `(catalog_name, db_type, cache_policy)` for every registered

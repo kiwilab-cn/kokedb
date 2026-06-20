@@ -115,6 +115,15 @@ score = w_a*freshness_value + w_u*update_pressure - w_c*cost
 
 ## 3. Phase 2：增量推断 + 安全闸门
 
+> **实现状态（2a 已落地，2c 待做）**：推断引擎 `incremental_infer.rs`（`gather_facts`+纯
+> `classify`，9 个单测）+ 分层（trusted/probation/audited）+ 落库（`table_sync_policy` 的
+> `inc_*`/watermark/pk，upsert 保留状态机不被重评估清掉）+ `plan_sync` 消费策略 已实现。
+> **安全分级落地策略**：`active`(仅 trusted=DB-enforced) 用存的策略走增量；`rejected` 强制全量；
+> 其余（none/suggested）保持**旧的 live-detection 行为**——因此常规 `PK+updated_at` 不回归，
+> 而新的高风险推断（APPEND、非常规时间戳列）legacy 探测返回 None → 仍走全量，**不会在未校验前
+> 自动启用**。§3.2 的影子校验 + sweeper（**2c**）落地后，再把 probation/audited 从"等校验"推进到
+> active，并收紧 legacy 回退。
+
 ### 3.1 放宽 watermark 检测（规则）
 `detect_watermark_column` 升级为 `infer_incremental_strategy`：
 1. **UPSERT**：有 PK + 任一 `timestamp/timestamptz` 列。多候选时排序：候选名命中 > `pg_stats` 单调相关性高（`correlation`≈1）> NOT NULL > 有索引。

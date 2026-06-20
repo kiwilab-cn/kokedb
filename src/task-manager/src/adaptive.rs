@@ -8,12 +8,16 @@
 use std::sync::Arc;
 
 use kokedb_common::cache_policy::CachePolicy;
-use kokedb_meta::catalog_list::{PostgreSQLMetaCatalogProviderList, TableSyncPolicy};
+use kokedb_common::env::get_env_as;
+use kokedb_meta::catalog_list::{
+    PostgreSQLMetaCatalogProviderList, TableIncPolicy, TableSyncPolicy,
+};
 use log::{info, warn};
 use sqlx::postgres::PgPool;
 
 use crate::cache_sync_task::{refresh_single_table, select_tables_for_policy};
 use crate::error::TaskError;
+use crate::incremental_infer::infer_strategy;
 use crate::table_signals::{bucket, collect_remote_signals, score, ScoreWeights};
 use crate::task_manager::TaskManager;
 
@@ -78,6 +82,34 @@ pub async fn reevaluate_catalog(
             warn!("Failed to persist policy for {catalog}.{table}: {e}");
         } else {
             updated += 1;
+        }
+
+        // Infer the incremental strategy and persist it. The upsert preserves any
+        // existing lifecycle status, so a trusted strategy activates immediately
+        // while probation/audited ones wait for validation (Phase 2c).
+        if get_env_as("KOKEDB_INFER_INCREMENTAL", true) {
+            match infer_strategy(&pool, table).await {
+                Ok(s) => {
+                    let inc = TableIncPolicy {
+                        inc_mode: s.mode.as_str().to_string(),
+                        inc_status: s.tier.initial_status().to_string(),
+                        inc_tier: s.tier.as_str().to_string(),
+                        watermark_column: s.watermark_column.clone(),
+                        pk_columns: (!s.pk_columns.is_empty())
+                            .then(|| s.pk_columns.join(",")),
+                        source: "rule".to_string(),
+                        confidence: Some(s.confidence_pct as f32 / 100.0),
+                        reason: Some(s.reason.clone()),
+                    };
+                    if let Err(e) = meta
+                        .upsert_table_inc_policy(catalog, &schema, &tbl, &inc)
+                        .await
+                    {
+                        warn!("Failed to persist inc policy for {catalog}.{table}: {e}");
+                    }
+                }
+                Err(e) => warn!("Incremental inference failed for {catalog}.{table}: {e}"),
+            }
         }
     }
     pool.close().await;

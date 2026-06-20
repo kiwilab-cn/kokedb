@@ -403,6 +403,32 @@ async fn plan_sync(
     let pk_columns = incremental::detect_primary_keys(&pool, source_table).await?;
     let watermark_column = incremental::detect_watermark_column(&pool, source_table).await?;
 
+    // Phase 2: an explicit inferred policy overrides live detection. An `active`
+    // strategy supplies the watermark/pk to use; a `rejected` one (validation
+    // found incremental unsafe) forces full. Otherwise (no policy yet, or still
+    // `suggested`) we keep the legacy live-detection behavior — no regression.
+    let inc_policy = meta
+        .get_table_inc_policy(catalog, schema, table)
+        .await
+        .ok()
+        .flatten();
+    let (pk_columns, watermark_column, policy_forces_full) = match &inc_policy {
+        Some(p)
+            if p.inc_status == "active" && matches!(p.inc_mode.as_str(), "upsert" | "append") =>
+        {
+            let pk = p
+                .pk_columns
+                .as_ref()
+                .map(|s| s.split(',').map(|x| x.to_string()).collect::<Vec<_>>())
+                .filter(|v| !v.is_empty())
+                .unwrap_or(pk_columns);
+            let wm = p.watermark_column.clone().or(watermark_column);
+            (pk, wm, false)
+        }
+        Some(p) if p.inc_status == "rejected" => (pk_columns, watermark_column, true),
+        _ => (pk_columns, watermark_column, false),
+    };
+
     let sync_state = meta
         .get_table_sync_state(catalog, schema, table)
         .await
@@ -423,7 +449,8 @@ async fn plan_sync(
         && watermark_column.is_some()
         && !old_path.is_empty()
         && sync_state.last_watermark.is_some()
-        && !force_full;
+        && !force_full
+        && !policy_forces_full;
 
     if !can_incremental {
         pool.close().await;
