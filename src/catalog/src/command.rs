@@ -11,6 +11,7 @@ use serde_arrow::to_arrow;
 
 use crate::display::{
     CachePolicyDisplay, CatalogDisplay, EmptyDisplay, RefreshCacheDisplay, SingleValueDisplay,
+    TableMetadataDisplay,
 };
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
@@ -40,6 +41,9 @@ pub enum CatalogCommand {
     },
     ListCachePolicies,
     RefreshCache {
+        table: Vec<String>,
+    },
+    ShowTableMetadata {
         table: Vec<String>,
     },
     CurrentDatabase,
@@ -149,6 +153,7 @@ impl CatalogCommand {
             CatalogCommand::DropCatalog { .. } => "DropCatalog",
             CatalogCommand::ListCachePolicies => "ListCachePolicies",
             CatalogCommand::RefreshCache { .. } => "RefreshCache",
+            CatalogCommand::ShowTableMetadata { .. } => "ShowTableMetadata",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
@@ -187,6 +192,9 @@ impl CatalogCommand {
             }
             CatalogCommand::RefreshCache { .. } => {
                 Vec::<FieldRef>::from_type::<RefreshCacheDisplay>(TracingOptions::default())
+            }
+            CatalogCommand::ShowTableMetadata { .. } => {
+                Vec::<FieldRef>::from_type::<TableMetadataDisplay>(TracingOptions::default())
             }
             CatalogCommand::GetDatabase { .. } | CatalogCommand::ListDatabases { .. } => {
                 Vec::<FieldRef>::from_type::<D::Database>(TracingOptions::default())
@@ -273,6 +281,10 @@ impl CatalogCommand {
             }
             CatalogCommand::RefreshCache { table } => {
                 let row = manager.refresh_table(table).await?;
+                build_record_batch(schema, &[row])
+            }
+            CatalogCommand::ShowTableMetadata { table } => {
+                let row = manager.show_table_metadata(table).await?;
                 build_record_batch(schema, &[row])
             }
             CatalogCommand::DropCatalog { catalog, if_exists } => {

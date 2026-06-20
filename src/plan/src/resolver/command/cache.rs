@@ -18,4 +18,13 @@ impl PlanResolver<'_> {
             table: table.into(),
         })
     }
+
+    pub(in super::super) fn resolve_show_table_metadata(
+        &self,
+        table: spec::ObjectName,
+    ) -> PlanResult<LogicalPlan> {
+        self.resolve_catalog_command(CatalogCommand::ShowTableMetadata {
+            table: table.into(),
+        })
+    }
 }

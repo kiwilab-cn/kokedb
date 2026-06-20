@@ -299,6 +299,7 @@ impl PlanResolver<'_> {
             }
             CommandNode::ListCachePolicies => self.resolve_cache_show_policies(),
             CommandNode::RefreshCache { table } => self.resolve_cache_refresh(table),
+            CommandNode::ShowTableMetadata { table } => self.resolve_show_table_metadata(table),
         }
     }
 

@@ -13,7 +13,8 @@ use crate::ast::keywords::{
     Delimited, Desc, Describe, Directory, Distributed, Drop, Escaped, Evolution, Exists, Explain,
     Extended, External, Fields, Fileformat, First, For, Format, Formatted, From, Function,
     Functions, Generated, Global, If, In, Inpath, Inputformat, Insert, Into, Is, Items, Keys, Lazy,
-    Like, Lines, Load, Local, Location, Map, Matched, Merge, Name, Noscan, Not, Null, On, Options,
+    Like, Lines, Load, Local, Location, Map, Matched, Merge, Metadata, Name, Noscan, Not, Null, On,
+    Options,
     Or, Outputformat, Overwrite, Partition, Partitioned, Partitions, Policies, Properties, Purge,
     Recover, Refresh, Rename, Replace, Restrict, Row, Schema, Schemas, Serde, Serdeproperties, Set,
     Show, Sorted, Source, Statistics, Stored, Table, Tables, Target, Tblproperties, Temp,
@@ -371,6 +372,13 @@ pub enum Statement {
         cache: Cache,
         from: From,
         table: Table,
+        name: ObjectName,
+    },
+    ShowTableMetadata {
+        show: Show,
+        table: Table,
+        metadata: Metadata,
+        from: From,
         name: ObjectName,
     },
 }
