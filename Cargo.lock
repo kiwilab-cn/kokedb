@@ -3385,6 +3385,7 @@ dependencies = [
 name = "kokedb-query"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "async-trait",
  "dashmap",
  "datafusion",
@@ -3405,6 +3406,7 @@ dependencies = [
  "kokedb-task-manager",
  "log",
  "serde_json",
+ "sqlx",
  "thiserror 2.0.16",
  "tokio",
  "tokio-cron-scheduler",

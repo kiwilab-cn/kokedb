@@ -1,0 +1,236 @@
+//! End-to-end integration test for the intelligent-sync stack, driving the exact
+//! server path (init_shared_services -> create_session_context -> parser ->
+//! query) in-process against a live PostgreSQL. Realistic scenario: an
+//! e-commerce catalog with an updatable orders table (DB-enforced watermark),
+//! an append-only events log (identity PK), and a small keyless dimension.
+//!
+//! Run with a live DB (see Makefile `integration-test`):
+//!   KOKEDB_TEST_DSN=...   (source) and PG_META_DSN=...  (meta)
+//!   cargo test -p kokedb-query --test e2e_intelligent_sync -- --ignored --test-threads=1
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arrow::array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
+use kokedb_cache::foyer_hybrid::LruResultCache;
+use kokedb_common::hash::get_plan_hash;
+use kokedb_query::binder::{parser, query};
+use kokedb_query::context::{create_session_context, init_shared_services, SharedServices};
+use sqlx::postgres::PgPool;
+use sqlx::Row;
+
+fn source_dsn() -> String {
+    std::env::var("KOKEDB_TEST_DSN")
+        .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".into())
+}
+
+fn meta_dsn() -> String {
+    std::env::var("PG_META_DSN")
+        .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/kokedb".into())
+}
+
+/// Runs a SQL statement through the full server pipeline and collects all rows.
+async fn run(shared: &SharedServices, sql: &str) -> Vec<RecordBatch> {
+    use futures::TryStreamExt;
+    let ctx = Arc::new(create_session_context(shared).expect("session ctx"));
+    let plan = parser(sql).unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
+    let key = get_plan_hash(&plan).unwrap();
+    let stream = query(ctx, &plan, key)
+        .await
+        .unwrap_or_else(|e| panic!("exec `{sql}`: {e}"));
+    stream.try_collect().await.expect("collect")
+}
+
+fn scalar_count(batches: &[RecordBatch]) -> i64 {
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("int64 count")
+        .value(0)
+}
+
+/// Reads a string column from the single-row `SHOW TABLE METADATA` result.
+fn meta_str(batches: &[RecordBatch], col: &str) -> String {
+    let b = &batches[0];
+    let idx = b.schema().index_of(col).unwrap_or_else(|_| panic!("no col {col}"));
+    let arr: &dyn Array = b.column(idx);
+    if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+        a.value(0).to_string()
+    } else if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
+        a.value(0).to_string()
+    } else if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
+        a.value(0).to_string()
+    } else {
+        panic!("col {col} is not a string array: {:?}", arr.data_type())
+    }
+}
+
+async fn seed_source(pool: &PgPool) {
+    for stmt in [
+        "DROP TABLE IF EXISTS e2e_orders, e2e_events, e2e_dim CASCADE",
+        "DROP FUNCTION IF EXISTS e2e_touch() CASCADE",
+        // Updatable table with a DB-enforced watermark (DEFAULT now() + trigger).
+        "CREATE TABLE e2e_orders (id int PRIMARY KEY, amount numeric, status text, \
+         updated_at timestamptz NOT NULL DEFAULT now())",
+        "CREATE FUNCTION e2e_touch() RETURNS trigger AS $$ \
+         BEGIN NEW.updated_at = now(); RETURN NEW; END; $$ LANGUAGE plpgsql",
+        "CREATE TRIGGER e2e_orders_touch BEFORE UPDATE ON e2e_orders \
+         FOR EACH ROW EXECUTE FUNCTION e2e_touch()",
+        "INSERT INTO e2e_orders(id, amount, status) \
+         SELECT g, (g*1.5)::numeric, 'new' FROM generate_series(1, 300) g",
+        // Append-only log with an identity PK and no timestamp -> APPEND.
+        "CREATE TABLE e2e_events (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+         kind text, payload text)",
+        "INSERT INTO e2e_events(kind, payload) SELECT 'click', 'p' FROM generate_series(1, 150)",
+        // Small keyless dimension -> full refresh.
+        "CREATE TABLE e2e_dim (code text, name text)",
+        "INSERT INTO e2e_dim(code, name) VALUES ('US','United States'),('CN','China'),('JP','Japan')",
+        "ANALYZE e2e_orders",
+        "ANALYZE e2e_events",
+    ] {
+        sqlx::query(stmt).execute(pool).await.unwrap();
+    }
+}
+
+async fn clean_meta(pool: &PgPool, catalog: &str) {
+    for sql in [
+        "DELETE FROM system.catalog WHERE name = $1",
+        "DELETE FROM system.table_sync_policy WHERE catalog = $1",
+        "DELETE FROM system.table_sync_state WHERE catalog = $1",
+        "DELETE FROM system.table_arrow_schema WHERE catalog_name = $1",
+    ] {
+        let _ = sqlx::query(sql).bind(catalog).execute(pool).await;
+    }
+}
+
+/// Polls until `table` has a committed snapshot (sync completed) or times out.
+async fn wait_until_cached(meta: &PgPool, catalog: &str, table: &str, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        let row = sqlx::query(
+            "SELECT local_path FROM system.table_arrow_schema \
+             WHERE catalog_name = $1 AND table_name = $2",
+        )
+        .bind(catalog)
+        .bind(table)
+        .fetch_optional(meta)
+        .await
+        .ok()
+        .flatten();
+        if let Some(r) = row {
+            let p: Option<String> = r.try_get("local_path").ok();
+            if p.map(|s| !s.is_empty()).unwrap_or(false) {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL; run via KOKEDB_TEST_DSN + PG_META_DSN"]
+async fn intelligent_sync_end_to_end() {
+    let catalog = "e2e_shop";
+    std::env::set_var("PG_META_DSN", meta_dsn());
+    // Keep the scheduler quiet during the short test window; we rely on the
+    // synchronous initial sync + reeval that CREATE CATALOG performs.
+    std::env::set_var("KOKEDB_REEVALUATE_INTERVAL_MIN", "60");
+
+    let source = PgPool::connect(&source_dsn()).await.unwrap();
+    let meta = PgPool::connect(&meta_dsn()).await.unwrap();
+    seed_source(&source).await;
+    clean_meta(&meta, catalog).await;
+
+    let result_cache = LruResultCache::new(2000, 40000).await.unwrap();
+    let shared = init_shared_services(result_cache).await.unwrap();
+
+    // 1. Create the catalog (triggers initial sync + adaptive reeval + inference).
+    let create = format!(
+        "CREATE CATALOG {catalog} USING '{}' WITH properties(cache_policy=\"select\", \
+         table_set=\"public.e2e_orders,public.e2e_events,public.e2e_dim\")",
+        source_dsn()
+    );
+    run(&shared, &create).await;
+
+    // 2. Wait for the snapshots to land, then verify queries return correct data.
+    assert!(
+        wait_until_cached(&meta, catalog, "e2e_orders", Duration::from_secs(60)).await,
+        "e2e_orders was not cached in time"
+    );
+    wait_until_cached(&meta, catalog, "e2e_events", Duration::from_secs(30)).await;
+    wait_until_cached(&meta, catalog, "e2e_dim", Duration::from_secs(30)).await;
+
+    let orders = run(&shared, &format!("SELECT count(*) FROM {catalog}.public.e2e_orders")).await;
+    assert_eq!(scalar_count(&orders), 300, "orders count");
+    let events = run(&shared, &format!("SELECT count(*) FROM {catalog}.public.e2e_events")).await;
+    assert_eq!(scalar_count(&events), 150, "events count");
+    let dim = run(&shared, &format!("SELECT count(*) FROM {catalog}.public.e2e_dim")).await;
+    assert_eq!(scalar_count(&dim), 3, "dim count");
+
+    // A filtered aggregate (exercises the resolver + read path end to end).
+    let filtered = run(
+        &shared,
+        &format!("SELECT count(*) FROM {catalog}.public.e2e_orders WHERE id <= 100"),
+    )
+    .await;
+    assert_eq!(scalar_count(&filtered), 100, "filtered orders");
+
+    // 3. Inference populated the metadata correctly.
+    let md_orders = run(&shared, &format!("SHOW TABLE METADATA FROM {catalog}.public.e2e_orders")).await;
+    assert_eq!(meta_str(&md_orders, "inc_mode"), "upsert", "orders -> upsert");
+    assert_eq!(meta_str(&md_orders, "inc_tier"), "trusted", "DB-enforced -> trusted");
+    assert_eq!(meta_str(&md_orders, "watermark_column"), "updated_at");
+
+    let md_events = run(&shared, &format!("SHOW TABLE METADATA FROM {catalog}.public.e2e_events")).await;
+    assert_eq!(meta_str(&md_events, "inc_mode"), "append", "events -> append");
+
+    let md_dim = run(&shared, &format!("SHOW TABLE METADATA FROM {catalog}.public.e2e_dim")).await;
+    assert_eq!(meta_str(&md_dim, "inc_mode"), "full", "keyless dim -> full");
+
+    // 4. User override is honored and sticky.
+    run(
+        &shared,
+        &format!("ALTER TABLE {catalog}.public.e2e_orders SET CACHE POLICY WITH (inc_mode = 'full')"),
+    )
+    .await;
+    let md_after = run(&shared, &format!("SHOW TABLE METADATA FROM {catalog}.public.e2e_orders")).await;
+    assert_eq!(meta_str(&md_after, "inc_mode"), "full", "override applied");
+    assert_eq!(meta_str(&md_after, "source"), "user", "override source");
+
+    // 5. Manual refresh returns a queued task and re-syncs new data.
+    sqlx::query("INSERT INTO e2e_orders(id, amount, status) \
+                 SELECT g, (g*1.5)::numeric, 'new' FROM generate_series(301, 350) g")
+        .execute(&source)
+        .await
+        .unwrap();
+    let refresh = run(
+        &shared,
+        &format!("REFRESH CACHE FROM TABLE {catalog}.public.e2e_orders"),
+    )
+    .await;
+    assert_eq!(meta_str(&refresh, "status"), "QUEUED", "refresh queued");
+
+    // The re-sync runs in the background; poll until the cached count catches up.
+    let mut updated = false;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        let c = run(&shared, &format!("SELECT count(*) FROM {catalog}.public.e2e_orders")).await;
+        if scalar_count(&c) == 350 {
+            updated = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(updated, "manual refresh did not pick up the 50 new orders");
+
+    // Cleanup.
+    clean_meta(&meta, catalog).await;
+    for stmt in [
+        "DROP TABLE IF EXISTS e2e_orders, e2e_events, e2e_dim CASCADE",
+        "DROP FUNCTION IF EXISTS e2e_touch() CASCADE",
+    ] {
+        let _ = sqlx::query(stmt).execute(&source).await;
+    }
+}
