@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
@@ -33,6 +34,39 @@ pub struct TableSyncState {
     pub sync_mode: String,
     /// Number of consecutive incremental runs since the last full refresh.
     pub incremental_runs: i32,
+}
+
+/// Per-table sync *decision* (how to sync and how often). Phase 1 populates the
+/// `refresh_*` cadence and the observed signal snapshot; the `inc_*` fields are
+/// reserved for the incremental-inference phases.
+#[derive(Debug, Clone)]
+pub struct TableSyncPolicy {
+    pub refresh_bucket: String,
+    pub refresh_interval_sec: i32,
+    pub est_row_count: Option<i64>,
+    pub est_size_bytes: Option<i64>,
+    pub churn_per_hour: Option<f32>,
+    pub access_per_day: Option<f32>,
+    pub score: Option<f32>,
+}
+
+/// The inferred incremental strategy for a table (Phase 2 decision layer),
+/// stored alongside the cadence in `system.table_sync_policy`.
+#[derive(Debug, Clone)]
+pub struct TableIncPolicy {
+    pub inc_mode: String,
+    /// Lifecycle: none | suggested | active | rejected.
+    pub inc_status: String,
+    /// trusted | probation | audited.
+    pub inc_tier: String,
+    pub watermark_column: Option<String>,
+    /// Comma-separated primary key columns.
+    pub pk_columns: Option<String>,
+    pub source: String,
+    pub confidence: Option<f32>,
+    pub reason: Option<String>,
+    pub audit_passes: i32,
+    pub divergence_count: i32,
 }
 
 #[derive(Debug)]
@@ -162,6 +196,37 @@ impl PostgreSQLMetaCatalogProviderList {
                 sync_mode VARCHAR(16) NOT NULL DEFAULT 'full',
                 incremental_runs INTEGER NOT NULL DEFAULT 0,
                 last_sync_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (catalog, schema_name, table_name)
+            );
+            "#,
+            // Per-table sync policy: the *decision* layer (how to sync + how
+            // often), separate from table_sync_state (the runtime cursor).
+            // Phase 1 uses the refresh_* + signal columns; the inc_*/audit
+            // columns are reserved for the incremental-inference phases.
+            r#"
+            CREATE TABLE IF NOT EXISTS system.table_sync_policy (
+                catalog VARCHAR(255) NOT NULL,
+                schema_name VARCHAR(255) NOT NULL,
+                table_name VARCHAR(255) NOT NULL,
+                refresh_bucket VARCHAR(16) NOT NULL DEFAULT 'normal',
+                refresh_interval_sec INTEGER NOT NULL DEFAULT 900,
+                est_row_count BIGINT,
+                est_size_bytes BIGINT,
+                churn_per_hour REAL,
+                access_per_day REAL,
+                score REAL,
+                inc_mode VARCHAR(16) NOT NULL DEFAULT 'full',
+                inc_status VARCHAR(16) NOT NULL DEFAULT 'none',
+                inc_tier VARCHAR(16) NOT NULL DEFAULT 'audited',
+                watermark_column VARCHAR(255),
+                pk_columns VARCHAR(1024),
+                source VARCHAR(16) NOT NULL DEFAULT 'rule',
+                confidence REAL,
+                reason TEXT,
+                next_audit_at TIMESTAMPTZ,
+                audit_passes INTEGER NOT NULL DEFAULT 0,
+                divergence_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (catalog, schema_name, table_name)
             );
             "#,
@@ -446,6 +511,251 @@ impl PostgreSQLMetaCatalogProviderList {
             .bind(&state.last_watermark)
             .bind(&state.sync_mode)
             .bind(state.incremental_runs)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(())
+    }
+
+    /// Upserts the adaptive refresh policy for a table (Phase 1: cadence +
+    /// observed signal snapshot). Preserves the `inc_*` columns' defaults/values.
+    pub async fn upsert_table_sync_policy(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        policy: &TableSyncPolicy,
+    ) -> Result<()> {
+        let sql = "INSERT INTO system.table_sync_policy \
+            (catalog, schema_name, table_name, refresh_bucket, refresh_interval_sec, \
+             est_row_count, est_size_bytes, churn_per_hour, access_per_day, score, updated_at) \
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP) \
+            ON CONFLICT (catalog, schema_name, table_name) DO UPDATE SET \
+                refresh_bucket = EXCLUDED.refresh_bucket, \
+                refresh_interval_sec = EXCLUDED.refresh_interval_sec, \
+                est_row_count = EXCLUDED.est_row_count, \
+                est_size_bytes = EXCLUDED.est_size_bytes, \
+                churn_per_hour = EXCLUDED.churn_per_hour, \
+                access_per_day = EXCLUDED.access_per_day, \
+                score = EXCLUDED.score, \
+                updated_at = CURRENT_TIMESTAMP;";
+
+        sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(&policy.refresh_bucket)
+            .bind(policy.refresh_interval_sec)
+            .bind(policy.est_row_count)
+            .bind(policy.est_size_bytes)
+            .bind(policy.churn_per_hour)
+            .bind(policy.access_per_day)
+            .bind(policy.score)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(())
+    }
+
+    /// Returns the `schema.table` names in `catalog` whose adaptive refresh
+    /// interval has elapsed (or that have never been synced). Drives the
+    /// per-catalog refresh tick.
+    pub async fn get_due_refresh_tables(&self, catalog: &str) -> Result<Vec<String>> {
+        let sql = "SELECT p.schema_name, p.table_name \
+            FROM system.table_sync_policy p \
+            LEFT JOIN system.table_sync_state s \
+              ON p.catalog = s.catalog AND p.schema_name = s.schema_name \
+             AND p.table_name = s.table_name \
+            WHERE p.catalog = $1 \
+              AND (s.last_sync_at IS NULL \
+                   OR s.last_sync_at + (p.refresh_interval_sec || ' seconds')::interval \
+                      <= CURRENT_TIMESTAMP) \
+            ORDER BY p.schema_name, p.table_name;";
+
+        let rows = sqlx::query(sql)
+            .bind(catalog)
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let schema_name: String = row.get("schema_name");
+                let table_name: String = row.get("table_name");
+                format!("{}.{}", schema_name, table_name)
+            })
+            .collect())
+    }
+
+    /// Per-table query counts over the last 7 days as queries/day, keyed by
+    /// `schema.table`. Feeds the "access heat" signal for adaptive scheduling.
+    pub async fn get_access_per_day(&self, catalog: &str) -> Result<HashMap<String, f32>> {
+        let seven_days_ago = Local::now() - Duration::days(7);
+        let sql = "SELECT schema_name, table_name, SUM(query_count)::float8 / 7.0 AS per_day \
+            FROM system.query_table_daily_stats \
+            WHERE catalog = $1 AND stat_date >= $2 \
+            GROUP BY schema_name, table_name;";
+
+        let rows = sqlx::query(sql)
+            .bind(catalog)
+            .bind(seven_days_ago.date_naive())
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let schema_name: String = row.get("schema_name");
+                let table_name: String = row.get("table_name");
+                let per_day: f64 = row.try_get("per_day").unwrap_or(0.0);
+                (format!("{}.{}", schema_name, table_name), per_day as f32)
+            })
+            .collect())
+    }
+
+    /// Upserts the inferred incremental strategy for a table. The detected fields
+    /// (mode/watermark/pk/confidence/reason/source) always refresh, but the
+    /// lifecycle `inc_status` and `inc_tier` are only seeded while still `none` —
+    /// later re-inference must not clobber an `active`/`rejected`/in-validation
+    /// decision the state machine owns.
+    pub async fn upsert_table_inc_policy(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        inc: &TableIncPolicy,
+    ) -> Result<()> {
+        let sql = "INSERT INTO system.table_sync_policy \
+            (catalog, schema_name, table_name, inc_mode, inc_status, inc_tier, \
+             watermark_column, pk_columns, source, confidence, reason, updated_at) \
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP) \
+            ON CONFLICT (catalog, schema_name, table_name) DO UPDATE SET \
+                inc_mode = EXCLUDED.inc_mode, \
+                watermark_column = EXCLUDED.watermark_column, \
+                pk_columns = EXCLUDED.pk_columns, \
+                source = EXCLUDED.source, \
+                confidence = EXCLUDED.confidence, \
+                reason = EXCLUDED.reason, \
+                inc_status = CASE WHEN system.table_sync_policy.inc_status = 'none' \
+                                  THEN EXCLUDED.inc_status \
+                                  ELSE system.table_sync_policy.inc_status END, \
+                inc_tier = CASE WHEN system.table_sync_policy.inc_status = 'none' \
+                                THEN EXCLUDED.inc_tier \
+                                ELSE system.table_sync_policy.inc_tier END, \
+                updated_at = CURRENT_TIMESTAMP;";
+
+        sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(&inc.inc_mode)
+            .bind(&inc.inc_status)
+            .bind(&inc.inc_tier)
+            .bind(&inc.watermark_column)
+            .bind(&inc.pk_columns)
+            .bind(&inc.source)
+            .bind(inc.confidence)
+            .bind(&inc.reason)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(())
+    }
+
+    /// Reads the inferred incremental strategy for a table, if one exists.
+    pub async fn get_table_inc_policy(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<TableIncPolicy>> {
+        let sql = "SELECT inc_mode, inc_status, inc_tier, watermark_column, pk_columns, \
+            source, confidence, reason, audit_passes, divergence_count \
+            FROM system.table_sync_policy \
+            WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
+
+        let row = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(row.map(|row| TableIncPolicy {
+            inc_mode: row.try_get("inc_mode").unwrap_or_else(|_| "full".to_string()),
+            inc_status: row.try_get("inc_status").unwrap_or_else(|_| "none".to_string()),
+            inc_tier: row
+                .try_get("inc_tier")
+                .unwrap_or_else(|_| "audited".to_string()),
+            watermark_column: row.try_get("watermark_column").ok(),
+            pk_columns: row.try_get("pk_columns").ok(),
+            source: row.try_get("source").unwrap_or_else(|_| "rule".to_string()),
+            confidence: row.try_get("confidence").ok(),
+            reason: row.try_get("reason").ok(),
+            audit_passes: row.try_get("audit_passes").unwrap_or(0),
+            divergence_count: row.try_get("divergence_count").unwrap_or(0),
+        }))
+    }
+
+    /// Returns `schema.table` names whose shadow audit is due: an inferred,
+    /// not-yet-rejected strategy whose `next_audit_at` has passed (or was never
+    /// scheduled — a freshly `suggested` table audits as soon as possible).
+    pub async fn get_due_audit_tables(&self, catalog: &str) -> Result<Vec<String>> {
+        let sql = "SELECT schema_name, table_name FROM system.table_sync_policy \
+            WHERE catalog = $1 \
+              AND inc_mode <> 'full' AND inc_status IN ('suggested', 'active') \
+              AND (next_audit_at IS NULL OR next_audit_at <= CURRENT_TIMESTAMP) \
+            ORDER BY schema_name, table_name;";
+
+        let rows = sqlx::query(sql)
+            .bind(catalog)
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let schema_name: String = row.get("schema_name");
+                let table_name: String = row.get("table_name");
+                format!("{}.{}", schema_name, table_name)
+            })
+            .collect())
+    }
+
+    /// Persists the result of one shadow audit: the new lifecycle status,
+    /// pass/divergence counters, and when to audit next (`None` = stop).
+    pub async fn update_audit_result(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        status: &str,
+        passes: i32,
+        divergence: i32,
+        next_audit_secs: Option<i64>,
+    ) -> Result<()> {
+        let sql = "UPDATE system.table_sync_policy SET \
+                inc_status = $4, audit_passes = $5, divergence_count = $6, \
+                next_audit_at = CASE WHEN $7::bigint IS NULL THEN NULL \
+                    ELSE CURRENT_TIMESTAMP + ($7::bigint || ' seconds')::interval END, \
+                updated_at = CURRENT_TIMESTAMP \
+            WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
+
+        sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(status)
+            .bind(passes)
+            .bind(divergence)
+            .bind(next_audit_secs)
             .execute(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -827,5 +1137,155 @@ impl CatalogProviderList for PostgreSQLMetaCatalogProviderList {
                 None
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    fn meta_dsn() -> String {
+        std::env::var("PG_META_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/kokedb".into())
+    }
+
+    // Verifies the table_sync_policy schema is created and that cadence + inc
+    // policy roundtrip, including that re-inference does NOT clobber a decided
+    // lifecycle status.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via PG_META_DSN"]
+    async fn sync_policy_roundtrip_and_status_preserved() {
+        let pool = PgPool::connect(&meta_dsn()).await.unwrap();
+        let meta = PostgreSQLMetaCatalogProviderList::from_pool(pool);
+        meta.init_db().await.unwrap();
+
+        let (cat, schema, table) = ("it_cat", "public", "it_policy");
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+
+        // Cadence upsert.
+        let cadence = TableSyncPolicy {
+            refresh_bucket: "fast".into(),
+            refresh_interval_sec: 120,
+            est_row_count: Some(1000),
+            est_size_bytes: Some(4096),
+            churn_per_hour: Some(10.0),
+            access_per_day: Some(5.0),
+            score: Some(3.5),
+        };
+        meta.upsert_table_sync_policy(cat, schema, table, &cadence)
+            .await
+            .unwrap();
+
+        // First inference: probation -> suggested.
+        let suggested = TableIncPolicy {
+            inc_mode: "upsert".into(),
+            inc_status: "suggested".into(),
+            inc_tier: "probation".into(),
+            watermark_column: Some("updated_at".into()),
+            pk_columns: Some("id".into()),
+            source: "rule".into(),
+            confidence: Some(0.75),
+            reason: Some("conventional watermark".into()),
+            audit_passes: 0,
+            divergence_count: 0,
+        };
+        meta.upsert_table_inc_policy(cat, schema, table, &suggested)
+            .await
+            .unwrap();
+
+        // Manually promote to active (simulating validation).
+        sqlx::query(
+            "UPDATE system.table_sync_policy SET inc_status='active' \
+             WHERE catalog=$1 AND schema_name=$2 AND table_name=$3",
+        )
+        .bind(cat)
+        .bind(schema)
+        .bind(table)
+        .execute(&meta.local_pool)
+        .await
+        .unwrap();
+
+        // Re-inference (e.g. next reeval) must NOT reset active -> suggested.
+        meta.upsert_table_inc_policy(cat, schema, table, &suggested)
+            .await
+            .unwrap();
+
+        let got = meta
+            .get_table_inc_policy(cat, schema, table)
+            .await
+            .unwrap()
+            .expect("policy row exists");
+        assert_eq!(got.inc_status, "active", "lifecycle must be preserved");
+        assert_eq!(got.inc_mode, "upsert");
+        assert_eq!(got.watermark_column.as_deref(), Some("updated_at"));
+        assert_eq!(got.pk_columns.as_deref(), Some("id"));
+
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+    }
+
+    // get_due_audit_tables should surface inferred (non-full, non-rejected)
+    // tables whose next_audit_at has passed; update_audit_result should persist
+    // the lifecycle + reschedule.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via PG_META_DSN"]
+    async fn audit_accessors_roundtrip() {
+        let pool = PgPool::connect(&meta_dsn()).await.unwrap();
+        let meta = PostgreSQLMetaCatalogProviderList::from_pool(pool);
+        meta.init_db().await.unwrap();
+        let cat = "it_audit";
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+
+        let inc = TableIncPolicy {
+            inc_mode: "upsert".into(),
+            inc_status: "suggested".into(),
+            inc_tier: "probation".into(),
+            watermark_column: Some("updated_at".into()),
+            pk_columns: Some("id".into()),
+            source: "rule".into(),
+            confidence: Some(0.7),
+            reason: None,
+            audit_passes: 0,
+            divergence_count: 0,
+        };
+        meta.upsert_table_inc_policy(cat, "public", "t1", &inc)
+            .await
+            .unwrap();
+
+        // Freshly suggested (next_audit_at NULL) is due.
+        let due = meta.get_due_audit_tables(cat).await.unwrap();
+        assert!(due.contains(&"public.t1".to_string()));
+
+        // Record a pass that reschedules far in the future -> no longer due.
+        meta.update_audit_result(cat, "public", "t1", "active", 2, 0, Some(86_400))
+            .await
+            .unwrap();
+        let due2 = meta.get_due_audit_tables(cat).await.unwrap();
+        assert!(!due2.contains(&"public.t1".to_string()), "rescheduled audit not due");
+
+        let got = meta
+            .get_table_inc_policy(cat, "public", "t1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.inc_status, "active");
+        assert_eq!(got.audit_passes, 2);
+
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
     }
 }

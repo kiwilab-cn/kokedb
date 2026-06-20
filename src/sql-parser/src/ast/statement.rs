@@ -366,6 +366,13 @@ pub enum Statement {
         cache: Cache,
         policies: Policies,
     },
+    RefreshCache {
+        refresh: Refresh,
+        cache: Cache,
+        from: From,
+        table: Table,
+        name: ObjectName,
+    },
 }
 
 #[derive(Debug, Clone, TreeParser)]

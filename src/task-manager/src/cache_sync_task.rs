@@ -46,6 +46,26 @@ pub async fn execute_catalog_sync_task(
     Ok(())
 }
 
+/// Enqueues a sync task for a single table and returns its task id. Backs the
+/// manual `REFRESH CACHE FROM TABLE` command. Whether the run is full or
+/// incremental is decided later by the runner from detected metadata and the
+/// persisted sync state, so a manual refresh reuses the same code path as the
+/// scheduled catalog sync.
+pub async fn refresh_single_table(
+    catalog: &str,
+    dsn: &str,
+    source_table: &str,
+    catalog_task_manager: Arc<TaskManager>,
+) -> Result<String, TaskError> {
+    let config = CacheTableTaskConfig::new(
+        catalog.to_string(),
+        dsn.to_string(),
+        source_table.to_string(),
+        source_table.to_string(),
+    );
+    catalog_task_manager.add_task(config).await
+}
+
 async fn add_table_sync_task(
     tables: Vec<String>,
     catalog: &str,
@@ -77,6 +97,40 @@ async fn create_smart_table_task(
     dsn: &str,
     catalog_task_manager: Arc<TaskManager>,
 ) -> Result<(), TaskError> {
+    let merged_tables = select_smart_tables(catalog, dsn).await?;
+    add_table_sync_task(merged_tables, catalog, dsn, catalog_task_manager).await
+}
+
+async fn create_all_table_task(
+    catalog: &str,
+    dsn: &str,
+    catalog_task_manager: Arc<TaskManager>,
+) -> Result<(), TaskError> {
+    let postgres_all_table = select_all_tables(catalog, dsn).await?;
+    add_table_sync_task(postgres_all_table, catalog, dsn, catalog_task_manager).await
+}
+
+async fn create_topk_table_task(
+    catalog: &str,
+    dsn: &str,
+    k: u32,
+    catalog_task_manager: Arc<TaskManager>,
+) -> Result<(), TaskError> {
+    let postgres_topk_table = select_topk_tables(dsn, k).await?;
+    add_table_sync_task(postgres_topk_table, catalog, dsn, catalog_task_manager).await
+}
+
+async fn create_select_table_task(
+    catalog: &str,
+    dsn: &str,
+    table_set: &str,
+    catalog_task_manager: Arc<TaskManager>,
+) -> Result<(), TaskError> {
+    let table_set = select_listed_tables(table_set)?;
+    add_table_sync_task(table_set, catalog, dsn, catalog_task_manager).await
+}
+
+async fn select_smart_tables(catalog: &str, dsn: &str) -> Result<Vec<String>, TaskError> {
     let meta_client = PostgreSQLMetaCatalogProviderList::new()
         .await
         .map_err(|x| {
@@ -94,21 +148,15 @@ async fn create_smart_table_task(
         })?;
 
     let postgres_topk_table = get_postgres_top_tables(dsn, 10).await?;
-    let merged_tables = postgres_topk_table
+    Ok(postgres_topk_table
         .into_iter()
         .chain(hot_tables)
         .collect::<HashSet<_>>()
         .into_iter()
-        .collect::<Vec<String>>();
-
-    add_table_sync_task(merged_tables, catalog, dsn, catalog_task_manager).await
+        .collect::<Vec<String>>())
 }
 
-async fn create_all_table_task(
-    catalog: &str,
-    dsn: &str,
-    catalog_task_manager: Arc<TaskManager>,
-) -> Result<(), TaskError> {
+async fn select_all_tables(catalog: &str, dsn: &str) -> Result<Vec<String>, TaskError> {
     let postgres_all_table = get_postgres_all_tables(dsn).await?;
     if postgres_all_table.len() > 100 {
         warn!(
@@ -118,40 +166,38 @@ async fn create_all_table_task(
             postgres_all_table.len()
         );
     }
-
-    add_table_sync_task(postgres_all_table, catalog, dsn, catalog_task_manager).await
+    Ok(postgres_all_table)
 }
 
-async fn create_topk_table_task(
-    catalog: &str,
-    dsn: &str,
-    k: u32,
-    catalog_task_manager: Arc<TaskManager>,
-) -> Result<(), TaskError> {
+async fn select_topk_tables(dsn: &str, k: u32) -> Result<Vec<String>, TaskError> {
     if k == 0 {
         return Err(TaskError::InvalideTaskArgment(
             "The k must be large than 0.".to_string(),
         ));
     }
-
-    let postgres_topk_table = get_postgres_top_tables(dsn, k as usize).await?;
-
-    add_table_sync_task(postgres_topk_table, catalog, dsn, catalog_task_manager).await
+    get_postgres_top_tables(dsn, k as usize).await
 }
 
-async fn create_select_table_task(
-    catalog: &str,
-    dsn: &str,
-    table_set: &str,
-    catalog_task_manager: Arc<TaskManager>,
-) -> Result<(), TaskError> {
+fn select_listed_tables(table_set: &str) -> Result<Vec<String>, TaskError> {
     if table_set.is_empty() {
         return Err(TaskError::InvalideTaskArgment(
             "The table_set config in cache_policy must be unempty.".to_string(),
         ));
     }
+    Ok(table_set.split(',').map(|x| x.to_string()).collect())
+}
 
-    let table_set: Vec<String> = table_set.split(',').map(|x| x.to_string()).collect();
-
-    add_table_sync_task(table_set, catalog, dsn, catalog_task_manager).await
+/// Returns the `schema.table` names a cache policy selects, without enqueuing
+/// any sync. Used by the adaptive re-evaluator to learn the cached-table set.
+pub async fn select_tables_for_policy(
+    catalog: &str,
+    dsn: &str,
+    cache_policy: &CachePolicy,
+) -> Result<Vec<String>, TaskError> {
+    match cache_policy {
+        CachePolicy::TopK { k } => select_topk_tables(dsn, *k).await,
+        CachePolicy::All => select_all_tables(catalog, dsn).await,
+        CachePolicy::Select { table_set } => select_listed_tables(table_set),
+        CachePolicy::Smart => select_smart_tables(catalog, dsn).await,
+    }
 }

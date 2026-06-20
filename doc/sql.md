@@ -48,8 +48,25 @@ Cache the tables which are in the **table_set**.
 
 ## DML
 
+- REFRESH CACHE FROM TABLE
 
+Manually trigger a sync of a single cached table from its remote source. The
+table is resolved as `catalog.database.table` (a 2- or 1-part name falls back to
+the session's default catalog/database). The sync is enqueued asynchronously and
+the command returns immediately with the queued task id; whether the run is full
+or incremental is decided by the runner from the table's detected metadata and
+its persisted sync state.
 
+```sql
+REFRESH CACHE FROM TABLE demo.public.orders;
+```
+```
++--------------------+--------------------------------------+--------+
+| table              | task_id                              | status |
++--------------------+--------------------------------------+--------+
+| demo.public.orders | 3f2a...-...                          | QUEUED |
++--------------------+--------------------------------------+--------+
+```
 
 
 

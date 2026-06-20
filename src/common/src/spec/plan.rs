@@ -518,6 +518,9 @@ pub enum CommandNode {
         value: Option<String>,
     },
     ListCachePolicies,
+    RefreshCache {
+        table: ObjectName,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

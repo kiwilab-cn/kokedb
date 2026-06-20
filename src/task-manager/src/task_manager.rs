@@ -398,6 +398,20 @@ impl TaskManager {
         }
     }
 
+    /// Whether a sync task for `(catalog, source_table)` is currently pending,
+    /// queued, or running. Used by the adaptive tick to avoid stacking duplicate
+    /// refreshes when a sync runs longer than the tick interval.
+    pub fn has_inflight_table_task(&self, catalog: &str, source_table: &str) -> bool {
+        self.tasks.iter().any(|entry| {
+            let t = entry.value();
+            matches!(
+                t.status,
+                TaskStatus::Pending | TaskStatus::Queued | TaskStatus::Running
+            ) && t.config.catalog_name == catalog
+                && t.config.source_table == source_table
+        })
+    }
+
     pub async fn add_task(&self, config: CacheTableTaskConfig) -> Result<String, TaskError> {
         if self.is_shutting_down.load(Ordering::Relaxed) {
             return Err(TaskError::ExecutionFailed(
