@@ -303,6 +303,9 @@ impl PlanResolver<'_> {
             CommandNode::AlterTableCachePolicy { table, options } => {
                 self.resolve_alter_table_cache_policy(table, options)
             }
+            CommandNode::ShowCacheJobs { table, catalog } => {
+                self.resolve_show_cache_jobs(table, catalog)
+            }
         }
     }
 

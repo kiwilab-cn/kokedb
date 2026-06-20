@@ -10,7 +10,9 @@ use kokedb_task_manager::error::TaskError;
 use log::{error, info, warn};
 use tokio_cron_scheduler::Job;
 
-use crate::display::{CachePolicyDisplay, RefreshCacheDisplay, TableMetadataDisplay};
+use crate::display::{
+    CacheJobDisplay, CachePolicyDisplay, RefreshCacheDisplay, TableMetadataDisplay,
+};
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::provider::CreateCatalogOptions;
@@ -242,6 +244,64 @@ impl CatalogManager {
 
         info!("User set cache policy for {catalog}.{schema_name}.{table_name}: inc_mode={inc_mode}");
         Ok(())
+    }
+
+    /// Returns recent table-sync runs (`SHOW CACHE JOBS`), optionally scoped to a
+    /// `FROM TABLE catalog.db.table` or `FROM CATALOG name` filter.
+    pub async fn show_cache_jobs(
+        &self,
+        table: Option<Vec<String>>,
+        catalog: Option<String>,
+    ) -> CatalogResult<Vec<CacheJobDisplay>> {
+        // Resolve the filter: a table scope pins all three parts; a catalog scope
+        // pins just the catalog; otherwise everything (newest first).
+        let (cat, schema, tbl) = match (&table, &catalog) {
+            (Some(parts), _) => match parts.as_slice() {
+                [c, db, t] => (Some(c.clone()), Some(db.clone()), Some(t.clone())),
+                [db, t] => (
+                    Some(self.default_catalog()?.to_string()),
+                    Some(db.clone()),
+                    Some(t.clone()),
+                ),
+                [t] => (
+                    Some(self.default_catalog()?.to_string()),
+                    Some(self.default_database()?.head.to_string()),
+                    Some(t.clone()),
+                ),
+                _ => {
+                    return Err(CatalogError::InvalidArgument(
+                        "expected catalog.database.table".to_string(),
+                    ))
+                }
+            },
+            (None, Some(c)) => (Some(c.clone()), None, None),
+            (None, None) => (None, None, None),
+        };
+
+        let limit = get_env_as("KOKEDB_SHOW_JOBS_LIMIT", 50i64);
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let jobs = meta
+            .get_cache_jobs(cat.as_deref(), schema.as_deref(), tbl.as_deref(), limit)
+            .await
+            .map_err(|e| CatalogError::Internal(format!("Failed to read cache jobs: {e}")))?;
+
+        let fmt = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%d %H:%M:%S").to_string();
+        Ok(jobs
+            .into_iter()
+            .map(|j| CacheJobDisplay {
+                id: j.id,
+                catalog: j.catalog,
+                schema: j.schema_name,
+                table: j.table_name,
+                status: j.status,
+                started_at: fmt(j.started_at),
+                ended_at: j.ended_at.map(fmt),
+                duration_ms: j
+                    .ended_at
+                    .map(|e| (e - j.started_at).num_milliseconds()),
+                error: j.error_message,
+            })
+            .collect())
     }
 
     pub fn create_catalog(

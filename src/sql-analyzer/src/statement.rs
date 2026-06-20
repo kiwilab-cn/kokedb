@@ -1045,6 +1045,24 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::ShowCacheJobs {
+            show: _,
+            cache: _,
+            jobs: _,
+            target,
+        } => {
+            let (table, catalog) = match target {
+                Some((_, Either::Left(_table_kw), name)) => {
+                    (Some(from_ast_object_name(name)?), None)
+                }
+                Some((_, Either::Right(_catalog_kw), name)) => {
+                    (None, Some(from_ast_object_name(name)?))
+                }
+                None => (None, None),
+            };
+            let node = spec::CommandNode::ShowCacheJobs { table, catalog };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
     }
 }
 
@@ -1902,6 +1920,43 @@ mod drop_catalog_tests {
             },
             _ => panic!("expected a command plan"),
         }
+    }
+
+    #[test]
+    fn parse_show_cache_jobs() {
+        // Unscoped.
+        let plan = from_ast_statement(parse_one_statement("SHOW CACHE JOBS").unwrap()).unwrap();
+        assert!(matches!(
+            plan,
+            spec::Plan::Command(c)
+                if matches!(c.node, spec::CommandNode::ShowCacheJobs { table: None, catalog: None })
+        ));
+
+        // Scoped to a table.
+        let plan = from_ast_statement(
+            parse_one_statement("SHOW CACHE JOBS FROM TABLE demo.public.orders").unwrap(),
+        )
+        .unwrap();
+        match plan {
+            spec::Plan::Command(c) => match c.node {
+                spec::CommandNode::ShowCacheJobs { table: Some(t), catalog: None } => {
+                    assert_eq!(<Vec<String>>::from(t), vec!["demo", "public", "orders"]);
+                }
+                other => panic!("expected table-scoped ShowCacheJobs, got {other:?}"),
+            },
+            _ => panic!("expected a command plan"),
+        }
+
+        // Scoped to a catalog.
+        let plan = from_ast_statement(
+            parse_one_statement("SHOW CACHE JOBS FROM CATALOG demo").unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            spec::Plan::Command(c)
+                if matches!(c.node, spec::CommandNode::ShowCacheJobs { table: None, catalog: Some(_) })
+        ));
     }
 
     #[test]

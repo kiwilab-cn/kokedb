@@ -90,6 +90,44 @@ impl TaskExecutor for DataSyncExecutor {
         cache: LruResultCache,
         progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError> {
+        // Record a cache_job row around the sync (best-effort observability).
+        let (job_schema, job_table) = config
+            .local_table
+            .split_once('.')
+            .map(|(s, t)| (s.to_string(), t.to_string()))
+            .unwrap_or_else(|| ("public".to_string(), config.local_table.clone()));
+        let job_catalog = config.catalog_name.clone();
+        let job = match PostgreSQLMetaCatalogProviderList::new().await {
+            Ok(m) => {
+                let id = m
+                    .insert_cache_job(&job_catalog, &job_schema, &job_table)
+                    .await
+                    .ok();
+                Some((m, id))
+            }
+            Err(_) => None,
+        };
+
+        let result = self.run_sync(config, cache, progress_callback).await;
+
+        if let Some((m, Some(id))) = job {
+            let (status, err) = match &result {
+                Ok(_) => ("success", None),
+                Err(e) => ("failed", Some(e.to_string())),
+            };
+            let _ = m.complete_cache_job(id, status, err).await;
+        }
+        result
+    }
+}
+
+impl DataSyncExecutor {
+    async fn run_sync(
+        &self,
+        config: CacheTableTaskConfig,
+        cache: LruResultCache,
+        progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
+    ) -> Result<(), TaskError> {
         // Report coarse progress at the natural milestones of a sync.
         let report = |p: f32| {
             if let Some(cb) = progress_callback.as_ref() {

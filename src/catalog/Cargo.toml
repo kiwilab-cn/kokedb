@@ -17,6 +17,7 @@ dashmap.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 log.workspace = true
+chrono.workspace = true
 arrow-schema.workspace = true
 tokio-cron-scheduler.workspace = true
 

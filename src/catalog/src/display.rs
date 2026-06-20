@@ -53,6 +53,20 @@ pub struct TableMetadataDisplay {
     pub reason: Option<String>,
 }
 
+/// One row of `SHOW CACHE JOBS`: a single table-sync run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheJobDisplay {
+    pub id: i64,
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+    pub status: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub error: Option<String>,
+}
+
 /// A trait for displaying catalog information in a structured format.
 /// This is useful for defining output schemas and producing outputs
 /// for various SQL catalog commands.

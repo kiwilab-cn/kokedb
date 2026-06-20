@@ -38,4 +38,15 @@ impl PlanResolver<'_> {
             options,
         })
     }
+
+    pub(in super::super) fn resolve_show_cache_jobs(
+        &self,
+        table: Option<spec::ObjectName>,
+        catalog: Option<spec::ObjectName>,
+    ) -> PlanResult<LogicalPlan> {
+        self.resolve_catalog_command(CatalogCommand::ShowCacheJobs {
+            table: table.map(|t| t.into()),
+            catalog: catalog.map(|c| <Vec<String>>::from(c).join(".")),
+        })
+    }
 }

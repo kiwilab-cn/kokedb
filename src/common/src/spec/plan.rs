@@ -528,6 +528,10 @@ pub enum CommandNode {
         table: ObjectName,
         options: Vec<(String, String)>,
     },
+    ShowCacheJobs {
+        table: Option<ObjectName>,
+        catalog: Option<ObjectName>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

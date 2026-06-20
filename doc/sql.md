@@ -57,6 +57,18 @@ key, validation counters, and the size/churn/access signals.
 SHOW TABLE METADATA FROM demo.public.orders;
 ```
 
+- SHOW CACHE JOBS
+
+Lists recent table-sync runs (one row per sync) with status, timing, duration,
+and any error — for observability and debugging. Optionally scoped to a single
+table or a whole catalog; newest first.
+
+```sql
+SHOW CACHE JOBS;                                  -- all recent runs
+SHOW CACHE JOBS FROM CATALOG demo;                -- one catalog
+SHOW CACHE JOBS FROM TABLE demo.public.orders;    -- one table
+```
+
 - ALTER TABLE ... SET CACHE POLICY
 
 Manually override a cached table's incremental sync strategy. A user override is

@@ -99,6 +99,7 @@ async fn clean_meta(pool: &PgPool, catalog: &str) {
         "DELETE FROM system.table_sync_policy WHERE catalog = $1",
         "DELETE FROM system.table_sync_state WHERE catalog = $1",
         "DELETE FROM system.table_arrow_schema WHERE catalog_name = $1",
+        "DELETE FROM system.cache_job WHERE catalog = $1",
     ] {
         let _ = sqlx::query(sql).bind(catalog).execute(pool).await;
     }
@@ -176,6 +177,16 @@ async fn intelligent_sync_end_to_end() {
     )
     .await;
     assert_eq!(scalar_count(&filtered), 100, "filtered orders");
+
+    // 2b. The sync runs are recorded as cache jobs.
+    let jobs = run(&shared, &format!("SHOW CACHE JOBS FROM CATALOG {catalog}")).await;
+    let job_count: i64 = jobs.iter().map(|b| b.num_rows() as i64).sum();
+    assert!(job_count >= 3, "expected a cache job per table, got {job_count}");
+    // The orders sync should have succeeded.
+    let orders_jobs =
+        run(&shared, &format!("SHOW CACHE JOBS FROM TABLE {catalog}.public.e2e_orders")).await;
+    assert!(orders_jobs[0].num_rows() >= 1, "no job for orders");
+    assert_eq!(meta_str(&orders_jobs, "status"), "success", "orders sync status");
 
     // 3. Inference populated the metadata correctly.
     let md_orders = run(&shared, &format!("SHOW TABLE METADATA FROM {catalog}.public.e2e_orders")).await;

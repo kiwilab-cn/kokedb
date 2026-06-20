@@ -69,6 +69,19 @@ pub struct TableIncPolicy {
     pub divergence_count: i32,
 }
 
+/// One sync-run record from `system.cache_job` (`SHOW CACHE JOBS`).
+#[derive(Debug, Clone)]
+pub struct CacheJob {
+    pub id: i64,
+    pub catalog: String,
+    pub schema_name: String,
+    pub table_name: String,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// The full `table_sync_policy` row for `SHOW TABLE METADATA`.
 #[derive(Debug, Clone)]
 pub struct TableMetadata {
@@ -251,6 +264,21 @@ impl PostgreSQLMetaCatalogProviderList {
                 PRIMARY KEY (catalog, schema_name, table_name)
             );
             "#,
+            // One row per table-sync run, for `SHOW CACHE JOBS` observability.
+            r#"
+            CREATE TABLE IF NOT EXISTS system.cache_job (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                catalog VARCHAR(255) NOT NULL,
+                schema_name VARCHAR(255) NOT NULL,
+                table_name VARCHAR(255) NOT NULL,
+                status VARCHAR(16) NOT NULL DEFAULT 'running',
+                error_message TEXT,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                ended_at TIMESTAMPTZ
+            );
+            "#,
+            "CREATE INDEX IF NOT EXISTS idx_cache_job_lookup \
+             ON system.cache_job (catalog, schema_name, table_name, started_at DESC);",
         ];
 
         for sql in sql_statements {
@@ -816,6 +844,87 @@ impl PostgreSQLMetaCatalogProviderList {
             audit_passes: row.try_get("audit_passes").unwrap_or(0),
             divergence_count: row.try_get("divergence_count").unwrap_or(0),
         }))
+    }
+
+    /// Records the start of a sync run and returns its job id.
+    pub async fn insert_cache_job(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            "INSERT INTO system.cache_job (catalog, schema_name, table_name, status) \
+             VALUES ($1, $2, $3, 'running') RETURNING id;",
+        )
+        .bind(catalog)
+        .bind(schema)
+        .bind(table)
+        .fetch_one(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(row.try_get("id").unwrap_or(0))
+    }
+
+    /// Marks a sync run finished with its terminal status and optional error.
+    pub async fn complete_cache_job(
+        &self,
+        id: i64,
+        status: &str,
+        error: Option<String>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE system.cache_job SET status = $2, error_message = $3, \
+             ended_at = CURRENT_TIMESTAMP WHERE id = $1;",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(&error)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
+    /// Returns recent sync-run records, optionally filtered to a catalog and/or a
+    /// `schema.table`, newest first.
+    pub async fn get_cache_jobs(
+        &self,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<CacheJob>> {
+        let sql = "SELECT id, catalog, schema_name, table_name, status, error_message, \
+            started_at, ended_at FROM system.cache_job \
+            WHERE ($1::text IS NULL OR catalog = $1) \
+              AND ($2::text IS NULL OR schema_name = $2) \
+              AND ($3::text IS NULL OR table_name = $3) \
+            ORDER BY started_at DESC LIMIT $4;";
+        let rows = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(limit)
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| CacheJob {
+                id: row.try_get("id").unwrap_or(0),
+                catalog: row.try_get("catalog").unwrap_or_default(),
+                schema_name: row.try_get("schema_name").unwrap_or_default(),
+                table_name: row.try_get("table_name").unwrap_or_default(),
+                status: row.try_get("status").unwrap_or_default(),
+                error_message: row.try_get("error_message").ok(),
+                started_at: row
+                    .try_get("started_at")
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+                ended_at: row.try_get("ended_at").ok(),
+            })
+            .collect())
     }
 
     /// Returns `schema.table` names whose shadow audit is due: an inferred,
