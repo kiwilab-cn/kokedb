@@ -182,6 +182,16 @@ sweeper 接入 `task_manager.rs`。
 
 ## 4. Phase 3：LLM 辅助层（Anthropic 原生，配 key 才启用）
 
+> **实现状态：已落地（`llm.rs`）。** 默认 **inert**——没配 `KOKEDB_LLM_API_KEY` 时完全不触发，
+> 行为 = 纯规则，零回归。触发：规则 `confidence < KOKEDB_LLM_CONFIDENCE_THRESHOLD`(0.6) 时调
+> Anthropic `/v1/messages`（`x-api-key`+`anthropic-version`，默认 `claude-opus-4-8`，可 `KOKEDB_LLM_BASE_URL`
+> 走兼容网关）。Prompt 只发 `TableSummary`（列/类型/可空/默认/注释 + PK + 触发器 + 聚合统计，
+> `KOKEDB_LLM_SEND_STATS=false` 连统计也不发）——**绝不发行数据**。解析容忍 markdown 包裹，
+> 校验非法 mode→降级为"无建议"。**安全**：LLM 结果一律 `source='llm'` + `audited` + `suggested`，
+> 绝不直接 active，必须过 Phase 2c 影子校验；任何失败/超时/未配 key → 回退纯规则。缓存：已有
+> `source='llm'` 决定且在校验流程中（status≠none）则不再重复调。纯逻辑（config/prompt/解析）8 单测；
+> 真实 API 调用有一个 `#[ignore]` 的 opt-in 测试（配 key 才跑）。
+
 ### 4.1 触发条件（省钱：只在规则模糊时调）
 规则给出 `confidence < 阈值`（如无明确 watermark、PK 非单调、列名非英文/语义模糊）→ 才调 LLM。按 `schema_hash` 缓存结果，schema 不变不重复调。
 

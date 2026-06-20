@@ -80,6 +80,7 @@ arrow-pyarrow = { version = "55.2.0" }
 
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # TODO: `serde_yaml` is deprecated. No satisfactory alternative exists yet, we may need to build our own in the future.
 serde_yaml = "0.9.34"
 serde_arrow = { version = "0.13.5", features = ["arrow-55"] }
