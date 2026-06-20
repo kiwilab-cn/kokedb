@@ -2,12 +2,12 @@ use std::sync::Arc;
 
 use kokedb_common::cache_policy::CachePolicy;
 use kokedb_common::env::get_env_as;
-use kokedb_task_manager::cache_sync_task::execute_catalog_sync_task;
+use kokedb_task_manager::cache_sync_task::{execute_catalog_sync_task, refresh_single_table};
 use kokedb_task_manager::error::TaskError;
 use log::{error, info};
 use tokio_cron_scheduler::Job;
 
-use crate::display::CachePolicyDisplay;
+use crate::display::{CachePolicyDisplay, RefreshCacheDisplay};
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::provider::CreateCatalogOptions;
@@ -58,6 +58,51 @@ impl CatalogManager {
                 cache_policy,
             })
             .collect())
+    }
+
+    /// Enqueues a sync for a single cached table (backs `REFRESH CACHE FROM
+    /// TABLE`). The `table` parts are `[catalog, db, table]`, `[db, table]`, or
+    /// `[table]`; missing parts fall back to the session's default catalog and
+    /// database. Returns the queued task id without waiting for the sync.
+    pub async fn refresh_table(&self, table: Vec<String>) -> CatalogResult<RefreshCacheDisplay> {
+        let (catalog, source_table) = match table.as_slice() {
+            [c, db, t] => (c.clone(), format!("{db}.{t}")),
+            [db, t] => (self.default_catalog()?.to_string(), format!("{db}.{t}")),
+            [t] => {
+                let db = self.default_database()?.head;
+                (self.default_catalog()?.to_string(), format!("{db}.{t}"))
+            }
+            _ => {
+                return Err(CatalogError::InvalidArgument(format!(
+                    "expected catalog.database.table, got {} name parts",
+                    table.len()
+                )))
+            }
+        };
+
+        // Look up the catalog's DSN; fail fast if the catalog is unknown.
+        let dynamic_catalog_list = self.state()?.dynamic_catalog_list.clone();
+        let catalog_info = dynamic_catalog_list
+            .get_catalog(&catalog)
+            .await
+            .map_err(|e| CatalogError::NotFound("catalog", format!("{catalog}: {e}")))?;
+
+        let task_manager = self.state()?.catalog_task_manager.clone();
+        let task_id =
+            refresh_single_table(&catalog, &catalog_info.dsn, &source_table, task_manager)
+                .await
+                .map_err(|e| {
+                    CatalogError::External(format!("Failed to enqueue refresh task: {e}"))
+                })?;
+
+        info!(
+            "Queued manual refresh for {catalog}.{source_table} as task {task_id}"
+        );
+        Ok(RefreshCacheDisplay {
+            table: format!("{catalog}.{source_table}"),
+            task_id,
+            status: "QUEUED".to_string(),
+        })
     }
 
     pub fn create_catalog(

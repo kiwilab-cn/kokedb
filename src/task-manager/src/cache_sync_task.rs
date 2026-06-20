@@ -46,6 +46,26 @@ pub async fn execute_catalog_sync_task(
     Ok(())
 }
 
+/// Enqueues a sync task for a single table and returns its task id. Backs the
+/// manual `REFRESH CACHE FROM TABLE` command. Whether the run is full or
+/// incremental is decided later by the runner from detected metadata and the
+/// persisted sync state, so a manual refresh reuses the same code path as the
+/// scheduled catalog sync.
+pub async fn refresh_single_table(
+    catalog: &str,
+    dsn: &str,
+    source_table: &str,
+    catalog_task_manager: Arc<TaskManager>,
+) -> Result<String, TaskError> {
+    let config = CacheTableTaskConfig::new(
+        catalog.to_string(),
+        dsn.to_string(),
+        source_table.to_string(),
+        source_table.to_string(),
+    );
+    catalog_task_manager.add_task(config).await
+}
+
 async fn add_table_sync_task(
     tables: Vec<String>,
     catalog: &str,

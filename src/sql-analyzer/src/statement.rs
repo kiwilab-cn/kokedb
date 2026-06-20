@@ -1012,6 +1012,18 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             let node = spec::CommandNode::ListCachePolicies;
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::RefreshCache {
+            refresh: _,
+            cache: _,
+            from: _,
+            table: _,
+            name,
+        } => {
+            let node = spec::CommandNode::RefreshCache {
+                table: from_ast_object_name(name)?,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
     }
 }
 
@@ -1823,6 +1835,24 @@ mod drop_catalog_tests {
             plan,
             spec::Plan::Command(c) if matches!(c.node, spec::CommandNode::ListFunctions { .. })
         ));
+    }
+
+    #[test]
+    fn parse_refresh_cache_from_table() {
+        let plan = from_ast_statement(
+            parse_one_statement("REFRESH CACHE FROM TABLE demo.public.orders").unwrap(),
+        )
+        .unwrap();
+        match plan {
+            spec::Plan::Command(c) => match c.node {
+                spec::CommandNode::RefreshCache { table } => {
+                    let parts: Vec<String> = table.into();
+                    assert_eq!(parts, vec!["demo", "public", "orders"]);
+                }
+                other => panic!("expected RefreshCache, got {other:?}"),
+            },
+            _ => panic!("expected a command plan"),
+        }
     }
 
     #[test]

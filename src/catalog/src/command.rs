@@ -9,7 +9,9 @@ use serde::Serialize;
 use serde_arrow::schema::{SchemaLike, TracingOptions};
 use serde_arrow::to_arrow;
 
-use crate::display::{CachePolicyDisplay, CatalogDisplay, EmptyDisplay, SingleValueDisplay};
+use crate::display::{
+    CachePolicyDisplay, CatalogDisplay, EmptyDisplay, RefreshCacheDisplay, SingleValueDisplay,
+};
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::provider::{
@@ -37,6 +39,9 @@ pub enum CatalogCommand {
         if_exists: bool,
     },
     ListCachePolicies,
+    RefreshCache {
+        table: Vec<String>,
+    },
     CurrentDatabase,
     SetCurrentDatabase {
         database: Vec<String>,
@@ -143,6 +148,7 @@ impl CatalogCommand {
             CatalogCommand::ListCatalogs { .. } => "ListCatalogs",
             CatalogCommand::DropCatalog { .. } => "DropCatalog",
             CatalogCommand::ListCachePolicies => "ListCachePolicies",
+            CatalogCommand::RefreshCache { .. } => "RefreshCache",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
@@ -178,6 +184,9 @@ impl CatalogCommand {
             }
             CatalogCommand::ListCachePolicies => {
                 Vec::<FieldRef>::from_type::<CachePolicyDisplay>(TracingOptions::default())
+            }
+            CatalogCommand::RefreshCache { .. } => {
+                Vec::<FieldRef>::from_type::<RefreshCacheDisplay>(TracingOptions::default())
             }
             CatalogCommand::GetDatabase { .. } | CatalogCommand::ListDatabases { .. } => {
                 Vec::<FieldRef>::from_type::<D::Database>(TracingOptions::default())
@@ -261,6 +270,10 @@ impl CatalogCommand {
             CatalogCommand::ListCachePolicies => {
                 let rows = manager.list_cache_policies().await?;
                 build_record_batch(schema, &rows)
+            }
+            CatalogCommand::RefreshCache { table } => {
+                let row = manager.refresh_table(table).await?;
+                build_record_batch(schema, &[row])
             }
             CatalogCommand::DropCatalog { catalog, if_exists } => {
                 manager.drop_catalog(&catalog, if_exists).await?;

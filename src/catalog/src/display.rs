@@ -20,6 +20,15 @@ pub struct CachePolicyDisplay {
     pub cache_policy: String,
 }
 
+/// One row of `REFRESH CACHE FROM TABLE` output: the resolved table, the queued
+/// sync task id, and the resulting status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefreshCacheDisplay {
+    pub table: String,
+    pub task_id: String,
+    pub status: String,
+}
+
 /// A trait for displaying catalog information in a structured format.
 /// This is useful for defining output schemas and producing outputs
 /// for various SQL catalog commands.
