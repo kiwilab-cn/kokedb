@@ -1024,6 +1024,18 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::ShowTableMetadata {
+            show: _,
+            table: _,
+            metadata: _,
+            from: _,
+            name,
+        } => {
+            let node = spec::CommandNode::ShowTableMetadata {
+                table: from_ast_object_name(name)?,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
     }
 }
 
@@ -1850,6 +1862,24 @@ mod drop_catalog_tests {
                     assert_eq!(parts, vec!["demo", "public", "orders"]);
                 }
                 other => panic!("expected RefreshCache, got {other:?}"),
+            },
+            _ => panic!("expected a command plan"),
+        }
+    }
+
+    #[test]
+    fn parse_show_table_metadata() {
+        let plan = from_ast_statement(
+            parse_one_statement("SHOW TABLE METADATA FROM demo.public.orders").unwrap(),
+        )
+        .unwrap();
+        match plan {
+            spec::Plan::Command(c) => match c.node {
+                spec::CommandNode::ShowTableMetadata { table } => {
+                    let parts: Vec<String> = table.into();
+                    assert_eq!(parts, vec!["demo", "public", "orders"]);
+                }
+                other => panic!("expected ShowTableMetadata, got {other:?}"),
             },
             _ => panic!("expected a command plan"),
         }

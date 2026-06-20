@@ -10,7 +10,7 @@ use kokedb_task_manager::error::TaskError;
 use log::{error, info, warn};
 use tokio_cron_scheduler::Job;
 
-use crate::display::{CachePolicyDisplay, RefreshCacheDisplay};
+use crate::display::{CachePolicyDisplay, RefreshCacheDisplay, TableMetadataDisplay};
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::provider::CreateCatalogOptions;
@@ -105,6 +105,68 @@ impl CatalogManager {
             table: format!("{catalog}.{source_table}"),
             task_id,
             status: "QUEUED".to_string(),
+        })
+    }
+
+    /// Reads a table's inferred sync metadata for `SHOW TABLE METADATA`. The
+    /// `table` parts default like [`refresh_table`].
+    pub async fn show_table_metadata(
+        &self,
+        table: Vec<String>,
+    ) -> CatalogResult<TableMetadataDisplay> {
+        let (catalog, schema_name, table_name) = match table.as_slice() {
+            [c, db, t] => (c.clone(), db.clone(), t.clone()),
+            [db, t] => (self.default_catalog()?.to_string(), db.clone(), t.clone()),
+            [t] => (
+                self.default_catalog()?.to_string(),
+                self.default_database()?.head.to_string(),
+                t.clone(),
+            ),
+            _ => {
+                return Err(CatalogError::InvalidArgument(format!(
+                    "expected catalog.database.table, got {} name parts",
+                    table.len()
+                )))
+            }
+        };
+
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let m = meta
+            .get_table_metadata(&catalog, &schema_name, &table_name)
+            .await
+            .map_err(|e| CatalogError::Internal(format!("Failed to read table metadata: {e}")))?
+            .ok_or_else(|| {
+                CatalogError::NotFound(
+                    "table metadata",
+                    format!("{catalog}.{schema_name}.{table_name} (not yet evaluated)"),
+                )
+            })?;
+
+        let partition_by = meta
+            .get_table_partition_column(&catalog, &schema_name, &table_name)
+            .await
+            .ok()
+            .flatten();
+
+        Ok(TableMetadataDisplay {
+            table: format!("{catalog}.{schema_name}.{table_name}"),
+            inc_mode: m.inc_mode,
+            inc_status: m.inc_status,
+            inc_tier: m.inc_tier,
+            source: m.source,
+            confidence: m.confidence,
+            watermark_column: m.watermark_column,
+            pk_columns: m.pk_columns,
+            partition_by,
+            refresh_bucket: m.refresh_bucket,
+            refresh_interval_sec: m.refresh_interval_sec,
+            est_row_count: m.est_row_count,
+            est_size_bytes: m.est_size_bytes,
+            churn_per_hour: m.churn_per_hour,
+            access_per_day: m.access_per_day,
+            audit_passes: m.audit_passes,
+            divergence_count: m.divergence_count,
+            reason: m.reason,
         })
     }
 

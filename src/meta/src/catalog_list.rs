@@ -69,6 +69,27 @@ pub struct TableIncPolicy {
     pub divergence_count: i32,
 }
 
+/// The full `table_sync_policy` row for `SHOW TABLE METADATA`.
+#[derive(Debug, Clone)]
+pub struct TableMetadata {
+    pub refresh_bucket: String,
+    pub refresh_interval_sec: i32,
+    pub est_row_count: Option<i64>,
+    pub est_size_bytes: Option<i64>,
+    pub churn_per_hour: Option<f32>,
+    pub access_per_day: Option<f32>,
+    pub inc_mode: String,
+    pub inc_status: String,
+    pub inc_tier: String,
+    pub watermark_column: Option<String>,
+    pub pk_columns: Option<String>,
+    pub source: String,
+    pub confidence: Option<f32>,
+    pub reason: Option<String>,
+    pub audit_passes: i32,
+    pub divergence_count: i32,
+}
+
 #[derive(Debug)]
 pub struct PostgreSQLMetaCatalogProviderList {
     local_pool: PgPool,
@@ -703,6 +724,51 @@ impl PostgreSQLMetaCatalogProviderList {
         }))
     }
 
+    /// Reads the full sync-policy row for a table (backs `SHOW TABLE METADATA`).
+    pub async fn get_table_metadata(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<TableMetadata>> {
+        let sql = "SELECT refresh_bucket, refresh_interval_sec, est_row_count, est_size_bytes, \
+            churn_per_hour, access_per_day, inc_mode, inc_status, inc_tier, watermark_column, \
+            pk_columns, source, confidence, reason, audit_passes, divergence_count \
+            FROM system.table_sync_policy \
+            WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
+
+        let row = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(row.map(|row| TableMetadata {
+            refresh_bucket: row
+                .try_get("refresh_bucket")
+                .unwrap_or_else(|_| "normal".to_string()),
+            refresh_interval_sec: row.try_get("refresh_interval_sec").unwrap_or(900),
+            est_row_count: row.try_get("est_row_count").ok(),
+            est_size_bytes: row.try_get("est_size_bytes").ok(),
+            churn_per_hour: row.try_get("churn_per_hour").ok(),
+            access_per_day: row.try_get("access_per_day").ok(),
+            inc_mode: row.try_get("inc_mode").unwrap_or_else(|_| "full".to_string()),
+            inc_status: row.try_get("inc_status").unwrap_or_else(|_| "none".to_string()),
+            inc_tier: row
+                .try_get("inc_tier")
+                .unwrap_or_else(|_| "audited".to_string()),
+            watermark_column: row.try_get("watermark_column").ok(),
+            pk_columns: row.try_get("pk_columns").ok(),
+            source: row.try_get("source").unwrap_or_else(|_| "rule".to_string()),
+            confidence: row.try_get("confidence").ok(),
+            reason: row.try_get("reason").ok(),
+            audit_passes: row.try_get("audit_passes").unwrap_or(0),
+            divergence_count: row.try_get("divergence_count").unwrap_or(0),
+        }))
+    }
+
     /// Returns `schema.table` names whose shadow audit is due: an inferred,
     /// not-yet-rejected strategy whose `next_audit_at` has passed (or was never
     /// scheduled — a freshly `suggested` table audits as soon as possible).
@@ -1223,6 +1289,18 @@ mod policy_tests {
         assert_eq!(got.inc_mode, "upsert");
         assert_eq!(got.watermark_column.as_deref(), Some("updated_at"));
         assert_eq!(got.pk_columns.as_deref(), Some("id"));
+
+        // SHOW TABLE METADATA reads the combined row.
+        let md = meta
+            .get_table_metadata(cat, schema, table)
+            .await
+            .unwrap()
+            .expect("metadata row exists");
+        assert_eq!(md.refresh_bucket, "fast");
+        assert_eq!(md.refresh_interval_sec, 120);
+        assert_eq!(md.inc_mode, "upsert");
+        assert_eq!(md.inc_status, "active");
+        assert_eq!(md.est_row_count, Some(1000));
 
         sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
             .bind(cat)

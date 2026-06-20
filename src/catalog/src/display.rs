@@ -29,6 +29,30 @@ pub struct RefreshCacheDisplay {
     pub status: String,
 }
 
+/// One row of `SHOW TABLE METADATA`: the inferred sync decision, its validation
+/// lifecycle, and the observed signals that drove it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableMetadataDisplay {
+    pub table: String,
+    pub inc_mode: String,
+    pub inc_status: String,
+    pub inc_tier: String,
+    pub source: String,
+    pub confidence: Option<f32>,
+    pub watermark_column: Option<String>,
+    pub pk_columns: Option<String>,
+    pub partition_by: Option<String>,
+    pub refresh_bucket: String,
+    pub refresh_interval_sec: i32,
+    pub est_row_count: Option<i64>,
+    pub est_size_bytes: Option<i64>,
+    pub churn_per_hour: Option<f32>,
+    pub access_per_day: Option<f32>,
+    pub audit_passes: i32,
+    pub divergence_count: i32,
+    pub reason: Option<String>,
+}
+
 /// A trait for displaying catalog information in a structured format.
 /// This is useful for defining output schemas and producing outputs
 /// for various SQL catalog commands.

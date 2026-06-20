@@ -521,6 +521,9 @@ pub enum CommandNode {
     RefreshCache {
         table: ObjectName,
     },
+    ShowTableMetadata {
+        table: ObjectName,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

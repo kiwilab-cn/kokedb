@@ -45,6 +45,18 @@ Cache the tables which are in the **table_set**.
 
 - SHOW COLUMNS
 
+- SHOW TABLE METADATA
+
+Shows the inferred sync decision and the observed signals that drove it for a
+cached table (`catalog.database.table`, with the catalog/database defaulting to
+the session). Includes the refresh cadence bucket/interval, the incremental mode
++ lifecycle status + tier + source (rule/llm), the detected watermark/primary
+key, validation counters, and the size/churn/access signals.
+
+```sql
+SHOW TABLE METADATA FROM demo.public.orders;
+```
+
 
 ## DML
 
