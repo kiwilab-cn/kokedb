@@ -27,4 +27,15 @@ impl PlanResolver<'_> {
             table: table.into(),
         })
     }
+
+    pub(in super::super) fn resolve_alter_table_cache_policy(
+        &self,
+        table: spec::ObjectName,
+        options: Vec<(String, String)>,
+    ) -> PlanResult<LogicalPlan> {
+        self.resolve_catalog_command(CatalogCommand::AlterTableCachePolicy {
+            table: table.into(),
+            options,
+        })
+    }
 }

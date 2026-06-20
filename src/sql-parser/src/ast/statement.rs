@@ -15,7 +15,8 @@ use crate::ast::keywords::{
     Functions, Generated, Global, If, In, Inpath, Inputformat, Insert, Into, Is, Items, Keys, Lazy,
     Like, Lines, Load, Local, Location, Map, Matched, Merge, Metadata, Name, Noscan, Not, Null, On,
     Options,
-    Or, Outputformat, Overwrite, Partition, Partitioned, Partitions, Policies, Properties, Purge,
+    Or, Outputformat, Overwrite, Partition, Partitioned, Partitions, Policies, Policy, Properties,
+    Purge,
     Recover, Refresh, Rename, Replace, Restrict, Row, Schema, Schemas, Serde, Serdeproperties, Set,
     Show, Sorted, Source, Statistics, Stored, Table, Tables, Target, Tblproperties, Temp,
     Temporary, Terminated, Then, Time, To, Type, Uncache, Unset, Update, Use, Using, Values,
@@ -696,6 +697,13 @@ pub enum AlterTableOperation {
         #[parser(function = |(e, _), o| compose(e, o))]
         partition: PartitionClause,
         purge: Option<Purge>,
+    },
+    SetCachePolicy {
+        set: Set,
+        cache: Cache,
+        policy: Policy,
+        with: With,
+        properties: PropertyList,
     },
     SetTableProperties {
         set: Set,

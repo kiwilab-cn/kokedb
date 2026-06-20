@@ -46,6 +46,10 @@ pub enum CatalogCommand {
     ShowTableMetadata {
         table: Vec<String>,
     },
+    AlterTableCachePolicy {
+        table: Vec<String>,
+        options: Vec<(String, String)>,
+    },
     CurrentDatabase,
     SetCurrentDatabase {
         database: Vec<String>,
@@ -154,6 +158,7 @@ impl CatalogCommand {
             CatalogCommand::ListCachePolicies => "ListCachePolicies",
             CatalogCommand::RefreshCache { .. } => "RefreshCache",
             CatalogCommand::ShowTableMetadata { .. } => "ShowTableMetadata",
+            CatalogCommand::AlterTableCachePolicy { .. } => "AlterTableCachePolicy",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
@@ -232,6 +237,7 @@ impl CatalogCommand {
             | CatalogCommand::DropFunction { .. }
             | CatalogCommand::DropTemporaryView { .. }
             | CatalogCommand::DropView { .. }
+            | CatalogCommand::AlterTableCachePolicy { .. }
             | CatalogCommand::DropCatalog { .. } => {
                 Vec::<FieldRef>::from_type::<SingleValueDisplay<bool>>(TracingOptions::default())
             }
@@ -286,6 +292,11 @@ impl CatalogCommand {
             CatalogCommand::ShowTableMetadata { table } => {
                 let row = manager.show_table_metadata(table).await?;
                 build_record_batch(schema, &[row])
+            }
+            CatalogCommand::AlterTableCachePolicy { table, options } => {
+                manager.set_table_cache_policy(table, options).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
             }
             CatalogCommand::DropCatalog { catalog, if_exists } => {
                 manager.drop_catalog(&catalog, if_exists).await?;

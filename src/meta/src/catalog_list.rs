@@ -688,6 +688,55 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(())
     }
 
+    /// Applies a user override of a table's incremental strategy. The strategy is
+    /// trusted (`source='user'`, activated without validation) and resets the
+    /// audit state. Creates the policy row if absent (cadence defaults apply).
+    pub async fn set_user_inc_policy(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        inc_mode: &str,
+        watermark_column: Option<String>,
+        pk_columns: Option<String>,
+    ) -> Result<()> {
+        // `full` disables incremental; anything else is trusted active.
+        let status = if inc_mode == "full" { "none" } else { "active" };
+        let sql = "INSERT INTO system.table_sync_policy \
+            (catalog, schema_name, table_name, inc_mode, inc_status, inc_tier, \
+             watermark_column, pk_columns, source, confidence, reason, \
+             audit_passes, divergence_count, next_audit_at, updated_at) \
+            VALUES ($1, $2, $3, $4, $5, 'trusted', $6, $7, 'user', NULL, \
+                    '[user] manual override', 0, 0, NULL, CURRENT_TIMESTAMP) \
+            ON CONFLICT (catalog, schema_name, table_name) DO UPDATE SET \
+                inc_mode = EXCLUDED.inc_mode, \
+                inc_status = EXCLUDED.inc_status, \
+                inc_tier = 'trusted', \
+                watermark_column = EXCLUDED.watermark_column, \
+                pk_columns = EXCLUDED.pk_columns, \
+                source = 'user', \
+                confidence = NULL, \
+                reason = '[user] manual override', \
+                audit_passes = 0, \
+                divergence_count = 0, \
+                next_audit_at = NULL, \
+                updated_at = CURRENT_TIMESTAMP;";
+
+        sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(inc_mode)
+            .bind(status)
+            .bind(&watermark_column)
+            .bind(&pk_columns)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(())
+    }
+
     /// Reads the inferred incremental strategy for a table, if one exists.
     pub async fn get_table_inc_policy(
         &self,
@@ -1301,6 +1350,63 @@ mod policy_tests {
         assert_eq!(md.inc_mode, "upsert");
         assert_eq!(md.inc_status, "active");
         assert_eq!(md.est_row_count, Some(1000));
+
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+    }
+
+    // A user override must persist as a trusted, active, user-sourced strategy.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via PG_META_DSN"]
+    async fn user_override_sets_trusted_active() {
+        let pool = PgPool::connect(&meta_dsn()).await.unwrap();
+        let meta = PostgreSQLMetaCatalogProviderList::from_pool(pool);
+        meta.init_db().await.unwrap();
+        let cat = "it_user";
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+
+        // Override on a table with no prior policy row (must insert).
+        meta.set_user_inc_policy(
+            cat,
+            "public",
+            "orders",
+            "upsert",
+            Some("updated_at".into()),
+            Some("id".into()),
+        )
+        .await
+        .unwrap();
+
+        let got = meta
+            .get_table_inc_policy(cat, "public", "orders")
+            .await
+            .unwrap()
+            .expect("policy row created");
+        assert_eq!(got.source, "user");
+        assert_eq!(got.inc_status, "active");
+        assert_eq!(got.inc_tier, "trusted");
+        assert_eq!(got.inc_mode, "upsert");
+        assert_eq!(got.watermark_column.as_deref(), Some("updated_at"));
+
+        // full disables incremental.
+        meta.set_user_inc_policy(cat, "public", "orders", "full", None, None)
+            .await
+            .unwrap();
+        let got2 = meta
+            .get_table_inc_policy(cat, "public", "orders")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got2.inc_mode, "full");
+        assert_eq!(got2.inc_status, "none");
+        assert_eq!(got2.source, "user");
 
         sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
             .bind(cat)
