@@ -1,10 +1,12 @@
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use kokedb_common::cache_policy::CachePolicy;
 use kokedb_common::env::get_env_as;
+use kokedb_task_manager::adaptive;
 use kokedb_task_manager::cache_sync_task::{execute_catalog_sync_task, refresh_single_table};
 use kokedb_task_manager::error::TaskError;
-use log::{error, info};
+use log::{error, info, warn};
 use tokio_cron_scheduler::Job;
 
 use crate::display::{CachePolicyDisplay, RefreshCacheDisplay};
@@ -203,28 +205,75 @@ impl CatalogManager {
             )
         }
 
+        let adaptive = get_env_as("KOKEDB_ADAPTIVE_REFRESH", true);
         let job_dsn = dsn.to_string();
         let job_catalog = catalog.to_string();
-        let cron_expr = format!("0 */{} * * * *", schedule_interval_min);
 
-        let job = Job::new_async(cron_expr, move |_uuid, _l| {
-            let dsn = job_dsn.clone();
-            let catalog = job_catalog.clone();
-            let catalog_task_manager = catalog_task_manager.clone();
-            let cache_policy = cache_policy.clone();
+        let job = if adaptive {
+            // Adaptive mode: seed per-table policies now, then run a per-minute
+            // tick that enqueues only tables whose cadence has elapsed, and
+            // re-evaluate cadences (and discover new tables) periodically.
+            if let Err(e) =
+                adaptive::reevaluate_catalog(&catalog, &dsn, &cache_policy).await
+            {
+                warn!("Initial adaptive reeval failed for '{}': {}", catalog, e);
+            }
+            let tick_min: u32 = get_env_as("KOKEDB_TICK_MIN", 1u32).max(1);
+            let reeval_min: u32 =
+                get_env_as("KOKEDB_REEVALUATE_INTERVAL_MIN", 60u32).max(tick_min);
+            let cron_expr = format!("0 */{} * * * *", tick_min);
+            let ticks = Arc::new(AtomicU64::new(0));
 
-            Box::pin(async move {
-                if let Err(e) =
-                    execute_catalog_sync_task(&dsn, &catalog, catalog_task_manager, cache_policy)
-                        .await
-                {
-                    error!(
-                        "Catalog sync task failed for catalog '{}' with DSN '{}': {}",
-                        &catalog, &dsn, e
-                    );
-                }
+            Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
+                let dsn = job_dsn.clone();
+                let catalog = job_catalog.clone();
+                let task_manager = catalog_task_manager.clone();
+                let cache_policy = cache_policy.clone();
+                let ticks = ticks.clone();
+                Box::pin(async move {
+                    // Enqueue tables that are due this tick.
+                    if let Err(e) =
+                        adaptive::tick_refresh_due(&catalog, &dsn, task_manager).await
+                    {
+                        error!("Adaptive tick failed for '{}': {}", catalog, e);
+                    }
+                    // Re-evaluate cadences every `reeval_min` minutes.
+                    let elapsed_min =
+                        (ticks.fetch_add(1, AtomicOrdering::Relaxed) + 1) * tick_min as u64;
+                    if elapsed_min % reeval_min as u64 == 0 {
+                        if let Err(e) =
+                            adaptive::reevaluate_catalog(&catalog, &dsn, &cache_policy).await
+                        {
+                            error!("Adaptive reeval failed for '{}': {}", catalog, e);
+                        }
+                    }
+                })
             })
-        })
+        } else {
+            // Legacy mode: a single periodic full-catalog sync.
+            let cron_expr = format!("0 */{} * * * *", schedule_interval_min);
+            Job::new_async(cron_expr.as_str(), move |_uuid, _l| {
+                let dsn = job_dsn.clone();
+                let catalog = job_catalog.clone();
+                let catalog_task_manager = catalog_task_manager.clone();
+                let cache_policy = cache_policy.clone();
+                Box::pin(async move {
+                    if let Err(e) = execute_catalog_sync_task(
+                        &dsn,
+                        &catalog,
+                        catalog_task_manager,
+                        cache_policy,
+                    )
+                    .await
+                    {
+                        error!(
+                            "Catalog sync task failed for catalog '{}' with DSN '{}': {}",
+                            &catalog, &dsn, e
+                        );
+                    }
+                })
+            })
+        }
         .map_err(|e| {
             CatalogError::External(format!(
                 "Failed to create scheduler job for catalog '{}': {}",

@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
@@ -33,6 +34,20 @@ pub struct TableSyncState {
     pub sync_mode: String,
     /// Number of consecutive incremental runs since the last full refresh.
     pub incremental_runs: i32,
+}
+
+/// Per-table sync *decision* (how to sync and how often). Phase 1 populates the
+/// `refresh_*` cadence and the observed signal snapshot; the `inc_*` fields are
+/// reserved for the incremental-inference phases.
+#[derive(Debug, Clone)]
+pub struct TableSyncPolicy {
+    pub refresh_bucket: String,
+    pub refresh_interval_sec: i32,
+    pub est_row_count: Option<i64>,
+    pub est_size_bytes: Option<i64>,
+    pub churn_per_hour: Option<f32>,
+    pub access_per_day: Option<f32>,
+    pub score: Option<f32>,
 }
 
 #[derive(Debug)]
@@ -162,6 +177,32 @@ impl PostgreSQLMetaCatalogProviderList {
                 sync_mode VARCHAR(16) NOT NULL DEFAULT 'full',
                 incremental_runs INTEGER NOT NULL DEFAULT 0,
                 last_sync_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (catalog, schema_name, table_name)
+            );
+            "#,
+            // Per-table sync policy: the *decision* layer (how to sync + how
+            // often), separate from table_sync_state (the runtime cursor).
+            // Phase 1 uses the refresh_* + signal columns; the inc_*/audit
+            // columns are reserved for the incremental-inference phases.
+            r#"
+            CREATE TABLE IF NOT EXISTS system.table_sync_policy (
+                catalog VARCHAR(255) NOT NULL,
+                schema_name VARCHAR(255) NOT NULL,
+                table_name VARCHAR(255) NOT NULL,
+                refresh_bucket VARCHAR(16) NOT NULL DEFAULT 'normal',
+                refresh_interval_sec INTEGER NOT NULL DEFAULT 900,
+                est_row_count BIGINT,
+                est_size_bytes BIGINT,
+                churn_per_hour REAL,
+                access_per_day REAL,
+                score REAL,
+                inc_mode VARCHAR(16) NOT NULL DEFAULT 'full',
+                inc_status VARCHAR(16) NOT NULL DEFAULT 'none',
+                inc_tier VARCHAR(16) NOT NULL DEFAULT 'audited',
+                source VARCHAR(16) NOT NULL DEFAULT 'rule',
+                confidence REAL,
+                reason TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (catalog, schema_name, table_name)
             );
             "#,
@@ -451,6 +492,105 @@ impl PostgreSQLMetaCatalogProviderList {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         Ok(())
+    }
+
+    /// Upserts the adaptive refresh policy for a table (Phase 1: cadence +
+    /// observed signal snapshot). Preserves the `inc_*` columns' defaults/values.
+    pub async fn upsert_table_sync_policy(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        policy: &TableSyncPolicy,
+    ) -> Result<()> {
+        let sql = "INSERT INTO system.table_sync_policy \
+            (catalog, schema_name, table_name, refresh_bucket, refresh_interval_sec, \
+             est_row_count, est_size_bytes, churn_per_hour, access_per_day, score, updated_at) \
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP) \
+            ON CONFLICT (catalog, schema_name, table_name) DO UPDATE SET \
+                refresh_bucket = EXCLUDED.refresh_bucket, \
+                refresh_interval_sec = EXCLUDED.refresh_interval_sec, \
+                est_row_count = EXCLUDED.est_row_count, \
+                est_size_bytes = EXCLUDED.est_size_bytes, \
+                churn_per_hour = EXCLUDED.churn_per_hour, \
+                access_per_day = EXCLUDED.access_per_day, \
+                score = EXCLUDED.score, \
+                updated_at = CURRENT_TIMESTAMP;";
+
+        sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(&policy.refresh_bucket)
+            .bind(policy.refresh_interval_sec)
+            .bind(policy.est_row_count)
+            .bind(policy.est_size_bytes)
+            .bind(policy.churn_per_hour)
+            .bind(policy.access_per_day)
+            .bind(policy.score)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(())
+    }
+
+    /// Returns the `schema.table` names in `catalog` whose adaptive refresh
+    /// interval has elapsed (or that have never been synced). Drives the
+    /// per-catalog refresh tick.
+    pub async fn get_due_refresh_tables(&self, catalog: &str) -> Result<Vec<String>> {
+        let sql = "SELECT p.schema_name, p.table_name \
+            FROM system.table_sync_policy p \
+            LEFT JOIN system.table_sync_state s \
+              ON p.catalog = s.catalog AND p.schema_name = s.schema_name \
+             AND p.table_name = s.table_name \
+            WHERE p.catalog = $1 \
+              AND (s.last_sync_at IS NULL \
+                   OR s.last_sync_at + (p.refresh_interval_sec || ' seconds')::interval \
+                      <= CURRENT_TIMESTAMP) \
+            ORDER BY p.schema_name, p.table_name;";
+
+        let rows = sqlx::query(sql)
+            .bind(catalog)
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let schema_name: String = row.get("schema_name");
+                let table_name: String = row.get("table_name");
+                format!("{}.{}", schema_name, table_name)
+            })
+            .collect())
+    }
+
+    /// Per-table query counts over the last 7 days as queries/day, keyed by
+    /// `schema.table`. Feeds the "access heat" signal for adaptive scheduling.
+    pub async fn get_access_per_day(&self, catalog: &str) -> Result<HashMap<String, f32>> {
+        let seven_days_ago = Local::now() - Duration::days(7);
+        let sql = "SELECT schema_name, table_name, SUM(query_count)::float8 / 7.0 AS per_day \
+            FROM system.query_table_daily_stats \
+            WHERE catalog = $1 AND stat_date >= $2 \
+            GROUP BY schema_name, table_name;";
+
+        let rows = sqlx::query(sql)
+            .bind(catalog)
+            .bind(seven_days_ago.date_naive())
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let schema_name: String = row.get("schema_name");
+                let table_name: String = row.get("table_name");
+                let per_day: f64 = row.try_get("per_day").unwrap_or(0.0);
+                (format!("{}.{}", schema_name, table_name), per_day as f32)
+            })
+            .collect())
     }
 
     /// Returns `(catalog_name, db_type, cache_policy)` for every registered

@@ -96,8 +96,20 @@ score = w_a*freshness_value + w_u*update_pressure - w_c*cost
 
 权重 `w_*` 走 env，给保守默认。结果写 `table_sync_policy.refresh_bucket/refresh_interval_sec`。
 
-### 2.3 调度器改造
-现在：每 catalog 一个 cron 全量遍历。改为**分档调度器**：每个 bucket 一个 cron（fast/normal/slow/cold 共 4 条/catalog），触发时只挑该档的表 `add_task`。表升降档由一个低频（如每小时）"重评估"任务更新 policy。改动集中在 `catalog.rs::create_catalog_scheduler_job` + `cache_sync_task.rs`。向后兼容：没有 policy 行的表落 `normal`。
+### 2.3 调度器改造（已实现：tick + 周期重评估）
+现在：每 catalog 一个 cron 全量遍历。改为**逐表到期触发**——比"每档一个 cron"更简单、且支持连续区间：
+
+- 每 catalog 一个**每分钟 tick**（`adaptive::tick_refresh_due`）：查 `get_due_refresh_tables`
+  （`last_sync_at + refresh_interval_sec <= now` 的表），逐个 `refresh_single_table` 入队；
+  用 `TaskManager::has_inflight_table_task` 去重，避免同步耗时超过 tick 时堆积重复任务。
+- 同一 tick 闭包里按计数器每 `KOKEDB_REEVALUATE_INTERVAL_MIN` 分钟跑一次
+  `adaptive::reevaluate_catalog`：重新 `select_tables_for_policy`（顺带发现新表）+ 采信号 +
+  打分 + upsert policy。
+- `KOKEDB_ADAPTIVE_REFRESH=false` 回退到旧的单 cron 全量同步。
+
+改动落在 `catalog.rs::create_catalog_scheduler_job`、新模块 `task-manager/src/{table_signals,adaptive}.rs`、
+`cache_sync_task.rs`(抽出 `select_tables_for_policy`)、meta 的 `table_sync_policy` 访问器。
+向后兼容：没有 policy 行的表不会被 tick 选中，由首次同步 + 重评估补种。
 
 ---
 
