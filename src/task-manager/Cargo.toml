@@ -24,6 +24,8 @@ sqlx.workspace = true
 futures-util.workspace = true
 log.workspace = true
 anyhow.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

@@ -17,7 +17,8 @@ use sqlx::postgres::PgPool;
 
 use crate::cache_sync_task::{refresh_single_table, select_tables_for_policy};
 use crate::error::TaskError;
-use crate::incremental_infer::infer_strategy;
+use crate::incremental_infer::{classify, gather_facts, IncTier};
+use crate::llm::{self, LlmConfig, TableStats, TableSummary};
 use crate::table_signals::{bucket, collect_remote_signals, score, ScoreWeights};
 use crate::task_manager::TaskManager;
 
@@ -84,39 +85,99 @@ pub async fn reevaluate_catalog(
             updated += 1;
         }
 
-        // Infer the incremental strategy and persist it. The upsert preserves any
-        // existing lifecycle status, so a trusted strategy activates immediately
-        // while probation/audited ones wait for validation (Phase 2c).
+        // Infer the incremental strategy (rule-based, optionally LLM-assisted)
+        // and persist it. The upsert preserves any existing lifecycle status.
         if get_env_as("KOKEDB_INFER_INCREMENTAL", true) {
-            match infer_strategy(&pool, table).await {
-                Ok(s) => {
-                    let inc = TableIncPolicy {
-                        inc_mode: s.mode.as_str().to_string(),
-                        inc_status: s.tier.initial_status().to_string(),
-                        inc_tier: s.tier.as_str().to_string(),
-                        watermark_column: s.watermark_column.clone(),
-                        pk_columns: (!s.pk_columns.is_empty())
-                            .then(|| s.pk_columns.join(",")),
-                        source: "rule".to_string(),
-                        confidence: Some(s.confidence_pct as f32 / 100.0),
-                        reason: Some(s.reason.clone()),
-                        audit_passes: 0,
-                        divergence_count: 0,
-                    };
-                    if let Err(e) = meta
-                        .upsert_table_inc_policy(catalog, &schema, &tbl, &inc)
-                        .await
-                    {
-                        warn!("Failed to persist inc policy for {catalog}.{table}: {e}");
-                    }
-                }
-                Err(e) => warn!("Incremental inference failed for {catalog}.{table}: {e}"),
+            if let Err(e) =
+                infer_and_persist(&meta, &pool, catalog, &schema, &tbl, table, &signals).await
+            {
+                warn!("Incremental inference failed for {catalog}.{table}: {e}");
             }
         }
     }
     pool.close().await;
 
     info!("Adaptive reeval for catalog '{catalog}': updated {updated}/{} table policies", tables.len());
+    Ok(())
+}
+
+/// Infers a table's incremental strategy (rule-based, with an optional LLM
+/// assist when the rules are unsure) and persists it. A prior LLM decision that
+/// is already in the validation pipeline is left untouched.
+async fn infer_and_persist(
+    meta: &PostgreSQLMetaCatalogProviderList,
+    pool: &PgPool,
+    catalog: &str,
+    schema: &str,
+    tbl: &str,
+    qualified_table: &str,
+    signals: &crate::table_signals::TableSignals,
+) -> Result<(), TaskError> {
+    // Don't overwrite an LLM recommendation that the state machine already owns.
+    if let Ok(Some(existing)) = meta.get_table_inc_policy(catalog, schema, tbl).await {
+        if existing.source == "llm" && existing.inc_status != "none" {
+            return Ok(());
+        }
+    }
+
+    let facts = gather_facts(pool, qualified_table).await?;
+    let rule = classify(&facts);
+
+    // Build the policy from the rule by default.
+    let mut inc = TableIncPolicy {
+        inc_mode: rule.mode.as_str().to_string(),
+        inc_status: rule.tier.initial_status().to_string(),
+        inc_tier: rule.tier.as_str().to_string(),
+        watermark_column: rule.watermark_column.clone(),
+        pk_columns: (!rule.pk_columns.is_empty()).then(|| rule.pk_columns.join(",")),
+        source: "rule".to_string(),
+        confidence: Some(rule.confidence_pct as f32 / 100.0),
+        reason: Some(rule.reason.clone()),
+        audit_passes: 0,
+        divergence_count: 0,
+    };
+
+    // When the rule is unsure and an LLM is configured, ask it and prefer a valid
+    // recommendation. An LLM strategy is never trusted directly — it starts as
+    // `suggested`/`audited` and must pass shadow validation like any inference.
+    let unsure = (rule.confidence_pct as f32 / 100.0) < llm::confidence_threshold();
+    if unsure {
+        if let Some(cfg) = LlmConfig::from_env() {
+            let columns = llm::gather_columns(pool, qualified_table).await.unwrap_or_default();
+            let summary = TableSummary {
+                table: qualified_table.to_string(),
+                columns,
+                primary_key: facts.pk_columns.clone(),
+                has_update_trigger: facts.has_update_trigger,
+                stats: Some(TableStats {
+                    est_rows: signals.est_rows as i64,
+                    est_size_bytes: signals.est_size_bytes as i64,
+                    churn_per_hour: signals.churn_per_hour,
+                    timestamp_columns: facts
+                        .timestamp_columns
+                        .iter()
+                        .map(|c| c.name.clone())
+                        .collect(),
+                }),
+            };
+            if let Some(rec) = llm::recommend(&cfg, &summary).await {
+                inc.inc_mode = rec.inc_mode.clone();
+                inc.watermark_column = rec.watermark_column.clone();
+                inc.pk_columns = (!rec.pk_columns.is_empty()).then(|| rec.pk_columns.join(","));
+                // Inferred by a model → always audited, must be validated.
+                inc.inc_tier = IncTier::Audited.as_str().to_string();
+                inc.inc_status = if rec.inc_mode == "full" { "none" } else { "suggested" }
+                    .to_string();
+                inc.source = "llm".to_string();
+                inc.confidence = Some(rec.confidence);
+                inc.reason = Some(format!("[llm] {}", rec.reason));
+            }
+        }
+    }
+
+    meta.upsert_table_inc_policy(catalog, schema, tbl, &inc)
+        .await
+        .map_err(|e| TaskError::MetaReqeustError(format!("persist inc policy failed: {e}")))?;
     Ok(())
 }
 
