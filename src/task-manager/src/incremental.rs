@@ -216,76 +216,72 @@ pub async fn merge_snapshot(
 }
 
 #[cfg(test)]
-mod hive_bench {
+mod tests {
+    use arrow::array::Int64Array;
     use arrow::datatypes::DataType;
     use datafusion::dataframe::DataFrameWriteOptions;
     use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::datasource::listing::{
         ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
     };
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{ParquetReadOptions, SessionContext};
     use std::sync::Arc;
-    use std::time::Instant;
 
-    async fn time_ms(ctx: &SessionContext, sql: &str) -> u128 {
-        let t = Instant::now();
-        let df = ctx.sql(sql).await.unwrap();
-        let _ = df.collect().await.unwrap();
-        t.elapsed().as_millis()
-    }
+    // Regression test for the Hive-partitioned read path: writing a snapshot
+    // partitioned by `k` must exclude `k` from the parquet files (it lives in
+    // the path), and reading it back with `k` as a partition column must resolve
+    // without duplicating the column (`SELECT ... WHERE k = ...` works).
+    #[tokio::test]
+    async fn partitioned_snapshot_excludes_and_reads_partition_column() {
+        let base = std::env::temp_dir().join("kokedb-test-hive");
+        let flat = base.join("flat");
+        let out = base.join("out");
+        let flat = flat.to_string_lossy();
+        let out = out.to_string_lossy();
+        let _ = std::fs::remove_dir_all(base.as_path());
 
-    // Reproduce the production path: write flat, repartition via SELECT *, then
-    // register with infer_schema + partition col, and query the partition col.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "local repro; run explicitly"]
-    async fn partitioned_query_does_not_duplicate_column() {
-        let flat = "/tmp/kokedb-repro-flat";
-        let out = "/tmp/kokedb-repro-out";
-        let _ = std::fs::remove_dir_all(flat);
-        let _ = std::fs::remove_dir_all(out);
-
+        // Flat dataset with a low-cardinality column `k` (0..4), 1000 rows.
         let ctx = SessionContext::new();
-        // Flat dataset with a low-card column k.
-        let df = ctx
-            .sql("SELECT value AS id, CAST(value % 4 AS INT) AS k, CAST(value AS DOUBLE) AS v FROM range(0, 1000)")
+        ctx.sql("SELECT value AS id, CAST(value % 4 AS INT) AS k, CAST(value AS DOUBLE) AS v FROM range(0, 1000)")
             .await
-            .unwrap();
-        df.write_parquet(flat, DataFrameWriteOptions::new(), None)
+            .unwrap()
+            .write_parquet(&flat, DataFrameWriteOptions::new(), None)
             .await
             .unwrap();
 
-        // Production repartition: register flat, SELECT *, write partition_by(k).
-        let ctx2 = SessionContext::new();
-        let opts = ListingOptions::new(Arc::new(ParquetFormat::default()));
-        let url = ListingTableUrl::parse(flat).unwrap();
-        let cfg = ListingTableConfig::new(url)
-            .with_listing_options(opts)
-            .infer_schema(&ctx2.state())
+        // Repartition by `k` the same way the sync path does (SELECT * + partition_by).
+        let writer = SessionContext::new();
+        let cfg = ListingTableConfig::new(ListingTableUrl::parse(&flat).unwrap())
+            .with_listing_options(ListingOptions::new(Arc::new(ParquetFormat::default())))
+            .infer_schema(&writer.state())
             .await
             .unwrap();
-        ctx2.register_table("flat", Arc::new(ListingTable::try_new(cfg).unwrap()))
+        writer
+            .register_table("flat", Arc::new(ListingTable::try_new(cfg).unwrap()))
             .unwrap();
-        let merged = ctx2.sql("SELECT * FROM flat").await.unwrap();
-        merged
+        writer
+            .sql("SELECT * FROM flat")
+            .await
+            .unwrap()
             .write_parquet(
-                out,
+                &out,
                 DataFrameWriteOptions::new().with_partition_by(vec!["k".to_string()]),
                 None,
             )
             .await
             .unwrap();
 
-        // Inspect: does a partition file still contain column k?
+        // The partition column must not be stored inside the files.
         let probe = SessionContext::new();
         probe
             .register_parquet(
                 "probe",
-                &format!("{out}/k=0"),
-                datafusion::prelude::ParquetReadOptions::default(),
+                base.join("out/k=0").to_string_lossy().as_ref(),
+                ParquetReadOptions::default(),
             )
             .await
             .unwrap();
-        let cols: Vec<String> = probe
+        let file_cols: Vec<String> = probe
             .table("probe")
             .await
             .unwrap()
@@ -294,88 +290,48 @@ mod hive_bench {
             .iter()
             .map(|f| f.name().clone())
             .collect();
-        println!("REPRO file columns in k=0: {cols:?}");
+        assert!(
+            !file_cols.contains(&"k".to_string()),
+            "partition column must be excluded from files, got {file_cols:?}"
+        );
 
-        // Now register Hive-partitioned like build_listing_table does.
+        // Reading back with `k` as a partition column must not duplicate it.
         let qctx = SessionContext::new();
-        let opts = ListingOptions::new(Arc::new(ParquetFormat::default()))
+        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
             .with_table_partition_cols(vec![("k".to_string(), DataType::Int32)]);
-        let url = ListingTableUrl::parse(out).unwrap();
-        let cfg = ListingTableConfig::new(url)
-            .with_listing_options(opts)
+        let cfg = ListingTableConfig::new(ListingTableUrl::parse(&out).unwrap())
+            .with_listing_options(options)
             .infer_schema(&qctx.state())
             .await
             .unwrap();
         qctx.register_table("t", Arc::new(ListingTable::try_new(cfg).unwrap()))
             .unwrap();
-        let res = qctx.sql("SELECT count(*) FROM t WHERE k = 1").await;
-        match res {
-            Ok(df) => {
-                let n = df.collect().await;
-                println!("REPRO WHERE k=1 -> {:?}", n.map(|b| b[0].num_rows()));
-            }
-            Err(e) => println!("REPRO ERROR: {e}"),
-        }
-        let _ = std::fs::remove_dir_all(flat);
-        let _ = std::fs::remove_dir_all(out);
-    }
 
-    // De-risk: does DataFusion Hive partition pruning give a measurable win at
-    // ~10M rows? Generates a partitioned parquet dataset and times a
-    // partition-filtered query vs a full scan vs a non-partition filter.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "local benchmark; run explicitly"]
-    async fn hive_partition_pruning_benchmark() {
-        let dir = "/tmp/kokedb-hive-bench";
-        let _ = std::fs::remove_dir_all(dir);
-
-        let ctx = SessionContext::new();
-        // 10M rows, partition column `part` with 10 distinct values.
-        let gen = ctx
-            .sql(
-                "SELECT CAST(value % 10 AS INT) AS part, value AS id, \
-                 CAST(value AS DOUBLE) * 1.5 AS v FROM range(0, 10000000)",
-            )
+        let count_one = |b: &arrow::record_batch::RecordBatch| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+        let part = qctx
+            .sql("SELECT count(*) FROM t WHERE k = 1")
+            .await
+            .unwrap()
+            .collect()
             .await
             .unwrap();
-        gen.write_parquet(
-            dir,
-            DataFrameWriteOptions::new().with_partition_by(vec!["part".to_string()]),
-            None,
-        )
-        .await
-        .unwrap();
+        assert_eq!(count_one(&part[0]), 250, "k=1 selects one of four partitions");
+        let total = qctx
+            .sql("SELECT count(*) FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(count_one(&total[0]), 1000);
 
-        // Register as a Hive-partitioned listing table.
-        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-            .with_table_partition_cols(vec![("part".to_string(), DataType::Int32)]);
-        let url = ListingTableUrl::parse(dir).unwrap();
-        let config = ListingTableConfig::new(url).with_listing_options(options);
-        let config = config.infer_schema(&ctx.state()).await.unwrap();
-        let table = ListingTable::try_new(config).unwrap();
-        ctx.register_table("t", Arc::new(table)).unwrap();
-
-        // Warm + measure (best of 3).
-        let q_part = "SELECT count(*), sum(v) FROM t WHERE part = 3";
-        let q_full = "SELECT count(*), sum(v) FROM t";
-        let q_nonpart = "SELECT count(*), sum(v) FROM t WHERE id % 10 = 3";
-        for _ in 0..1 {
-            time_ms(&ctx, q_part).await;
-            time_ms(&ctx, q_full).await;
-        }
-        let mut part = u128::MAX;
-        let mut full = u128::MAX;
-        let mut nonpart = u128::MAX;
-        for _ in 0..3 {
-            part = part.min(time_ms(&ctx, q_part).await);
-            full = full.min(time_ms(&ctx, q_full).await);
-            nonpart = nonpart.min(time_ms(&ctx, q_nonpart).await);
-        }
-        println!(
-            "HIVE-BENCH  partition-filter(part=3)={part}ms  full-scan={full}ms  \
-             nonpartition-filter(id%10=3)={nonpart}ms"
-        );
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(base.as_path());
     }
 }
 
