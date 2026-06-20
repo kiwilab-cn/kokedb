@@ -5,6 +5,7 @@ use kokedb_common::cache_policy::CachePolicy;
 use kokedb_common::env::get_env_as;
 use kokedb_task_manager::adaptive;
 use kokedb_task_manager::cache_sync_task::{execute_catalog_sync_task, refresh_single_table};
+use kokedb_task_manager::shadow_validate;
 use kokedb_task_manager::error::TaskError;
 use log::{error, info, warn};
 use tokio_cron_scheduler::Job;
@@ -236,6 +237,12 @@ impl CatalogManager {
                         adaptive::tick_refresh_due(&catalog, &dsn, task_manager).await
                     {
                         error!("Adaptive tick failed for '{}': {}", catalog, e);
+                    }
+                    // Shadow-validate audit-due tables (low budget per tick).
+                    if get_env_as("KOKEDB_SHADOW_VALIDATE", true) {
+                        if let Err(e) = shadow_validate::sweep_audits(&catalog, &dsn).await {
+                            error!("Shadow audit sweep failed for '{}': {}", catalog, e);
+                        }
                     }
                     // Re-evaluate cadences every `reeval_min` minutes.
                     let elapsed_min =

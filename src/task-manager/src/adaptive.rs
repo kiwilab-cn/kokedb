@@ -100,6 +100,8 @@ pub async fn reevaluate_catalog(
                         source: "rule".to_string(),
                         confidence: Some(s.confidence_pct as f32 / 100.0),
                         reason: Some(s.reason.clone()),
+                        audit_passes: 0,
+                        divergence_count: 0,
                     };
                     if let Err(e) = meta
                         .upsert_table_inc_policy(catalog, &schema, &tbl, &inc)

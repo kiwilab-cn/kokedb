@@ -215,6 +215,75 @@ pub async fn merge_snapshot(
     Ok(())
 }
 
+/// Exact, order-independent comparison of two parquet snapshot directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotDiff {
+    pub count_a: i64,
+    pub count_b: i64,
+    /// Rows present in exactly one side (symmetric difference).
+    pub diff_rows: i64,
+}
+
+impl SnapshotDiff {
+    pub fn matches(&self) -> bool {
+        self.diff_rows == 0 && self.count_a == self.count_b
+    }
+}
+
+/// Compares two snapshot directories (same schema) for row-level equality using
+/// a symmetric `EXCEPT`. Catches missed inserts/deletes *and* silent updates,
+/// regardless of row order. Used by shadow validation to check that the
+/// incremental candidate equals the full truth.
+pub async fn compare_snapshots(
+    dir_a: &str,
+    dir_b: &str,
+    schema: Arc<Schema>,
+) -> Result<SnapshotDiff, TaskError> {
+    let ctx = SessionContext::new();
+    register_parquet_dir(&ctx, "a", dir_a, schema.clone()).await?;
+    register_parquet_dir(&ctx, "b", dir_b, schema).await?;
+
+    let count_a = scalar_count(&ctx, "SELECT count(*) FROM a").await?;
+    let count_b = scalar_count(&ctx, "SELECT count(*) FROM b").await?;
+    // Parenthesize each EXCEPT: EXCEPT and UNION ALL are left-associative with
+    // equal precedence, so without parens this would mis-parse.
+    let diff_rows = scalar_count(
+        &ctx,
+        "SELECT count(*) FROM ( \
+            (SELECT * FROM a EXCEPT SELECT * FROM b) \
+            UNION ALL \
+            (SELECT * FROM b EXCEPT SELECT * FROM a) \
+         ) t",
+    )
+    .await?;
+
+    Ok(SnapshotDiff {
+        count_a,
+        count_b,
+        diff_rows,
+    })
+}
+
+/// Runs a single-`Int64`-scalar query and returns the value (0 if empty).
+async fn scalar_count(ctx: &SessionContext, sql: &str) -> Result<i64, TaskError> {
+    let batches = ctx
+        .sql(sql)
+        .await
+        .map_err(|e| TaskError::ExecutionFailed(format!("compare query failed: {e}")))?
+        .collect()
+        .await
+        .map_err(|e| TaskError::ExecutionFailed(format!("compare collect failed: {e}")))?;
+    Ok(batches
+        .first()
+        .and_then(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .map(|a| a.value(0))
+        })
+        .unwrap_or(0))
+}
+
 #[cfg(test)]
 mod tests {
     use arrow::array::Int64Array;
@@ -330,6 +399,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count_one(&total[0]), 1000);
+
+        let _ = std::fs::remove_dir_all(base.as_path());
+    }
+
+    // compare_snapshots must report equality for identical data and catch a
+    // single silently-changed row (the case watermark incremental would miss).
+    #[tokio::test]
+    async fn compare_snapshots_detects_silent_change() {
+        use super::compare_snapshots;
+        let base = std::env::temp_dir().join("kokedb-test-cmp");
+        let a = base.join("a");
+        let b = base.join("b");
+        let c = base.join("c");
+        let (a, b, c) = (
+            a.to_string_lossy().to_string(),
+            b.to_string_lossy().to_string(),
+            c.to_string_lossy().to_string(),
+        );
+        let _ = std::fs::remove_dir_all(base.as_path());
+
+        let ctx = SessionContext::new();
+        ctx.sql("SELECT value AS id, value * 2 AS v FROM range(0, 500)")
+            .await
+            .unwrap()
+            .write_parquet(&a, DataFrameWriteOptions::new(), None)
+            .await
+            .unwrap();
+        // Identical content (rewritten -> different file/order on purpose).
+        ctx.sql("SELECT value AS id, value * 2 AS v FROM range(0, 500) ORDER BY id DESC")
+            .await
+            .unwrap()
+            .write_parquet(&b, DataFrameWriteOptions::new(), None)
+            .await
+            .unwrap();
+        // One row silently changed (same id, different v).
+        ctx.sql("SELECT value AS id, CASE WHEN value = 7 THEN 999999 ELSE value * 2 END AS v FROM range(0, 500)")
+            .await
+            .unwrap()
+            .write_parquet(&c, DataFrameWriteOptions::new(), None)
+            .await
+            .unwrap();
+
+        let schema = ctx
+            .read_parquet(&a, ParquetReadOptions::default())
+            .await
+            .unwrap()
+            .schema()
+            .as_arrow()
+            .clone();
+        let schema = Arc::new(schema);
+
+        let same = compare_snapshots(&a, &b, schema.clone()).await.unwrap();
+        assert!(same.matches(), "identical data must match: {same:?}");
+        assert_eq!(same.diff_rows, 0);
+
+        let changed = compare_snapshots(&a, &c, schema).await.unwrap();
+        assert!(!changed.matches(), "silent change must be detected");
+        assert_eq!(changed.diff_rows, 2, "one changed row -> present in each side");
 
         let _ = std::fs::remove_dir_all(base.as_path());
     }

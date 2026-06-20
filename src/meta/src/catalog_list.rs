@@ -65,6 +65,8 @@ pub struct TableIncPolicy {
     pub source: String,
     pub confidence: Option<f32>,
     pub reason: Option<String>,
+    pub audit_passes: i32,
+    pub divergence_count: i32,
 }
 
 #[derive(Debug)]
@@ -221,6 +223,9 @@ impl PostgreSQLMetaCatalogProviderList {
                 source VARCHAR(16) NOT NULL DEFAULT 'rule',
                 confidence REAL,
                 reason TEXT,
+                next_audit_at TIMESTAMPTZ,
+                audit_passes INTEGER NOT NULL DEFAULT 0,
+                divergence_count INTEGER NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (catalog, schema_name, table_name)
             );
@@ -670,7 +675,8 @@ impl PostgreSQLMetaCatalogProviderList {
         table: &str,
     ) -> Result<Option<TableIncPolicy>> {
         let sql = "SELECT inc_mode, inc_status, inc_tier, watermark_column, pk_columns, \
-            source, confidence, reason FROM system.table_sync_policy \
+            source, confidence, reason, audit_passes, divergence_count \
+            FROM system.table_sync_policy \
             WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
 
         let row = sqlx::query(sql)
@@ -692,7 +698,69 @@ impl PostgreSQLMetaCatalogProviderList {
             source: row.try_get("source").unwrap_or_else(|_| "rule".to_string()),
             confidence: row.try_get("confidence").ok(),
             reason: row.try_get("reason").ok(),
+            audit_passes: row.try_get("audit_passes").unwrap_or(0),
+            divergence_count: row.try_get("divergence_count").unwrap_or(0),
         }))
+    }
+
+    /// Returns `schema.table` names whose shadow audit is due: an inferred,
+    /// not-yet-rejected strategy whose `next_audit_at` has passed (or was never
+    /// scheduled — a freshly `suggested` table audits as soon as possible).
+    pub async fn get_due_audit_tables(&self, catalog: &str) -> Result<Vec<String>> {
+        let sql = "SELECT schema_name, table_name FROM system.table_sync_policy \
+            WHERE catalog = $1 \
+              AND inc_mode <> 'full' AND inc_status IN ('suggested', 'active') \
+              AND (next_audit_at IS NULL OR next_audit_at <= CURRENT_TIMESTAMP) \
+            ORDER BY schema_name, table_name;";
+
+        let rows = sqlx::query(sql)
+            .bind(catalog)
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let schema_name: String = row.get("schema_name");
+                let table_name: String = row.get("table_name");
+                format!("{}.{}", schema_name, table_name)
+            })
+            .collect())
+    }
+
+    /// Persists the result of one shadow audit: the new lifecycle status,
+    /// pass/divergence counters, and when to audit next (`None` = stop).
+    pub async fn update_audit_result(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        status: &str,
+        passes: i32,
+        divergence: i32,
+        next_audit_secs: Option<i64>,
+    ) -> Result<()> {
+        let sql = "UPDATE system.table_sync_policy SET \
+                inc_status = $4, audit_passes = $5, divergence_count = $6, \
+                next_audit_at = CASE WHEN $7::bigint IS NULL THEN NULL \
+                    ELSE CURRENT_TIMESTAMP + ($7::bigint || ' seconds')::interval END, \
+                updated_at = CURRENT_TIMESTAMP \
+            WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
+
+        sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(status)
+            .bind(passes)
+            .bind(divergence)
+            .bind(next_audit_secs)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(())
     }
 
     /// Returns `(catalog_name, db_type, cache_policy)` for every registered
@@ -1122,6 +1190,8 @@ mod policy_tests {
             source: "rule".into(),
             confidence: Some(0.75),
             reason: Some("conventional watermark".into()),
+            audit_passes: 0,
+            divergence_count: 0,
         };
         meta.upsert_table_inc_policy(cat, schema, table, &suggested)
             .await
@@ -1153,6 +1223,64 @@ mod policy_tests {
         assert_eq!(got.inc_mode, "upsert");
         assert_eq!(got.watermark_column.as_deref(), Some("updated_at"));
         assert_eq!(got.pk_columns.as_deref(), Some("id"));
+
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+    }
+
+    // get_due_audit_tables should surface inferred (non-full, non-rejected)
+    // tables whose next_audit_at has passed; update_audit_result should persist
+    // the lifecycle + reschedule.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via PG_META_DSN"]
+    async fn audit_accessors_roundtrip() {
+        let pool = PgPool::connect(&meta_dsn()).await.unwrap();
+        let meta = PostgreSQLMetaCatalogProviderList::from_pool(pool);
+        meta.init_db().await.unwrap();
+        let cat = "it_audit";
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+
+        let inc = TableIncPolicy {
+            inc_mode: "upsert".into(),
+            inc_status: "suggested".into(),
+            inc_tier: "probation".into(),
+            watermark_column: Some("updated_at".into()),
+            pk_columns: Some("id".into()),
+            source: "rule".into(),
+            confidence: Some(0.7),
+            reason: None,
+            audit_passes: 0,
+            divergence_count: 0,
+        };
+        meta.upsert_table_inc_policy(cat, "public", "t1", &inc)
+            .await
+            .unwrap();
+
+        // Freshly suggested (next_audit_at NULL) is due.
+        let due = meta.get_due_audit_tables(cat).await.unwrap();
+        assert!(due.contains(&"public.t1".to_string()));
+
+        // Record a pass that reschedules far in the future -> no longer due.
+        meta.update_audit_result(cat, "public", "t1", "active", 2, 0, Some(86_400))
+            .await
+            .unwrap();
+        let due2 = meta.get_due_audit_tables(cat).await.unwrap();
+        assert!(!due2.contains(&"public.t1".to_string()), "rescheduled audit not due");
+
+        let got = meta
+            .get_table_inc_policy(cat, "public", "t1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.inc_status, "active");
+        assert_eq!(got.audit_passes, 2);
 
         sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
             .bind(cat)

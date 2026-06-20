@@ -6,5 +6,7 @@ pub mod incremental_infer;
 pub mod postgres_table_analyzer;
 pub mod read_postgres;
 pub mod runner;
+pub mod shadow_validate;
 pub mod table_signals;
 pub mod task_manager;
+pub mod validation;

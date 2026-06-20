@@ -115,14 +115,17 @@ score = w_a*freshness_value + w_u*update_pressure - w_c*cost
 
 ## 3. Phase 2：增量推断 + 安全闸门
 
-> **实现状态（2a 已落地，2c 待做）**：推断引擎 `incremental_infer.rs`（`gather_facts`+纯
-> `classify`，9 个单测）+ 分层（trusted/probation/audited）+ 落库（`table_sync_policy` 的
-> `inc_*`/watermark/pk，upsert 保留状态机不被重评估清掉）+ `plan_sync` 消费策略 已实现。
-> **安全分级落地策略**：`active`(仅 trusted=DB-enforced) 用存的策略走增量；`rejected` 强制全量；
-> 其余（none/suggested）保持**旧的 live-detection 行为**——因此常规 `PK+updated_at` 不回归，
-> 而新的高风险推断（APPEND、非常规时间戳列）legacy 探测返回 None → 仍走全量，**不会在未校验前
-> 自动启用**。§3.2 的影子校验 + sweeper（**2c**）落地后，再把 probation/audited 从"等校验"推进到
-> active，并收紧 legacy 回退。
+> **实现状态：2a + 2c 均已落地，并在真实 PG 上集成验证。**
+> - **2a 推断**：`incremental_infer.rs`（`gather_facts`+纯 `classify`）+ 分层 + 落库 + `plan_sync`
+>   消费策略。安全分级：`active`(trusted=DB-enforced) 走增量；`rejected` 强制全量；其余保持旧
+>   live-detection（常规 `PK+updated_at` 不回归；APPEND/非常规时间戳列在校验前仍走全量）。
+> - **2c 影子校验**：纯状态机 `validation.rs`（promote/demote + 抽检频率随履历衰减 + 迟滞防抖，7 单测）；
+>   对账原语 `incremental::compare_snapshots`（对称 `EXCEPT`，捕获漏插/漏删/静默更新）；
+>   `shadow_validate.rs::validate_table` 隔离双跑（独立拉全量 vs 上次快照+delta 合并，比对），过校验
+>   推进 probation→active、audited 保持低频抽检、连续 diverge→rejected+自愈;sweeper 挂在调度 tick 上
+>   （`KOKEDB_SHADOW_VALIDATE`，低预算/tick，复用现有调度不另起线程池）。meta 加
+>   `next_audit_at/audit_passes/divergence_count` + `get_due_audit_tables`/`update_audit_result`。
+> - **集成验证**：核心安全属性已在真库验证——干净 append→Pass，静默更新(不动 watermark)→Diverge 被抓住。
 
 ### 3.1 放宽 watermark 检测（规则）
 `detect_watermark_column` 升级为 `infer_incremental_strategy`：
