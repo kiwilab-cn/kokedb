@@ -149,3 +149,88 @@ pub async fn tick_refresh_due(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Row;
+
+    fn test_dsn() -> String {
+        std::env::var("KOKEDB_TEST_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".into())
+    }
+
+    // End-to-end: reevaluate_catalog must select the listed tables, score a
+    // cadence, infer an incremental strategy, and persist both into
+    // system.table_sync_policy.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via KOKEDB_TEST_DSN + PG_META_DSN"]
+    async fn reevaluate_persists_cadence_and_strategy() {
+        let pool = PgPool::connect(&test_dsn()).await.unwrap();
+        for stmt in [
+            "DROP TABLE IF EXISTS it_e2e_upsert, it_e2e_full CASCADE",
+            "CREATE TABLE it_e2e_upsert (id int PRIMARY KEY, v text, \
+             updated_at timestamptz NOT NULL DEFAULT now())",
+            "INSERT INTO it_e2e_upsert(id,v) SELECT g,'x' FROM generate_series(1,200) g",
+            "CREATE TABLE it_e2e_full (v text)",
+            "ANALYZE it_e2e_upsert",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+
+        // Ensure the meta schema exists (init_db via the meta client), then use a
+        // separate pool for raw assertion/cleanup queries (local_pool is private).
+        PostgreSQLMetaCatalogProviderList::new()
+            .await
+            .unwrap()
+            .init_db()
+            .await
+            .unwrap();
+        let meta_dsn = std::env::var("PG_META_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/kokedb".into());
+        let meta_pool = PgPool::connect(&meta_dsn).await.unwrap();
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = 'it_e2e'")
+            .execute(&meta_pool)
+            .await
+            .unwrap();
+
+        let policy = CachePolicy::Select {
+            table_set: "public.it_e2e_upsert,public.it_e2e_full".into(),
+        };
+        reevaluate_catalog("it_e2e", &test_dsn(), &policy)
+            .await
+            .unwrap();
+
+        let rows = sqlx::query(
+            "SELECT table_name, refresh_bucket, refresh_interval_sec, inc_mode, inc_status, \
+                    est_row_count FROM system.table_sync_policy \
+             WHERE catalog = 'it_e2e' ORDER BY table_name",
+        )
+        .fetch_all(&meta_pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "both tables should have a policy row");
+
+        let by_name = |n: &str| {
+            rows.iter()
+                .find(|r| r.get::<String, _>("table_name") == n)
+                .unwrap_or_else(|| panic!("missing {n}"))
+        };
+        let upsert = by_name("it_e2e_upsert");
+        assert_eq!(upsert.get::<String, _>("inc_mode"), "upsert");
+        assert!(upsert.get::<i32, _>("refresh_interval_sec") > 0);
+        assert!(upsert.get::<Option<i64>, _>("est_row_count").unwrap_or(0) >= 1);
+
+        let full = by_name("it_e2e_full");
+        assert_eq!(full.get::<String, _>("inc_mode"), "full");
+
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = 'it_e2e'")
+            .execute(&meta_pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE IF EXISTS it_e2e_upsert, it_e2e_full CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}

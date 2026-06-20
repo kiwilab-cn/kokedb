@@ -411,4 +411,61 @@ mod tests {
         };
         assert_eq!(classify(&facts).mode, IncMode::Full);
     }
+
+    fn test_dsn() -> String {
+        std::env::var("KOKEDB_TEST_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".into())
+    }
+
+    // Exercises every SQL probe in `gather_facts` against a real PostgreSQL:
+    // a DB-enforced upsert table, an identity-PK append table, and a no-key
+    // full-refresh table.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via KOKEDB_TEST_DSN"]
+    async fn gather_facts_classifies_real_tables() {
+        let pool = PgPool::connect(&test_dsn()).await.unwrap();
+
+        sqlx::query("DROP TABLE IF EXISTS it_upsert, it_append, it_full CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // DB-enforced watermark: DEFAULT now() + a BEFORE UPDATE trigger.
+        for stmt in [
+            "CREATE TABLE it_upsert (id int PRIMARY KEY, v text, \
+             updated_at timestamptz NOT NULL DEFAULT now())",
+            "CREATE OR REPLACE FUNCTION it_touch() RETURNS trigger AS $$ \
+             BEGIN NEW.updated_at = now(); RETURN NEW; END; $$ LANGUAGE plpgsql",
+            "CREATE TRIGGER it_upsert_touch BEFORE UPDATE ON it_upsert \
+             FOR EACH ROW EXECUTE FUNCTION it_touch()",
+            "INSERT INTO it_upsert(id, v) SELECT g, 'x' FROM generate_series(1, 100) g",
+            "CREATE TABLE it_append (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text)",
+            "INSERT INTO it_append(v) SELECT 'y' FROM generate_series(1, 50)",
+            "CREATE TABLE it_full (v text)",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+
+        let upsert = classify(&gather_facts(&pool, "public.it_upsert").await.unwrap());
+        assert_eq!(upsert.mode, IncMode::Upsert, "{upsert:?}");
+        assert_eq!(upsert.tier, IncTier::Trusted, "{upsert:?}");
+        assert_eq!(upsert.watermark_column.as_deref(), Some("updated_at"));
+
+        let append = classify(&gather_facts(&pool, "public.it_append").await.unwrap());
+        assert_eq!(append.mode, IncMode::Append, "{append:?}");
+        assert_eq!(append.tier, IncTier::Audited, "{append:?}");
+        assert_eq!(append.watermark_column.as_deref(), Some("id"));
+
+        let full = classify(&gather_facts(&pool, "public.it_full").await.unwrap());
+        assert_eq!(full.mode, IncMode::Full, "{full:?}");
+
+        sqlx::query("DROP TABLE IF EXISTS it_upsert, it_append, it_full CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP FUNCTION IF EXISTS it_touch() CASCADE")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }

@@ -1071,3 +1071,93 @@ impl CatalogProviderList for PostgreSQLMetaCatalogProviderList {
         })
     }
 }
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    fn meta_dsn() -> String {
+        std::env::var("PG_META_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/kokedb".into())
+    }
+
+    // Verifies the table_sync_policy schema is created and that cadence + inc
+    // policy roundtrip, including that re-inference does NOT clobber a decided
+    // lifecycle status.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via PG_META_DSN"]
+    async fn sync_policy_roundtrip_and_status_preserved() {
+        let pool = PgPool::connect(&meta_dsn()).await.unwrap();
+        let meta = PostgreSQLMetaCatalogProviderList::from_pool(pool);
+        meta.init_db().await.unwrap();
+
+        let (cat, schema, table) = ("it_cat", "public", "it_policy");
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+
+        // Cadence upsert.
+        let cadence = TableSyncPolicy {
+            refresh_bucket: "fast".into(),
+            refresh_interval_sec: 120,
+            est_row_count: Some(1000),
+            est_size_bytes: Some(4096),
+            churn_per_hour: Some(10.0),
+            access_per_day: Some(5.0),
+            score: Some(3.5),
+        };
+        meta.upsert_table_sync_policy(cat, schema, table, &cadence)
+            .await
+            .unwrap();
+
+        // First inference: probation -> suggested.
+        let suggested = TableIncPolicy {
+            inc_mode: "upsert".into(),
+            inc_status: "suggested".into(),
+            inc_tier: "probation".into(),
+            watermark_column: Some("updated_at".into()),
+            pk_columns: Some("id".into()),
+            source: "rule".into(),
+            confidence: Some(0.75),
+            reason: Some("conventional watermark".into()),
+        };
+        meta.upsert_table_inc_policy(cat, schema, table, &suggested)
+            .await
+            .unwrap();
+
+        // Manually promote to active (simulating validation).
+        sqlx::query(
+            "UPDATE system.table_sync_policy SET inc_status='active' \
+             WHERE catalog=$1 AND schema_name=$2 AND table_name=$3",
+        )
+        .bind(cat)
+        .bind(schema)
+        .bind(table)
+        .execute(&meta.local_pool)
+        .await
+        .unwrap();
+
+        // Re-inference (e.g. next reeval) must NOT reset active -> suggested.
+        meta.upsert_table_inc_policy(cat, schema, table, &suggested)
+            .await
+            .unwrap();
+
+        let got = meta
+            .get_table_inc_policy(cat, schema, table)
+            .await
+            .unwrap()
+            .expect("policy row exists");
+        assert_eq!(got.inc_status, "active", "lifecycle must be preserved");
+        assert_eq!(got.inc_mode, "upsert");
+        assert_eq!(got.watermark_column.as_deref(), Some("updated_at"));
+        assert_eq!(got.pk_columns.as_deref(), Some("id"));
+
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+    }
+}

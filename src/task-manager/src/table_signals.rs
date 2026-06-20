@@ -135,13 +135,16 @@ pub async fn collect_remote_signals(
     };
 
     // Churn since stats were last reset: (ins+upd+del) over the elapsed hours.
+    // The per-table write counters live in pg_stat_user_tables, but the reset
+    // timestamp that bounds them is db-level (pg_stat_database.stats_reset).
     let churn_per_hour = sqlx::query(
-        "SELECT (COALESCE(n_tup_ins,0)+COALESCE(n_tup_upd,0)+COALESCE(n_tup_del,0))::float8 \
+        "SELECT (COALESCE(t.n_tup_ins,0)+COALESCE(t.n_tup_upd,0)+COALESCE(t.n_tup_del,0))::float8 \
                 AS writes, \
-                GREATEST(EXTRACT(EPOCH FROM (now() - COALESCE(stats_reset, now() - interval '1 hour'))), 1.0) \
+                GREATEST(EXTRACT(EPOCH FROM (now() - COALESCE(d.stats_reset, now() - interval '1 hour'))), 1.0) \
                 AS secs \
-         FROM pg_stat_user_tables \
-         WHERE relid = $1::regclass",
+         FROM pg_stat_user_tables t \
+         JOIN pg_stat_database d ON d.datname = current_database() \
+         WHERE t.relid = $1::regclass",
     )
     .bind(regclass)
     .fetch_optional(pool)
@@ -227,5 +230,36 @@ mod tests {
         assert!(RefreshBucket::Fast.interval_sec() < RefreshBucket::Normal.interval_sec());
         assert!(RefreshBucket::Normal.interval_sec() < RefreshBucket::Slow.interval_sec());
         assert!(RefreshBucket::Slow.interval_sec() < RefreshBucket::Cold.interval_sec());
+    }
+
+    // Verifies the size/churn signal SQL runs and returns sane values against a
+    // real PostgreSQL.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via KOKEDB_TEST_DSN"]
+    async fn collect_signals_reads_real_table() {
+        let dsn = std::env::var("KOKEDB_TEST_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".into());
+        let pool = PgPool::connect(&dsn).await.unwrap();
+        sqlx::query("DROP TABLE IF EXISTS it_signals").execute(&pool).await.unwrap();
+        sqlx::query("CREATE TABLE it_signals (id int primary key, v text)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO it_signals SELECT g, repeat('x', 100) FROM generate_series(1, 5000) g")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // ANALYZE so reltuples is populated.
+        sqlx::query("ANALYZE it_signals").execute(&pool).await.unwrap();
+
+        let s = collect_remote_signals(&pool, "public.it_signals", 12.0)
+            .await
+            .unwrap();
+        assert!(s.est_rows >= 1.0, "reltuples should be populated: {s:?}");
+        assert!(s.est_size_bytes > 0.0, "size should be > 0: {s:?}");
+        assert!(s.churn_per_hour >= 0.0);
+        assert_eq!(s.access_per_day, 12.0);
+
+        sqlx::query("DROP TABLE IF EXISTS it_signals").execute(&pool).await.unwrap();
     }
 }
