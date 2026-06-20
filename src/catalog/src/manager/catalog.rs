@@ -170,6 +170,80 @@ impl CatalogManager {
         })
     }
 
+    /// Applies a user override of a table's incremental strategy
+    /// (`ALTER TABLE ... SET CACHE POLICY WITH (...)`). Supported keys:
+    /// `inc_mode` (full|upsert|append), `watermark_column`, `pk_columns`. A
+    /// user-set strategy is trusted (activated without shadow validation) and is
+    /// sticky — periodic re-evaluation will not overwrite it.
+    pub async fn set_table_cache_policy(
+        &self,
+        table: Vec<String>,
+        options: Vec<(String, String)>,
+    ) -> CatalogResult<()> {
+        let (catalog, schema_name, table_name) = match table.as_slice() {
+            [c, db, t] => (c.clone(), db.clone(), t.clone()),
+            [db, t] => (self.default_catalog()?.to_string(), db.clone(), t.clone()),
+            [t] => (
+                self.default_catalog()?.to_string(),
+                self.default_database()?.head.to_string(),
+                t.clone(),
+            ),
+            _ => {
+                return Err(CatalogError::InvalidArgument(format!(
+                    "expected catalog.database.table, got {} name parts",
+                    table.len()
+                )))
+            }
+        };
+
+        let opts: std::collections::HashMap<String, String> = options
+            .into_iter()
+            .map(|(k, v)| (k.to_lowercase(), v))
+            .collect();
+
+        let inc_mode = opts
+            .get("inc_mode")
+            .map(|s| s.to_lowercase())
+            .ok_or_else(|| {
+                CatalogError::InvalidArgument("missing required option `inc_mode`".to_string())
+            })?;
+        let watermark = opts.get("watermark_column").cloned();
+        let pk = opts.get("pk_columns").cloned();
+
+        match inc_mode.as_str() {
+            "full" => {}
+            "upsert" => {
+                if watermark.is_none() || pk.is_none() {
+                    return Err(CatalogError::InvalidArgument(
+                        "inc_mode=upsert requires `watermark_column` and `pk_columns`".to_string(),
+                    ));
+                }
+            }
+            "append" => {
+                if watermark.is_none() {
+                    return Err(CatalogError::InvalidArgument(
+                        "inc_mode=append requires `watermark_column`".to_string(),
+                    ));
+                }
+            }
+            other => {
+                return Err(CatalogError::InvalidArgument(format!(
+                    "invalid inc_mode `{other}` (expected full|upsert|append)"
+                )))
+            }
+        }
+
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        meta.set_user_inc_policy(&catalog, &schema_name, &table_name, &inc_mode, watermark, pk)
+            .await
+            .map_err(|e| {
+                CatalogError::Internal(format!("Failed to set cache policy: {e}"))
+            })?;
+
+        info!("User set cache policy for {catalog}.{schema_name}.{table_name}: inc_mode={inc_mode}");
+        Ok(())
+    }
+
     pub fn create_catalog(
         &self,
         catalog: impl Into<Arc<str>>,

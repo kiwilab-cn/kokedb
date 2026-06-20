@@ -57,6 +57,24 @@ key, validation counters, and the size/churn/access signals.
 SHOW TABLE METADATA FROM demo.public.orders;
 ```
 
+- ALTER TABLE ... SET CACHE POLICY
+
+Manually override a cached table's incremental sync strategy. A user override is
+trusted (activated without shadow validation) and sticky — periodic
+re-evaluation will not overwrite it. Supported options: `inc_mode`
+(`full` | `upsert` | `append`), `watermark_column`, `pk_columns`. `upsert`
+requires both a watermark column and primary key; `append` requires a watermark;
+`full` disables incremental sync (always full refresh).
+
+```sql
+ALTER TABLE demo.public.orders SET CACHE POLICY WITH (
+  inc_mode = 'upsert', watermark_column = 'updated_at', pk_columns = 'id'
+);
+
+-- Disable incremental for a table:
+ALTER TABLE demo.public.events SET CACHE POLICY WITH (inc_mode = 'full');
+```
+
 
 ## DML
 

@@ -269,6 +269,15 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             name,
             operation,
         } => {
+            // `ALTER TABLE ... SET CACHE POLICY WITH (...)` is a kokedb extension
+            // routed to its own command rather than the generic alter path.
+            if let AlterTableOperation::SetCachePolicy { properties, .. } = operation {
+                let node = spec::CommandNode::AlterTableCachePolicy {
+                    table: from_ast_object_name(name)?,
+                    options: from_ast_property_list(properties)?,
+                };
+                return Ok(spec::Plan::Command(spec::CommandPlan::new(node)));
+            }
             let node = spec::CommandNode::AlterTable {
                 table: from_ast_object_name(name)?,
                 if_exists: false,
@@ -1776,6 +1785,8 @@ fn from_ast_alter_table_operation(
         AlterTableOperation::AddPartitions { .. } => {}
         AlterTableOperation::DropPartition { .. } => {}
         AlterTableOperation::SetTableProperties { .. } => {}
+        // Intercepted earlier in `from_ast_statement` as AlterTableCachePolicy.
+        AlterTableOperation::SetCachePolicy { .. } => {}
         AlterTableOperation::UnsetTableProperties { .. } => {}
         AlterTableOperation::SetFileFormat { .. } => {}
         AlterTableOperation::SetLocation { .. } => {}
@@ -1862,6 +1873,32 @@ mod drop_catalog_tests {
                     assert_eq!(parts, vec!["demo", "public", "orders"]);
                 }
                 other => panic!("expected RefreshCache, got {other:?}"),
+            },
+            _ => panic!("expected a command plan"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_set_cache_policy() {
+        let plan = from_ast_statement(
+            parse_one_statement(
+                "ALTER TABLE demo.public.orders SET CACHE POLICY WITH \
+                 (inc_mode = 'upsert', watermark_column = 'updated_at', pk_columns = 'id')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        match plan {
+            spec::Plan::Command(c) => match c.node {
+                spec::CommandNode::AlterTableCachePolicy { table, options } => {
+                    let parts: Vec<String> = table.into();
+                    assert_eq!(parts, vec!["demo", "public", "orders"]);
+                    assert!(options.contains(&("inc_mode".to_string(), "upsert".to_string())));
+                    assert!(options
+                        .contains(&("watermark_column".to_string(), "updated_at".to_string())));
+                    assert!(options.contains(&("pk_columns".to_string(), "id".to_string())));
+                }
+                other => panic!("expected AlterTableCachePolicy, got {other:?}"),
             },
             _ => panic!("expected a command plan"),
         }

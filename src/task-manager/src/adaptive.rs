@@ -113,9 +113,12 @@ async fn infer_and_persist(
     qualified_table: &str,
     signals: &crate::table_signals::TableSignals,
 ) -> Result<(), TaskError> {
-    // Don't overwrite an LLM recommendation that the state machine already owns.
+    // Don't overwrite a user override, or an LLM recommendation already in the
+    // validation pipeline.
     if let Ok(Some(existing)) = meta.get_table_inc_policy(catalog, schema, tbl).await {
-        if existing.source == "llm" && existing.inc_status != "none" {
+        if existing.source == "user"
+            || (existing.source == "llm" && existing.inc_status != "none")
+        {
             return Ok(());
         }
     }

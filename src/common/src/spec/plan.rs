@@ -524,6 +524,10 @@ pub enum CommandNode {
     ShowTableMetadata {
         table: ObjectName,
     },
+    AlterTableCachePolicy {
+        table: ObjectName,
+        options: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
