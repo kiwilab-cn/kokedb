@@ -123,9 +123,37 @@ impl TaskExecutor for DataSyncExecutor {
                 TaskError::DatabaseError("Failed to connect meta postgresql server.".to_string())
             })?;
 
+        // Catalog-level Hive partition column (e.g. `with properties(partition_by="dt")`).
+        let partition_by = meta.get_catalog_partition_by(catalog).await.ok().flatten();
+
         // Decide full vs incremental vs skip from detected metadata + state.
         let plan = plan_sync(&dsn, source_table, catalog, &schema, &table, &meta).await?;
+        // Partitioned tables are always rebuilt fully (incremental + partitioned
+        // merge is not supported); reuse the columns already detected.
+        let plan = if partition_by.is_some() {
+            match plan {
+                SyncPlan::Incremental {
+                    watermark_column,
+                    pk_columns,
+                    ..
+                }
+                | SyncPlan::SkipUnchanged {
+                    watermark_column,
+                    pk_columns,
+                    ..
+                } => SyncPlan::Full {
+                    watermark_column: Some(watermark_column),
+                    pk_columns,
+                },
+                full => full,
+            }
+        } else {
+            plan
+        };
         report(0.1);
+
+        // Tracks the partition column actually used (persisted after the schema).
+        let mut partition_used: Option<String> = None;
 
         // Materialize the new snapshot (unless skipping) and compute the state
         // to persist.
@@ -168,8 +196,17 @@ impl TaskExecutor for DataSyncExecutor {
                 let sort_column = watermark_column
                     .clone()
                     .or_else(|| pk_columns.first().cloned());
-                let arrow_schema =
-                    convert_postgres_to_parquet(&dsn, source_table, &local_path, sort_column.as_deref())
+                let arrow_schema = match partition_by.as_deref() {
+                    // Hive-partition the snapshot when the catalog declares a
+                    // partition column and this table actually has it.
+                    Some(col) => {
+                        let flat = format!("/tmp/kokedb-flat/{}", uuid::Uuid::new_v4());
+                        let schema = convert_postgres_to_parquet(
+                            &dsn,
+                            source_table,
+                            &flat,
+                            sort_column.as_deref(),
+                        )
                         .await
                         .map_err(|x| {
                             TaskError::ExecutionFailed(format!(
@@ -177,6 +214,41 @@ impl TaskExecutor for DataSyncExecutor {
                                 x
                             ))
                         })?;
+                        if schema.field_with_name(col).is_ok() {
+                            ensure_dir_exists(&local_path).await?;
+                            incremental::write_partitioned(
+                                &flat,
+                                &local_path,
+                                col,
+                                schema.clone(),
+                            )
+                            .await?;
+                            let _ = tokio::fs::remove_dir_all(&flat).await;
+                            partition_used = Some(col.to_string());
+                        } else {
+                            // Table lacks the partition column: keep it flat.
+                            tokio::fs::rename(&flat, &local_path).await.map_err(|e| {
+                                TaskError::WriteParquetError(format!(
+                                    "Failed to move flat snapshot: {e}"
+                                ))
+                            })?;
+                        }
+                        schema
+                    }
+                    None => convert_postgres_to_parquet(
+                        &dsn,
+                        source_table,
+                        &local_path,
+                        sort_column.as_deref(),
+                    )
+                    .await
+                    .map_err(|x| {
+                        TaskError::ExecutionFailed(format!(
+                            "Failed to write postgresql table to parquet with error: {}",
+                            x
+                        ))
+                    })?,
+                };
 
                 let last_watermark = match &watermark_column {
                     Some(col) => {
@@ -247,6 +319,14 @@ impl TaskExecutor for DataSyncExecutor {
                 "Failed to save table schema to meta postgresql server.".to_string(),
             )
         })?;
+
+        // Record (or clear) the Hive partition column for the query path.
+        if let Err(e) = meta
+            .set_table_partition_column(catalog, &schema, &table, partition_used.as_deref())
+            .await
+        {
+            error!("Failed to persist partition column for {}: {}", schema_info, e);
+        }
 
         if let Err(e) = meta
             .upsert_table_sync_state(catalog, &schema, &table, &new_state)
