@@ -153,18 +153,37 @@ impl PostgreSQLSchemaProvider {
         Ok(table_names)
     }
 
-    fn build_listing_table(
+    async fn build_listing_table(
         schema: Arc<datafusion::arrow::datatypes::Schema>,
         table_path: &str,
+        partition_col: Option<&str>,
     ) -> Result<Arc<dyn TableProvider>> {
         let file_format: Arc<dyn datafusion::datasource::file_format::FileFormat> =
             Arc::new(ParquetFormat::default());
-        let listing_options = ListingOptions::new(file_format);
+        let mut listing_options = ListingOptions::new(file_format);
         let table_url = ListingTableUrl::parse(table_path)
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let config = ListingTableConfig::new(table_url)
-            .with_listing_options(listing_options)
-            .with_schema(schema);
+
+        let config = match partition_col {
+            // Hive-partitioned: the partition column is in the path, not the
+            // files. Declare it as a partition column and infer the file schema
+            // from the actual parquet files so the two don't collide.
+            Some(col) => {
+                let field = schema
+                    .field_with_name(col)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                listing_options = listing_options
+                    .with_table_partition_cols(vec![(col.to_string(), field.data_type().clone())]);
+                let ctx = datafusion::prelude::SessionContext::new();
+                ListingTableConfig::new(table_url)
+                    .with_listing_options(listing_options)
+                    .infer_schema(&ctx.state())
+                    .await?
+            }
+            None => ListingTableConfig::new(table_url)
+                .with_listing_options(listing_options)
+                .with_schema(schema),
+        };
         let listing_table = ListingTable::try_new(config)?;
         Ok(Arc::new(listing_table))
     }
@@ -231,7 +250,13 @@ impl SchemaProvider for PostgreSQLSchemaProvider {
                 return Ok(Some(entry.1.clone()));
             }
         }
-        let table = Self::build_listing_table(arrow_schema, &local_path)?;
+        let partition_col = meta_client
+            .get_table_partition_column(&catalog, &schema, name)
+            .await
+            .ok()
+            .flatten();
+        let table =
+            Self::build_listing_table(arrow_schema, &local_path, partition_col.as_deref()).await?;
         self.table_cache
             .insert(name.to_string(), (local_path, Arc::clone(&table)));
         Ok(Some(table))

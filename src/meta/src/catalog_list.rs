@@ -107,10 +107,13 @@ impl PostgreSQLMetaCatalogProviderList {
                 db_type varchar,
                 description varchar,
                 cache_policy varchar,
+                partition_by varchar,
                 created_at timestamptz DEFAULT CURRENT_TIMESTAMP,
                 updated_at timestamp DEFAULT CURRENT_TIMESTAMP
             );
             "#,
+            // Backfill for catalogs created before partition_by existed.
+            "ALTER TABLE system.catalog ADD COLUMN IF NOT EXISTS partition_by varchar;",
             r#"
             CREATE TABLE IF NOT EXISTS system.sql_stats (
                 sql_hash VARCHAR(20) PRIMARY KEY,
@@ -333,6 +336,59 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(cache_policy)
     }
 
+    /// The catalog's declared Hive partition column, if any.
+    pub async fn get_catalog_partition_by(&self, name: &str) -> Result<Option<String>> {
+        let sql = "SELECT partition_by FROM system.catalog WHERE name = $1;";
+        let row = sqlx::query(sql)
+            .bind(name)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(row.and_then(|r| r.try_get::<Option<String>, _>("partition_by").ok().flatten()))
+    }
+
+    /// Records (or clears) the Hive partition column for a synced table.
+    pub async fn set_table_partition_column(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        partition_col: Option<&str>,
+    ) -> Result<()> {
+        let info = partition_col.map(|c| serde_json::json!({ "partition_col": c }));
+        let sql = "UPDATE system.table_arrow_schema SET partition_info = $4 \
+            WHERE catalog_name = $1 AND schema_name = $2 AND table_name = $3;";
+        sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .bind(info)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
+    /// The Hive partition column a table's snapshot is partitioned by, if any.
+    pub async fn get_table_partition_column(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<String>> {
+        let sql = "SELECT partition_info ->> 'partition_col' AS col \
+            FROM system.table_arrow_schema \
+            WHERE catalog_name = $1 AND schema_name = $2 AND table_name = $3;";
+        let row = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(row.and_then(|r| r.try_get::<Option<String>, _>("col").ok().flatten()))
+    }
+
     /// Reads the persisted incremental-sync state for a table, if any.
     pub async fn get_table_sync_state(
         &self,
@@ -429,6 +485,13 @@ impl PostgreSQLMetaCatalogProviderList {
         comment: Option<String>,
         properties: Vec<(String, String)>,
     ) -> Result<bool> {
+        // Optional Hive partition column declared via `with properties(partition_by="col")`.
+        let partition_by = properties
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("partition_by"))
+            .map(|(_, v)| v.clone())
+            .filter(|v| !v.is_empty());
+
         let cache_policy = parse_cache_policy(properties).map_err(|x| {
             DataFusionError::SQL(
                 Box::new(ParserError::ParserError(
@@ -443,7 +506,7 @@ impl PostgreSQLMetaCatalogProviderList {
         })?;
 
         let insert_sql =
-            "INSERT INTO system.catalog (name, dsn, db_type, description, cache_policy) VALUES ($1, $2, $3, $4, $5);";
+            "INSERT INTO system.catalog (name, dsn, db_type, description, cache_policy, partition_by) VALUES ($1, $2, $3, $4, $5, $6);";
 
         let ret = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
@@ -458,6 +521,7 @@ impl PostgreSQLMetaCatalogProviderList {
                     .bind(db_type)
                     .bind(comment)
                     .bind(cache_policy.to_string())
+                    .bind(&partition_by)
                     .execute(&self.local_pool)
                     .await
             })

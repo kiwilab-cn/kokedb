@@ -3284,6 +3284,7 @@ dependencies = [
  "kokedb-common",
  "kokedb-data-source",
  "log",
+ "serde_json",
  "sqlx",
  "tokio",
 ]

@@ -47,7 +47,7 @@ impl DataFusionCatalogAdapter {
         table_provider: Arc<dyn datafusion::datasource::TableProvider>,
     ) -> Result<TableStatus, CatalogError> {
         let schema = table_provider.schema();
-        let columns = schema
+        let columns: Vec<TableColumnStatus> = schema
             .fields()
             .iter()
             .map(|field| TableColumnStatus {
@@ -100,6 +100,22 @@ impl DataFusionCatalogAdapter {
             None
         };
 
+        // For a Hive-partitioned snapshot, declare the partition column. The
+        // listing format splits it out of the schema (it lives in the path, not
+        // the parquet files) and uses the schema to recover its type, so the
+        // full `columns` set is kept here.
+        let partition_by = if is_cached {
+            meta_client
+                .get_table_partition_column(&catalog_info.name, schema_name, table_name)
+                .await
+                .ok()
+                .flatten()
+                .map(|col| vec![col])
+                .unwrap_or_default()
+        } else {
+            vec![]
+        };
+
         let table = TableStatus {
             name: table_name.to_string(),
             kind: TableKind::Table {
@@ -110,7 +126,7 @@ impl DataFusionCatalogAdapter {
                 constraints: vec![],
                 location,
                 format: "parquet".to_string(),
-                partition_by: vec![],
+                partition_by,
                 sort_by: vec![],
                 bucket_by: None,
                 options: vec![],
