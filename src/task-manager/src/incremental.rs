@@ -264,6 +264,35 @@ pub async fn compare_snapshots(
     })
 }
 
+/// Writes the subset of a snapshot directory whose `watermark_column` is greater
+/// than `boundary` (a text value coerced to the column type by DataFusion) to
+/// `out_path`. Used to restrict shadow validation to a recent window.
+pub async fn filter_snapshot_window(
+    in_path: &str,
+    out_path: &str,
+    watermark_column: &str,
+    boundary: &str,
+    schema: Arc<Schema>,
+) -> Result<(), TaskError> {
+    let ctx = SessionContext::new();
+    register_parquet_dir(&ctx, "s", in_path, schema).await?;
+    let escaped = boundary.replace('\'', "''");
+    let sql = format!(
+        "SELECT * FROM s WHERE \"{}\" > '{}'",
+        watermark_column, escaped
+    );
+    let df = ctx
+        .sql(&sql)
+        .await
+        .map_err(|e| TaskError::ExecutionFailed(format!("window filter query failed: {e}")))?;
+    df.write_parquet(out_path, DataFrameWriteOptions::new(), None)
+        .await
+        .map_err(|e| {
+            TaskError::WriteParquetError(format!("failed to write windowed snapshot: {e}"))
+        })?;
+    Ok(())
+}
+
 /// Runs a single-`Int64`-scalar query and returns the value (0 if empty).
 async fn scalar_count(ctx: &SessionContext, sql: &str) -> Result<i64, TaskError> {
     let batches = ctx
