@@ -3,9 +3,11 @@ use std::sync::Arc;
 
 use kokedb_common::cache_policy::{parse_cache_policy, CachePolicy};
 use kokedb_common::env::get_env_as;
+use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::adaptive;
 use kokedb_task_manager::cache_sync_task::{execute_catalog_sync_task, refresh_single_table};
 use kokedb_task_manager::shadow_validate;
+use kokedb_task_manager::task_manager::TaskManager;
 use kokedb_task_manager::error::TaskError;
 use log::{error, info, warn};
 use tokio_cron_scheduler::Job;
@@ -333,6 +335,34 @@ impl CatalogManager {
         Ok(())
     }
 
+    /// Unloads a single table from the cache: clears its cache metadata (so it
+    /// resolves to the live remote source again), invalidates affected query
+    /// results, and removes the on-disk snapshot. Best-effort.
+    async fn evict_one_table(
+        &self,
+        meta: &Arc<PostgreSQLMetaCatalogProviderList>,
+        task_manager: &Arc<TaskManager>,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) {
+        match meta.evict_table_cache(catalog, schema, table).await {
+            Ok((path, keys)) => {
+                task_manager.invalidate_cache_keys(&keys).await;
+                if let Some(dir) = path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).parent())
+                {
+                    if let Err(e) = tokio::fs::remove_dir_all(dir).await {
+                        warn!("Failed to remove snapshot dir {}: {}", dir.display(), e);
+                    }
+                }
+                info!("Evicted {catalog}.{schema}.{table} from cache");
+            }
+            Err(e) => warn!("Failed to evict {catalog}.{schema}.{table}: {e}"),
+        }
+    }
+
     /// Sets a per-database cache override (`ALTER DATABASE ... SET CACHE POLICY`).
     /// `mode='none'` disables caching for the database (and drops its table
     /// schedules); `mode='all'` caches every table in it. Re-applies afterwards.
@@ -370,7 +400,17 @@ impl CatalogManager {
             .await
             .map_err(|e| CatalogError::Internal(format!("Failed to set database policy: {e}")))?;
         if mode == "none" {
-            // Stop scheduling refreshes for this database's tables.
+            // Unload the database's cached tables: drop their snapshots + cache
+            // metadata so queries fall back to the live remote source, and reclaim
+            // the on-disk snapshots. Then stop scheduling any refreshes.
+            let task_manager = self.state()?.catalog_task_manager.clone();
+            let cached = meta
+                .list_cached_tables_in_schema(&catalog, &schema)
+                .await
+                .unwrap_or_default();
+            for t in &cached {
+                self.evict_one_table(&meta, &task_manager, &catalog, &schema, t).await;
+            }
             let _ = meta.delete_schema_table_policies(&catalog, &schema).await;
         }
 

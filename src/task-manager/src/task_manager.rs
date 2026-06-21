@@ -217,6 +217,8 @@ pub struct TaskManager {
     queue: TaskQueue,
     shutdown_tx: Option<mpsc::UnboundedSender<()>>,
     is_shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// The shared result cache, kept so callers can invalidate keys on eviction.
+    result_cache: LruResultCache,
 }
 
 impl TaskManager {
@@ -243,6 +245,7 @@ impl TaskManager {
             queue: TaskQueue::new(),
             shutdown_tx: Some(shutdown_tx),
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            result_cache: cache.clone(),
         };
 
         task_manager.start_scheduler(shutdown_rx, cache).await;
@@ -395,6 +398,14 @@ impl TaskManager {
     pub fn set_result_refresher(&self, refresher: Arc<dyn ResultRefresher>) {
         if let Ok(mut slot) = self.refresher_slot.lock() {
             *slot = Some(refresher);
+        }
+    }
+
+    /// Invalidates cached query results by key (used when a table is evicted from
+    /// the cache so stale results are not served after un-caching).
+    pub async fn invalidate_cache_keys(&self, keys: &[u64]) {
+        for key in keys {
+            let _ = self.result_cache.delete(*key).await;
         }
     }
 
