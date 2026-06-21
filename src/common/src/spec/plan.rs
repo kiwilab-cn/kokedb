@@ -521,6 +521,9 @@ pub enum CommandNode {
     RefreshCache {
         table: ObjectName,
     },
+    RefreshCacheCatalog {
+        catalog: ObjectName,
+    },
     ShowTableMetadata {
         table: ObjectName,
     },
