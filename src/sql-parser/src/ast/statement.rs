@@ -12,7 +12,8 @@ use crate::ast::keywords::{
     Compute, Cost, Create, Data, Database, Databases, Dbproperties, Default, Defined, Delete,
     Delimited, Desc, Describe, Directory, Distributed, Drop, Escaped, Evolution, Exists, Explain,
     Extended, External, Fields, Fileformat, First, For, Format, Formatted, From, Function,
-    Functions, Generated, Global, If, In, Inpath, Inputformat, Insert, Into, Is, Items, Keys, Lazy,
+    Functions, Generated, Global, If, In, Inpath, Inputformat, Insert, Into, Is, Items, Jobs, Keys,
+    Lazy,
     Like, Lines, Load, Local, Location, Map, Matched, Merge, Metadata, Name, Noscan, Not, Null, On,
     Options,
     Or, Outputformat, Overwrite, Partition, Partitioned, Partitions, Policies, Policy, Properties,
@@ -381,6 +382,12 @@ pub enum Statement {
         metadata: Metadata,
         from: From,
         name: ObjectName,
+    },
+    ShowCacheJobs {
+        show: Show,
+        cache: Cache,
+        jobs: Jobs,
+        target: Option<(From, Either<Table, Catalog>, ObjectName)>,
     },
 }
 
