@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
-use kokedb_common::cache_policy::CachePolicy;
+use kokedb_common::cache_policy::{parse_cache_policy, CachePolicy};
 use kokedb_common::env::get_env_as;
 use kokedb_task_manager::adaptive;
 use kokedb_task_manager::cache_sync_task::{execute_catalog_sync_task, refresh_single_table};
@@ -302,6 +302,91 @@ impl CatalogManager {
                 error: j.error_message,
             })
             .collect())
+    }
+
+    /// Changes a catalog's cache policy (`ALTER CATALOG ... SET CACHE POLICY`)
+    /// and re-applies it so the new selection is picked up.
+    pub async fn set_catalog_cache_policy(
+        &self,
+        catalog: &str,
+        options: Vec<(String, String)>,
+    ) -> CatalogResult<()> {
+        let policy = parse_cache_policy(options)
+            .map_err(|e| CatalogError::InvalidArgument(format!("invalid cache policy: {e:?}")))?;
+
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let updated = meta
+            .update_catalog_cache_policy(catalog, &policy.to_string())
+            .await
+            .map_err(|e| CatalogError::Internal(format!("Failed to update cache policy: {e}")))?;
+        if updated == 0 {
+            return Err(CatalogError::NotFound("catalog", catalog.to_string()));
+        }
+
+        // Re-apply: re-select tables, recompute cadence/inference (best-effort).
+        if let Ok(info) = meta.get_catalog(catalog).await {
+            if let Err(e) = adaptive::reevaluate_catalog(catalog, &info.dsn, &policy).await {
+                warn!("Re-apply after ALTER CATALOG '{}' failed: {}", catalog, e);
+            }
+        }
+        info!("Set cache policy for catalog '{catalog}': {}", policy.to_string());
+        Ok(())
+    }
+
+    /// Sets a per-database cache override (`ALTER DATABASE ... SET CACHE POLICY`).
+    /// `mode='none'` disables caching for the database (and drops its table
+    /// schedules); `mode='all'` caches every table in it. Re-applies afterwards.
+    pub async fn set_database_cache_policy(
+        &self,
+        database: Vec<String>,
+        options: Vec<(String, String)>,
+    ) -> CatalogResult<()> {
+        let (catalog, schema) = match database.as_slice() {
+            [c, db] => (c.clone(), db.clone()),
+            [db] => (self.default_catalog()?.to_string(), db.clone()),
+            _ => {
+                return Err(CatalogError::InvalidArgument(format!(
+                    "expected catalog.database, got {} name parts",
+                    database.len()
+                )))
+            }
+        };
+
+        let opts: std::collections::HashMap<String, String> = options
+            .into_iter()
+            .map(|(k, v)| (k.to_lowercase(), v.to_lowercase()))
+            .collect();
+        let mode = opts.get("mode").cloned().ok_or_else(|| {
+            CatalogError::InvalidArgument("missing required option `mode`".to_string())
+        })?;
+        if mode != "all" && mode != "none" {
+            return Err(CatalogError::InvalidArgument(format!(
+                "invalid mode `{mode}` (expected all|none)"
+            )));
+        }
+
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        meta.upsert_database_policy(&catalog, &schema, &mode)
+            .await
+            .map_err(|e| CatalogError::Internal(format!("Failed to set database policy: {e}")))?;
+        if mode == "none" {
+            // Stop scheduling refreshes for this database's tables.
+            let _ = meta.delete_schema_table_policies(&catalog, &schema).await;
+        }
+
+        // Re-apply the (now inheritance-aware) selection.
+        if let (Ok(info), Ok(policy_str)) = (
+            meta.get_catalog(&catalog).await,
+            meta.get_catalog_cache_policy(&catalog).await,
+        ) {
+            if let Ok(policy) = CachePolicy::from_string(&policy_str) {
+                if let Err(e) = adaptive::reevaluate_catalog(&catalog, &info.dsn, &policy).await {
+                    warn!("Re-apply after ALTER DATABASE '{}.{}' failed: {}", catalog, schema, e);
+                }
+            }
+        }
+        info!("Set database policy for '{catalog}.{schema}': mode={mode}");
+        Ok(())
     }
 
     pub fn create_catalog(

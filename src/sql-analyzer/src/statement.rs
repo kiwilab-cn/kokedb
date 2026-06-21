@@ -8,7 +8,8 @@ use kokedb_sql_parser::ast::literal::{IntegerLiteral, NumberLiteral, StringLiter
 use kokedb_sql_parser::ast::operator::{Minus, Plus};
 use kokedb_sql_parser::ast::query::{IdentList, WhereClause};
 use kokedb_sql_parser::ast::statement::{
-    AlterTableOperation, AlterViewOperation, AnalyzeTableModifier, AsQueryClause, Assignment,
+    AlterDatabaseOperation, AlterTableOperation, AlterViewOperation, AnalyzeTableModifier,
+    AsQueryClause, Assignment,
     AssignmentList, ColumnAlteration, ColumnAlterationList, ColumnAlterationOption,
     ColumnDefinition, ColumnDefinitionList, ColumnDefinitionOption, ColumnPosition,
     ColumnTypeDefinition, CommentValue, CreateCatalogClause, CreateDatabaseClause,
@@ -148,7 +149,28 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
-        Statement::AlterDatabase { .. } => Err(SqlError::todo("ALTER DATABASE")),
+        Statement::AlterCatalogCachePolicy { name, properties, .. } => {
+            let node = spec::CommandNode::AlterCatalogCachePolicy {
+                catalog: from_ast_object_name(name)?,
+                options: from_ast_property_list(properties)?,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::AlterDatabase {
+            alter: _,
+            database: _,
+            name,
+            operation,
+        } => match operation {
+            AlterDatabaseOperation::SetCachePolicy(_, _, _, _, properties) => {
+                let node = spec::CommandNode::AlterDatabaseCachePolicy {
+                    database: from_ast_object_name(name)?,
+                    options: from_ast_property_list(properties)?,
+                };
+                Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+            }
+            _ => Err(SqlError::todo("ALTER DATABASE")),
+        },
         Statement::DropDatabase {
             drop: _,
             database: _,
@@ -1917,6 +1939,47 @@ mod drop_catalog_tests {
                     assert!(options.contains(&("pk_columns".to_string(), "id".to_string())));
                 }
                 other => panic!("expected AlterTableCachePolicy, got {other:?}"),
+            },
+            _ => panic!("expected a command plan"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_catalog_cache_policy() {
+        let plan = from_ast_statement(
+            parse_one_statement(
+                "ALTER CATALOG demo SET CACHE POLICY WITH (cache_policy = 'topk', k = '5')",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        match plan {
+            spec::Plan::Command(c) => match c.node {
+                spec::CommandNode::AlterCatalogCachePolicy { catalog, options } => {
+                    assert_eq!(<Vec<String>>::from(catalog), vec!["demo"]);
+                    assert!(options.contains(&("cache_policy".to_string(), "topk".to_string())));
+                    assert!(options.contains(&("k".to_string(), "5".to_string())));
+                }
+                other => panic!("expected AlterCatalogCachePolicy, got {other:?}"),
+            },
+            _ => panic!("expected a command plan"),
+        }
+    }
+
+    #[test]
+    fn parse_alter_database_cache_policy() {
+        let plan = from_ast_statement(
+            parse_one_statement("ALTER DATABASE demo.tmp SET CACHE POLICY WITH (mode = 'none')")
+                .unwrap(),
+        )
+        .unwrap();
+        match plan {
+            spec::Plan::Command(c) => match c.node {
+                spec::CommandNode::AlterDatabaseCachePolicy { database, options } => {
+                    assert_eq!(<Vec<String>>::from(database), vec!["demo", "tmp"]);
+                    assert!(options.contains(&("mode".to_string(), "none".to_string())));
+                }
+                other => panic!("expected AlterDatabaseCachePolicy, got {other:?}"),
             },
             _ => panic!("expected a command plan"),
         }

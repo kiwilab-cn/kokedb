@@ -194,10 +194,125 @@ pub async fn select_tables_for_policy(
     dsn: &str,
     cache_policy: &CachePolicy,
 ) -> Result<Vec<String>, TaskError> {
-    match cache_policy {
-        CachePolicy::TopK { k } => select_topk_tables(dsn, *k).await,
-        CachePolicy::All => select_all_tables(catalog, dsn).await,
-        CachePolicy::Select { table_set } => select_listed_tables(table_set),
-        CachePolicy::Smart => select_smart_tables(catalog, dsn).await,
+    let base = match cache_policy {
+        CachePolicy::TopK { k } => select_topk_tables(dsn, *k).await?,
+        CachePolicy::All => select_all_tables(catalog, dsn).await?,
+        CachePolicy::Select { table_set } => select_listed_tables(table_set)?,
+        CachePolicy::Smart => select_smart_tables(catalog, dsn).await?,
+    };
+    apply_database_overrides(catalog, dsn, base).await
+}
+
+fn schema_of(qualified: &str) -> String {
+    qualified
+        .split_once('.')
+        .map(|(s, _)| s.to_string())
+        .unwrap_or_else(|| "public".to_string())
+}
+
+/// Applies the per-database tier on top of the catalog selection: a database with
+/// `mode='none'` has all its tables excluded; `mode='all'` adds every table in
+/// that database (the middle tier of the policy inheritance).
+async fn apply_database_overrides(
+    catalog: &str,
+    dsn: &str,
+    mut tables: Vec<String>,
+) -> Result<Vec<String>, TaskError> {
+    let meta = PostgreSQLMetaCatalogProviderList::new().await.map_err(|x| {
+        TaskError::MetaReqeustError(format!("Failed to create meta client: {x}"))
+    })?;
+    let policies = meta.get_database_policies(catalog).await.unwrap_or_default();
+    if policies.is_empty() {
+        return Ok(tables);
+    }
+
+    let none: HashSet<String> = policies
+        .iter()
+        .filter(|(_, m)| m == "none")
+        .map(|(s, _)| s.clone())
+        .collect();
+    let all: HashSet<String> = policies
+        .iter()
+        .filter(|(_, m)| m == "all")
+        .map(|(s, _)| s.clone())
+        .collect();
+
+    tables.retain(|t| !none.contains(&schema_of(t)));
+    if !all.is_empty() {
+        for t in get_postgres_all_tables(dsn).await? {
+            let s = schema_of(&t);
+            if all.contains(&s) && !none.contains(&s) {
+                tables.push(t);
+            }
+        }
+    }
+
+    Ok(tables.into_iter().collect::<HashSet<_>>().into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPool;
+
+    // A database with mode='none' has its tables excluded from the catalog
+    // selection (the database tier of the policy inheritance).
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via KOKEDB_TEST_DSN + PG_META_DSN"]
+    async fn database_none_excludes_schema_from_selection() {
+        let dsn = std::env::var("KOKEDB_TEST_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".into());
+        let meta_dsn = std::env::var("PG_META_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/kokedb".into());
+        let cat = "it_inh";
+
+        let pool = PgPool::connect(&dsn).await.unwrap();
+        for stmt in [
+            "CREATE SCHEMA IF NOT EXISTS it_inh_tmp",
+            "DROP TABLE IF EXISTS public.it_inh_pub",
+            "DROP TABLE IF EXISTS it_inh_tmp.t",
+            "CREATE TABLE public.it_inh_pub (id int)",
+            "CREATE TABLE it_inh_tmp.t (id int)",
+            "ANALYZE public.it_inh_pub",
+            "ANALYZE it_inh_tmp.t",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+
+        let meta = PostgreSQLMetaCatalogProviderList::new().await.unwrap();
+        meta.init_db().await.unwrap();
+        let meta_pool = PgPool::connect(&meta_dsn).await.unwrap();
+        sqlx::query("DELETE FROM system.database_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta_pool)
+            .await
+            .unwrap();
+
+        // Without an override, both schemas are selected.
+        let before = select_tables_for_policy(cat, &dsn, &CachePolicy::All).await.unwrap();
+        assert!(before.iter().any(|t| t == "public.it_inh_pub"));
+        assert!(before.iter().any(|t| t == "it_inh_tmp.t"));
+
+        // Disabling the database excludes its tables.
+        meta.upsert_database_policy(cat, "it_inh_tmp", "none").await.unwrap();
+        let after = select_tables_for_policy(cat, &dsn, &CachePolicy::All).await.unwrap();
+        assert!(after.iter().any(|t| t == "public.it_inh_pub"), "public stays");
+        assert!(
+            !after.iter().any(|t| t.starts_with("it_inh_tmp.")),
+            "disabled database excluded: {after:?}"
+        );
+
+        // Cleanup.
+        sqlx::query("DELETE FROM system.database_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta_pool)
+            .await
+            .unwrap();
+        for stmt in [
+            "DROP TABLE IF EXISTS public.it_inh_pub",
+            "DROP SCHEMA IF EXISTS it_inh_tmp CASCADE",
+        ] {
+            let _ = sqlx::query(stmt).execute(&pool).await;
+        }
     }
 }

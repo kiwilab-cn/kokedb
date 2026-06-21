@@ -49,4 +49,26 @@ impl PlanResolver<'_> {
             catalog: catalog.map(|c| <Vec<String>>::from(c).join(".")),
         })
     }
+
+    pub(in super::super) fn resolve_alter_catalog_cache_policy(
+        &self,
+        catalog: spec::ObjectName,
+        options: Vec<(String, String)>,
+    ) -> PlanResult<LogicalPlan> {
+        self.resolve_catalog_command(CatalogCommand::AlterCatalogCachePolicy {
+            catalog: <Vec<String>>::from(catalog).join("."),
+            options,
+        })
+    }
+
+    pub(in super::super) fn resolve_alter_database_cache_policy(
+        &self,
+        database: spec::ObjectName,
+        options: Vec<(String, String)>,
+    ) -> PlanResult<LogicalPlan> {
+        self.resolve_catalog_command(CatalogCommand::AlterDatabaseCachePolicy {
+            database: database.into(),
+            options,
+        })
+    }
 }
