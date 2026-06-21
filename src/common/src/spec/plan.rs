@@ -535,6 +535,10 @@ pub enum CommandNode {
         table: Option<ObjectName>,
         catalog: Option<ObjectName>,
     },
+    SetTablePaused {
+        table: ObjectName,
+        paused: bool,
+    },
     AlterCatalogCachePolicy {
         catalog: ObjectName,
         options: Vec<(String, String)>,

@@ -309,6 +309,9 @@ impl PlanResolver<'_> {
             CommandNode::ShowCacheJobs { table, catalog } => {
                 self.resolve_show_cache_jobs(table, catalog)
             }
+            CommandNode::SetTablePaused { table, paused } => {
+                self.resolve_set_table_paused(table, paused)
+            }
             CommandNode::AlterCatalogCachePolicy { catalog, options } => {
                 self.resolve_alter_catalog_cache_policy(catalog, options)
             }

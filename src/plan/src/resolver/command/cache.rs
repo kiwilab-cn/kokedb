@@ -48,6 +48,17 @@ impl PlanResolver<'_> {
         })
     }
 
+    pub(in super::super) fn resolve_set_table_paused(
+        &self,
+        table: spec::ObjectName,
+        paused: bool,
+    ) -> PlanResult<LogicalPlan> {
+        self.resolve_catalog_command(CatalogCommand::SetTablePaused {
+            table: table.into(),
+            paused,
+        })
+    }
+
     pub(in super::super) fn resolve_show_cache_jobs(
         &self,
         table: Option<spec::ObjectName>,

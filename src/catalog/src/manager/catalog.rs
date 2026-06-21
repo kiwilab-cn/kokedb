@@ -150,6 +150,40 @@ impl CatalogManager {
         Ok(rows)
     }
 
+    /// Pauses or resumes a table's scheduled refresh
+    /// (`PAUSE/RESUME CACHE SCHEDULE FOR TABLE`). Name parts default to the
+    /// session catalog/database.
+    pub async fn set_table_paused(
+        &self,
+        table: Vec<String>,
+        paused: bool,
+    ) -> CatalogResult<()> {
+        let (catalog, schema_name, table_name) = match table.as_slice() {
+            [c, db, t] => (c.clone(), db.clone(), t.clone()),
+            [db, t] => (self.default_catalog()?.to_string(), db.clone(), t.clone()),
+            [t] => (
+                self.default_catalog()?.to_string(),
+                self.default_database()?.head.to_string(),
+                t.clone(),
+            ),
+            _ => {
+                return Err(CatalogError::InvalidArgument(format!(
+                    "expected catalog.database.table, got {} name parts",
+                    table.len()
+                )))
+            }
+        };
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        meta.set_table_paused(&catalog, &schema_name, &table_name, paused)
+            .await
+            .map_err(|e| CatalogError::Internal(format!("Failed to set paused: {e}")))?;
+        info!(
+            "{} refresh for {catalog}.{schema_name}.{table_name}",
+            if paused { "Paused" } else { "Resumed" }
+        );
+        Ok(())
+    }
+
     /// Reads a table's inferred sync metadata for `SHOW TABLE METADATA`. The
     /// `table` parts default like [`refresh_table`].
     pub async fn show_table_metadata(
