@@ -532,6 +532,14 @@ pub enum CommandNode {
         table: Option<ObjectName>,
         catalog: Option<ObjectName>,
     },
+    AlterCatalogCachePolicy {
+        catalog: ObjectName,
+        options: Vec<(String, String)>,
+    },
+    AlterDatabaseCachePolicy {
+        database: ObjectName,
+        options: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

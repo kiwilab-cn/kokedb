@@ -37,6 +37,27 @@ create catalog demo using postgresql://postgres:123456@192.168.0.227:25432/postg
 ```
 Cache the tables which are in the **table_set**.
 
+- ALTER CATALOG ... SET CACHE POLICY
+
+Change a catalog's cache policy after creation and re-apply it (re-select tables +
+recompute cadence/inference). Same options as `CREATE CATALOG`'s properties.
+
+```sql
+ALTER CATALOG demo SET CACHE POLICY WITH (cache_policy = 'topk', k = '20');
+```
+
+- ALTER DATABASE ... SET CACHE POLICY
+
+The middle tier of policy inheritance (catalog → database → table). `mode='none'`
+disables caching for a whole database and drops its tables' refresh schedules
+(snapshots remain until dropped); `mode='all'` caches every table in it,
+regardless of the catalog policy.
+
+```sql
+ALTER DATABASE demo.tmp SET CACHE POLICY WITH (mode = 'none');   -- disable a db
+ALTER DATABASE demo.dw  SET CACHE POLICY WITH (mode = 'all');    -- force-cache a db
+```
+
 - SHOW CATALOGS
 
 - SHOW DATABASES

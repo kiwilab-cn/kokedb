@@ -306,6 +306,12 @@ impl PlanResolver<'_> {
             CommandNode::ShowCacheJobs { table, catalog } => {
                 self.resolve_show_cache_jobs(table, catalog)
             }
+            CommandNode::AlterCatalogCachePolicy { catalog, options } => {
+                self.resolve_alter_catalog_cache_policy(catalog, options)
+            }
+            CommandNode::AlterDatabaseCachePolicy { database, options } => {
+                self.resolve_alter_database_cache_policy(database, options)
+            }
         }
     }
 

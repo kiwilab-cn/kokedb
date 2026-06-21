@@ -54,6 +54,14 @@ pub enum CatalogCommand {
         table: Option<Vec<String>>,
         catalog: Option<String>,
     },
+    AlterCatalogCachePolicy {
+        catalog: String,
+        options: Vec<(String, String)>,
+    },
+    AlterDatabaseCachePolicy {
+        database: Vec<String>,
+        options: Vec<(String, String)>,
+    },
     CurrentDatabase,
     SetCurrentDatabase {
         database: Vec<String>,
@@ -164,6 +172,8 @@ impl CatalogCommand {
             CatalogCommand::ShowTableMetadata { .. } => "ShowTableMetadata",
             CatalogCommand::AlterTableCachePolicy { .. } => "AlterTableCachePolicy",
             CatalogCommand::ShowCacheJobs { .. } => "ShowCacheJobs",
+            CatalogCommand::AlterCatalogCachePolicy { .. } => "AlterCatalogCachePolicy",
+            CatalogCommand::AlterDatabaseCachePolicy { .. } => "AlterDatabaseCachePolicy",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
@@ -246,6 +256,8 @@ impl CatalogCommand {
             | CatalogCommand::DropTemporaryView { .. }
             | CatalogCommand::DropView { .. }
             | CatalogCommand::AlterTableCachePolicy { .. }
+            | CatalogCommand::AlterCatalogCachePolicy { .. }
+            | CatalogCommand::AlterDatabaseCachePolicy { .. }
             | CatalogCommand::DropCatalog { .. } => {
                 Vec::<FieldRef>::from_type::<SingleValueDisplay<bool>>(TracingOptions::default())
             }
@@ -308,6 +320,16 @@ impl CatalogCommand {
             }
             CatalogCommand::ShowCacheJobs { table, catalog } => {
                 let rows = manager.show_cache_jobs(table, catalog).await?;
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::AlterCatalogCachePolicy { catalog, options } => {
+                manager.set_catalog_cache_policy(&catalog, options).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::AlterDatabaseCachePolicy { database, options } => {
+                manager.set_database_cache_policy(database, options).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
                 build_record_batch(schema, &rows)
             }
             CatalogCommand::DropCatalog { catalog, if_exists } => {

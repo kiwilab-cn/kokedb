@@ -279,6 +279,17 @@ impl PostgreSQLMetaCatalogProviderList {
             "#,
             "CREATE INDEX IF NOT EXISTS idx_cache_job_lookup \
              ON system.cache_job (catalog, schema_name, table_name, started_at DESC);",
+            // Per-database cache override (the middle tier between catalog and
+            // table policy). `mode`: all | none.
+            r#"
+            CREATE TABLE IF NOT EXISTS system.database_policy (
+                catalog VARCHAR(255) NOT NULL,
+                schema_name VARCHAR(255) NOT NULL,
+                mode VARCHAR(16) NOT NULL DEFAULT 'all',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (catalog, schema_name)
+            );
+            "#,
         ];
 
         for sql in sql_statements {
@@ -448,6 +459,82 @@ impl PostgreSQLMetaCatalogProviderList {
             .try_get("cache_policy")
             .unwrap_or_else(|_| String::new());
         Ok(cache_policy)
+    }
+
+    /// Updates a catalog's cache policy (backs `ALTER CATALOG ... SET CACHE
+    /// POLICY`). Returns the number of catalogs updated (0 if not found).
+    pub async fn update_catalog_cache_policy(
+        &self,
+        name: &str,
+        cache_policy: &str,
+    ) -> Result<u64> {
+        let res = sqlx::query(
+            "UPDATE system.catalog SET cache_policy = $2, updated_at = CURRENT_TIMESTAMP \
+             WHERE name = $1;",
+        )
+        .bind(name)
+        .bind(cache_policy)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(res.rows_affected())
+    }
+
+    /// Sets a per-database cache override (`mode`: all | none).
+    pub async fn upsert_database_policy(
+        &self,
+        catalog: &str,
+        schema: &str,
+        mode: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO system.database_policy (catalog, schema_name, mode, updated_at) \
+             VALUES ($1, $2, $3, CURRENT_TIMESTAMP) \
+             ON CONFLICT (catalog, schema_name) DO UPDATE SET \
+                 mode = EXCLUDED.mode, updated_at = CURRENT_TIMESTAMP;",
+        )
+        .bind(catalog)
+        .bind(schema)
+        .bind(mode)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
+    /// Removes the per-table sync policies for a whole database (used when a
+    /// database is disabled), so its tables stop being scheduled for refresh.
+    /// Cached snapshots remain until the table is dropped.
+    pub async fn delete_schema_table_policies(&self, catalog: &str, schema: &str) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM system.table_sync_policy WHERE catalog = $1 AND schema_name = $2;",
+        )
+        .bind(catalog)
+        .bind(schema)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
+    /// Returns the `(schema, mode)` database overrides for a catalog.
+    pub async fn get_database_policies(&self, catalog: &str) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query(
+            "SELECT schema_name, mode FROM system.database_policy WHERE catalog = $1;",
+        )
+        .bind(catalog)
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("schema_name"),
+                    r.get::<String, _>("mode"),
+                )
+            })
+            .collect())
     }
 
     /// The catalog's declared Hive partition column, if any.
@@ -1522,6 +1609,61 @@ mod policy_tests {
             .execute(&meta.local_pool)
             .await
             .unwrap();
+    }
+
+    // Catalog/database policy accessors roundtrip.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via PG_META_DSN"]
+    async fn catalog_and_database_policy_roundtrip() {
+        let pool = PgPool::connect(&meta_dsn()).await.unwrap();
+        let meta = PostgreSQLMetaCatalogProviderList::from_pool(pool);
+        meta.init_db().await.unwrap();
+        let cat = "it_polcat";
+        let _ = sqlx::query("DELETE FROM system.catalog WHERE name = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM system.database_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await;
+
+        // Catalog cache-policy update.
+        sqlx::query(
+            "INSERT INTO system.catalog (name, dsn, db_type, cache_policy) \
+             VALUES ($1, 'postgresql://x', 'postgresql', 'smart')",
+        )
+        .bind(cat)
+        .execute(&meta.local_pool)
+        .await
+        .unwrap();
+        let n = meta
+            .update_catalog_cache_policy(cat, "topk:k=5")
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(meta.get_catalog_cache_policy(cat).await.unwrap(), "topk:k=5");
+        assert_eq!(meta.update_catalog_cache_policy("nope", "all").await.unwrap(), 0);
+
+        // Database overrides.
+        meta.upsert_database_policy(cat, "tmp", "none").await.unwrap();
+        meta.upsert_database_policy(cat, "dw", "all").await.unwrap();
+        meta.upsert_database_policy(cat, "tmp", "all").await.unwrap(); // upsert overwrites
+        let mut policies = meta.get_database_policies(cat).await.unwrap();
+        policies.sort();
+        assert_eq!(
+            policies,
+            vec![("dw".to_string(), "all".to_string()), ("tmp".to_string(), "all".to_string())]
+        );
+
+        let _ = sqlx::query("DELETE FROM system.catalog WHERE name = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM system.database_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await;
     }
 
     // get_due_audit_tables should surface inferred (non-full, non-rejected)

@@ -83,6 +83,16 @@ pub enum Statement {
         name: ObjectName,
         operation: AlterDatabaseOperation,
     },
+    AlterCatalogCachePolicy {
+        alter: Alter,
+        catalog: Catalog,
+        name: ObjectName,
+        set: Set,
+        cache: Cache,
+        policy: Policy,
+        with: With,
+        properties: PropertyList,
+    },
     DropDatabase {
         drop: Drop,
         database: Either<Database, Schema>,
@@ -436,6 +446,7 @@ pub enum PropertyValue {
 
 #[derive(Debug, Clone, TreeParser)]
 pub enum AlterDatabaseOperation {
+    SetCachePolicy(Set, Cache, Policy, With, PropertyList),
     SetProperties(Set, Either<Dbproperties, Properties>, PropertyList),
     SetLocation(Set, Location, StringLiteral),
 }
