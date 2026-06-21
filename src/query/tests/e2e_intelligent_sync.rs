@@ -100,6 +100,7 @@ async fn clean_meta(pool: &PgPool, catalog: &str) {
         "DELETE FROM system.table_sync_state WHERE catalog = $1",
         "DELETE FROM system.table_arrow_schema WHERE catalog_name = $1",
         "DELETE FROM system.cache_job WHERE catalog = $1",
+        "DELETE FROM system.database_policy WHERE catalog = $1",
     ] {
         let _ = sqlx::query(sql).bind(catalog).execute(pool).await;
     }
@@ -235,6 +236,39 @@ async fn intelligent_sync_end_to_end() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(updated, "manual refresh did not pick up the 50 new orders");
+
+    // 6. Disabling the database evicts its cached tables: the cache metadata is
+    //    cleared (queries fall back to the live remote source), but the data is
+    //    still correct.
+    let cached_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM system.table_arrow_schema WHERE catalog_name = $1 AND schema_name = 'public'",
+    )
+    .bind(catalog)
+    .fetch_one(&meta)
+    .await
+    .unwrap();
+    assert!(cached_before >= 3, "tables should be cached before disable");
+
+    run(
+        &shared,
+        &format!("ALTER DATABASE {catalog}.public SET CACHE POLICY WITH (mode = 'none')"),
+    )
+    .await;
+
+    let cached_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM system.table_arrow_schema WHERE catalog_name = $1 AND schema_name = 'public'",
+    )
+    .bind(catalog)
+    .fetch_one(&meta)
+    .await
+    .unwrap();
+    assert_eq!(cached_after, 0, "disabling the database must evict its cached tables");
+
+    // Queries still work, now served live from the remote source. (Use count(id)
+    // rather than count(*): the remote provider can't yet scan a zero-column
+    // projection — a separate, pre-existing limitation of the live read path.)
+    let after_evict = run(&shared, &format!("SELECT count(id) FROM {catalog}.public.e2e_orders")).await;
+    assert_eq!(scalar_count(&after_evict), 350, "remote fallback returns correct data");
 
     // Cleanup.
     clean_meta(&meta, catalog).await;

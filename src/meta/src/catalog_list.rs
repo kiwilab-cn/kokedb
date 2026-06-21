@@ -517,6 +517,83 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(())
     }
 
+    /// Lists the currently-cached `table_name`s in a database (have a snapshot).
+    pub async fn list_cached_tables_in_schema(
+        &self,
+        catalog: &str,
+        schema: &str,
+    ) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT table_name FROM system.table_arrow_schema \
+             WHERE catalog_name = $1 AND schema_name = $2;",
+        )
+        .bind(catalog)
+        .bind(schema)
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("table_name")).collect())
+    }
+
+    /// Evicts a table from the cache at the meta level: returns its snapshot
+    /// `local_path` and the cached query-result keys (for the caller to delete
+    /// the files / invalidate the result cache), then removes the arrow-schema,
+    /// sync-state, policy, and stats rows so the table resolves to its live
+    /// remote source again.
+    pub async fn evict_table_cache(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<(Option<String>, Vec<u64>)> {
+        let local_path: Option<String> = sqlx::query(
+            "SELECT local_path FROM system.table_arrow_schema \
+             WHERE catalog_name = $1 AND schema_name = $2 AND table_name = $3;",
+        )
+        .bind(catalog)
+        .bind(schema)
+        .bind(table)
+        .fetch_optional(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .and_then(|r| r.try_get::<String, _>("local_path").ok());
+
+        let cache_keys: Vec<u64> = sqlx::query_as::<_, (Vec<String>,)>(
+            "SELECT cache_key_list FROM system.table_stats \
+             WHERE catalog = $1 AND schema = $2 AND table_name = $3;",
+        )
+        .bind(catalog)
+        .bind(schema)
+        .bind(table)
+        .fetch_optional(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?
+        .map(|(list,)| list.iter().filter_map(|s| s.parse::<u64>().ok()).collect())
+        .unwrap_or_default();
+
+        // Delete the cache metadata from all relevant tables (note the differing
+        // catalog/schema column names per table).
+        for sql in [
+            "DELETE FROM system.table_arrow_schema WHERE catalog_name=$1 AND schema_name=$2 AND table_name=$3",
+            "DELETE FROM system.table_sync_state WHERE catalog=$1 AND schema_name=$2 AND table_name=$3",
+            "DELETE FROM system.table_sync_policy WHERE catalog=$1 AND schema_name=$2 AND table_name=$3",
+            "DELETE FROM system.table_stats WHERE catalog=$1 AND schema=$2 AND table_name=$3",
+        ] {
+            sqlx::query(sql)
+                .bind(catalog)
+                .bind(schema)
+                .bind(table)
+                .execute(&self.local_pool)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
+        // Drop it from the in-memory provider cache so the next resolve rebuilds
+        // it (as a live remote table) instead of serving the stale snapshot.
+        self.catalog_cache.remove(catalog);
+
+        Ok((local_path, cache_keys))
+    }
+
     /// Returns the `(schema, mode)` database overrides for a catalog.
     pub async fn get_database_policies(&self, catalog: &str) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query(
@@ -1609,6 +1686,42 @@ mod policy_tests {
             .execute(&meta.local_pool)
             .await
             .unwrap();
+    }
+
+    // evict_table_cache returns the snapshot path + result-cache keys and removes
+    // the cache metadata so the table is no longer considered cached.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via PG_META_DSN"]
+    async fn evict_table_cache_clears_metadata() {
+        let pool = PgPool::connect(&meta_dsn()).await.unwrap();
+        let meta = PostgreSQLMetaCatalogProviderList::from_pool(pool);
+        meta.init_db().await.unwrap();
+        let (cat, sch, tbl) = ("it_evict", "public", "t1");
+        for sql in [
+            "DELETE FROM system.table_arrow_schema WHERE catalog_name='it_evict'",
+            "DELETE FROM system.table_sync_state WHERE catalog='it_evict'",
+            "DELETE FROM system.table_stats WHERE catalog='it_evict'",
+        ] {
+            sqlx::query(sql).execute(&meta.local_pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO system.table_arrow_schema (catalog_name, schema_name, table_name, local_path) \
+             VALUES ($1,$2,$3,'/tmp/kokedb-evict-x/uuid')",
+        )
+        .bind(cat).bind(sch).bind(tbl)
+        .execute(&meta.local_pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO system.table_stats (catalog, schema, table_name, cache_key_list) \
+             VALUES ($1,$2,$3, ARRAY['111','222'])",
+        )
+        .bind(cat).bind(sch).bind(tbl)
+        .execute(&meta.local_pool).await.unwrap();
+
+        assert!(meta.check_table_is_cached(cat, sch, tbl).await.unwrap());
+        let (path, keys) = meta.evict_table_cache(cat, sch, tbl).await.unwrap();
+        assert_eq!(path.as_deref(), Some("/tmp/kokedb-evict-x/uuid"));
+        assert_eq!(keys, vec![111u64, 222u64]);
+        assert!(!meta.check_table_is_cached(cat, sch, tbl).await.unwrap(), "no longer cached");
     }
 
     // Catalog/database policy accessors roundtrip.
