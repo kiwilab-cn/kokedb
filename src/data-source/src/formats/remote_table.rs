@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use arrow::datatypes::*;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
@@ -143,14 +143,16 @@ impl PostgreSQLExec {
             None => format!("\"{}\"", self.config.table_name),
         };
 
-        let columns = if let Some(ref projection) = self.projection {
-            projection
+        let columns = match &self.projection {
+            // An empty projection (e.g. `count(*)`) needs no columns — select a
+            // constant so PostgreSQL still returns one row per source row.
+            Some(p) if p.is_empty() => "1".to_string(),
+            Some(projection) => projection
                 .iter()
                 .map(|&i| format!("\"{}\"", self.projected_schema.field(i).name()))
                 .collect::<Vec<_>>()
-                .join(", ")
-        } else {
-            "*".to_string()
+                .join(", "),
+            None => "*".to_string(),
         };
 
         let mut query = format!("SELECT {} FROM {}", columns, full_table_name);
@@ -268,6 +270,21 @@ impl ExecutionPlan for PostgreSQLExec {
     }
 }
 
+/// Builds a record batch from source rows. Handles the zero-column case (a
+/// `count(*)`-style scan with an empty projection): the batch carries no columns
+/// but an explicit row count, which `RecordBatch::try_new` cannot infer.
+fn rows_to_batch(rows: &[sqlx::postgres::PgRow], schema: &SchemaRef) -> Result<RecordBatch> {
+    if schema.fields().is_empty() {
+        let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+        RecordBatch::try_new_with_options(schema.clone(), vec![], &options)
+            .map_err(DataFusionError::from)
+    } else {
+        rows_to_record_batch(rows, schema).map_err(|e| {
+            DataFusionError::Internal(format!("Failed to build record batch: {e}"))
+        })
+    }
+}
+
 struct PostgreSQLStream {
     schema: SchemaRef,
     stream: Pin<Box<dyn Stream<Item = Result<RecordBatch>> + Send>>,
@@ -289,13 +306,13 @@ impl PostgreSQLStream {
                         batch_rows.push(row);
 
                         if batch_rows.len() >= BATCH_SIZE {
-                            match rows_to_record_batch(&batch_rows, &schema_for_stream) {
+                            match rows_to_batch(&batch_rows, &schema_for_stream) {
                                 Ok(batch) => {
                                     yield Ok(batch);
                                     batch_rows.clear();
                                 }
                                 Err(e) => {
-                                    yield Err(DataFusionError::Internal(format!("Failed to transaction record batch with error: {}", e)));
+                                    yield Err(e);
                                     return;
                                 }
                             }
@@ -309,9 +326,9 @@ impl PostgreSQLStream {
             }
 
             if !batch_rows.is_empty() {
-                match rows_to_record_batch(&batch_rows, &schema_for_stream) {
+                match rows_to_batch(&batch_rows, &schema_for_stream) {
                     Ok(batch) => yield Ok(batch),
-                    Err(e) => yield Err(DataFusionError::Internal(format!("Failed to transaction record_batch with error: {}", e))),
+                    Err(e) => yield Err(e),
                 }
             }
         };
@@ -367,5 +384,58 @@ mod tests {
         info!("Results: {:?}", results);
 
         Ok(())
+    }
+
+    // Regression: `count(*)` over a remote (uncached) table — a zero-column
+    // projection — previously failed with "must either specify a row count or at
+    // least one column". 1500 rows exercises both the 1000-row chunk path and the
+    // final partial batch.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via KOKEDB_TEST_DSN"]
+    async fn count_star_over_remote_table() {
+        use arrow::array::Int64Array;
+        let dsn = std::env::var("KOKEDB_TEST_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".to_string());
+        let pool = PgPool::connect(&dsn).await.unwrap();
+        for stmt in [
+            "DROP TABLE IF EXISTS it_remote_cnt",
+            "CREATE TABLE it_remote_cnt (id int, v int)",
+            "INSERT INTO it_remote_cnt SELECT g, g*2 FROM generate_series(1, 1500) g",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+
+        let provider = PostgreSQLTableProvider::new(PostgreSQLConfig {
+            connection_string: dsn.clone(),
+            table_name: "it_remote_cnt".to_string(),
+            schema_name: Some("public".to_string()),
+        })
+        .await
+        .unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider)).unwrap();
+
+        let scalar = |batches: Vec<RecordBatch>| {
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0)
+        };
+
+        let total = ctx.sql("SELECT count(*) FROM t").await.unwrap().collect().await.unwrap();
+        assert_eq!(scalar(total), 1500, "count(*) over remote table");
+
+        let filtered = ctx
+            .sql("SELECT count(*) FROM t WHERE id > 1495")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(scalar(filtered), 5, "filtered count(*) over remote table");
+
+        sqlx::query("DROP TABLE IF EXISTS it_remote_cnt").execute(&pool).await.unwrap();
     }
 }
