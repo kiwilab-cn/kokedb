@@ -11,10 +11,13 @@
 use kokedb_common::env::get_env_as;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use log::{info, warn};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::error::TaskError;
-use crate::incremental::{compare_snapshots, incremental_where, merge_snapshot};
+use crate::incremental::{
+    compare_snapshots, filter_snapshot_window, incremental_where, merge_snapshot,
+};
 use crate::read_postgres::{convert_postgres_to_parquet, PostgresToParquetConverter};
 use crate::validation::{apply_audit, AuditOutcome, AuditState, AuditThresholds};
 
@@ -168,24 +171,74 @@ async fn run_validation(
     delta_dir: &str,
     inc_dir: &str,
 ) -> Result<bool, TaskError> {
-    // 1. Full truth.
-    let schema = convert_postgres_to_parquet(dsn, source_table, full_dir, Some(watermark)).await?;
+    // Bound the audit cost to a recent window when the watermark is a timestamp:
+    // pull/compare only rows newer than `boundary`. Older rows are reconciled by
+    // the periodic full refresh (force_full_every), so this trades a little
+    // detection latency for a much cheaper audit on large historical tables.
+    // For non-timestamp watermarks (e.g. APPEND on a bigint id) the boundary
+    // query fails to cast and we fall back to a full validation.
+    let window = get_env_as("KOKEDB_AUDIT_WINDOW", "30 days".to_string());
+    let boundary: Option<String> = if window.trim().is_empty() || window.trim() == "0" {
+        None
+    } else {
+        match PgPool::connect(dsn).await {
+            Ok(pool) => {
+                let b = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT LEAST(now() - $2::interval, $1::timestamptz)::text",
+                )
+                .bind(last_watermark)
+                .bind(&window)
+                .fetch_one(&pool)
+                .await
+                .ok()
+                .flatten();
+                pool.close().await;
+                b
+            }
+            Err(_) => None,
+        }
+    };
 
-    // 2. Delta since the last watermark.
+    // Ensure temp dirs exist so empty windows still register as 0-row tables.
+    let prev_window_dir = format!("{inc_dir}__prevwin");
+    for d in [full_dir, delta_dir, inc_dir, &prev_window_dir] {
+        let _ = tokio::fs::create_dir_all(d).await;
+    }
+
     let converter = PostgresToParquetConverter::new(dsn).await?;
-    let where_clause = incremental_where(watermark, last_watermark);
+
+    // 1. Truth: the whole table, or just the recent window.
+    let schema = match &boundary {
+        Some(b) => {
+            let where_truth = incremental_where(watermark, b);
+            converter
+                .convert_table_to_parquet_where(source_table, full_dir, Some(&where_truth), Some(watermark))
+                .await?
+        }
+        None => convert_postgres_to_parquet(dsn, source_table, full_dir, Some(watermark)).await?,
+    };
+
+    // 2. Delta since the last watermark (always a subset of the window).
     converter
         .convert_table_to_parquet_where(
             source_table,
             delta_dir,
-            Some(&where_clause),
+            Some(&incremental_where(watermark, last_watermark)),
             Some(watermark),
         )
         .await?;
 
-    // 3. Incremental candidate = previous snapshot merged with the delta.
+    // 3. Incremental candidate = previous snapshot (windowed to match the truth)
+    //    merged with the delta.
+    let prev_for_merge = match &boundary {
+        Some(b) => {
+            filter_snapshot_window(prev_path, &prev_window_dir, watermark, b, schema.clone()).await?;
+            prev_window_dir.as_str()
+        }
+        None => prev_path,
+    };
     merge_snapshot(
-        prev_path,
+        prev_for_merge,
         delta_dir,
         inc_dir,
         pk_columns,
@@ -194,12 +247,15 @@ async fn run_validation(
     )
     .await?;
 
-    // 4. Exact comparison.
+    // 4. Exact comparison over the (windowed) row sets.
     let diff = compare_snapshots(full_dir, inc_dir, schema).await?;
     if !diff.matches() {
         warn!(
-            "Shadow diff for {source_table}: full={} inc={} differing={}",
-            diff.count_a, diff.count_b, diff.diff_rows
+            "Shadow diff for {source_table} (window={}): truth={} inc={} differing={}",
+            boundary.as_deref().unwrap_or("full"),
+            diff.count_a,
+            diff.count_b,
+            diff.diff_rows
         );
     }
     Ok(diff.matches())
@@ -240,6 +296,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PostgreSQL; run via KOKEDB_TEST_DSN"]
     async fn run_validation_passes_clean_and_catches_silent_update() {
+        std::env::set_var("KOKEDB_AUDIT_WINDOW", "30 days");
         let dsn = test_dsn();
         let pool = PgPool::connect(&dsn).await.unwrap();
         for stmt in [
@@ -299,5 +356,74 @@ mod tests {
 
         let _ = tokio::fs::remove_dir_all(&base).await;
         sqlx::query("DROP TABLE IF EXISTS it_val").execute(&pool).await.unwrap();
+    }
+
+    // The windowed audit compares only rows newer than the boundary: a silent
+    // update INSIDE the window is caught; one OUTSIDE it is not (and is left for
+    // the periodic full reconcile). Verifies the cost/latency tradeoff boundary.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via KOKEDB_TEST_DSN"]
+    async fn windowed_audit_scopes_to_recent_rows() {
+        std::env::set_var("KOKEDB_AUDIT_WINDOW", "7 days");
+        let dsn = test_dsn();
+        let pool = PgPool::connect(&dsn).await.unwrap();
+        for stmt in [
+            "DROP TABLE IF EXISTS it_win",
+            // No trigger: we control updated_at directly.
+            "CREATE TABLE it_win (id int PRIMARY KEY, v int, updated_at timestamptz NOT NULL)",
+            "INSERT INTO it_win SELECT g, g, now() - interval '60 days' FROM generate_series(1, 50) g",
+            "INSERT INTO it_win SELECT g, g, now() FROM generate_series(51, 100) g",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+
+        let base = std::env::temp_dir().join(format!("kokedb-wintest/{}", Uuid::new_v4()));
+        let prev = base.join("prev").to_string_lossy().to_string();
+        convert_postgres_to_parquet(&dsn, "public.it_win", &prev, Some("updated_at"))
+            .await
+            .unwrap();
+        let last_wm: String = sqlx::query("SELECT max(updated_at)::text AS wm FROM it_win")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("wm");
+        let pk = vec!["id".to_string()];
+
+        let dirs = |n: &str| {
+            (
+                base.join(format!("{n}f")).to_string_lossy().to_string(),
+                base.join(format!("{n}d")).to_string_lossy().to_string(),
+                base.join(format!("{n}i")).to_string_lossy().to_string(),
+            )
+        };
+
+        // Silent update to an OLD row (updated_at 60d ago, outside the 7d window).
+        sqlx::query("UPDATE it_win SET v = -1 WHERE id = 10")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (f, d, i) = dirs("old");
+        let old_pass = run_validation(
+            &dsn, "public.it_win", "updated_at", &last_wm, &prev, &pk, &f, &d, &i,
+        )
+        .await
+        .unwrap();
+        assert!(old_pass, "an update outside the window is not audited (left to full reconcile)");
+
+        // Silent update to a RECENT row (updated_at now, inside the window).
+        sqlx::query("UPDATE it_win SET v = -1 WHERE id = 60")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (f, d, i) = dirs("new");
+        let recent_caught = run_validation(
+            &dsn, "public.it_win", "updated_at", &last_wm, &prev, &pk, &f, &d, &i,
+        )
+        .await
+        .unwrap();
+        assert!(!recent_caught, "an update inside the window must be caught");
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        sqlx::query("DROP TABLE IF EXISTS it_win").execute(&pool).await.unwrap();
     }
 }

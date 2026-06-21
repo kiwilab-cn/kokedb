@@ -126,6 +126,10 @@ score = w_a*freshness_value + w_u*update_pressure - w_c*cost
 >   （`KOKEDB_SHADOW_VALIDATE`，低预算/tick，复用现有调度不另起线程池）。meta 加
 >   `next_audit_at/audit_passes/divergence_count` + `get_due_audit_tables`/`update_audit_result`。
 > - **集成验证**：核心安全属性已在真库验证——干净 append→Pass，静默更新(不动 watermark)→Diverge 被抓住。
+> - **窗口化降本（已实现）**：影子双跑只拉/比 `watermark > LEAST(now()-KOKEDB_AUDIT_WINDOW, last_watermark)`
+>   的近窗行（prev 快照按同一边界裁剪后再 merge），大幅降低大历史表审计成本；窗口外老行的静默更新
+>   留给周期性全量对账兜底。非时间戳 watermark（APPEND/bigint）边界 cast 失败 → 自动回退全量校验。
+>   `KOKEDB_AUDIT_WINDOW` 默认 `30 days`，设空/`0` 关闭窗口化。真库验证：窗口内更新被抓、窗口外更新放过。
 
 ### 3.1 放宽 watermark 检测（规则）
 `detect_watermark_column` 升级为 `infer_incremental_strategy`：
