@@ -46,6 +46,9 @@ pub enum CatalogCommand {
     ShowTableMetadata {
         table: Vec<String>,
     },
+    RefreshCacheCatalog {
+        catalog: String,
+    },
     AlterTableCachePolicy {
         table: Vec<String>,
         options: Vec<(String, String)>,
@@ -169,6 +172,7 @@ impl CatalogCommand {
             CatalogCommand::DropCatalog { .. } => "DropCatalog",
             CatalogCommand::ListCachePolicies => "ListCachePolicies",
             CatalogCommand::RefreshCache { .. } => "RefreshCache",
+            CatalogCommand::RefreshCacheCatalog { .. } => "RefreshCacheCatalog",
             CatalogCommand::ShowTableMetadata { .. } => "ShowTableMetadata",
             CatalogCommand::AlterTableCachePolicy { .. } => "AlterTableCachePolicy",
             CatalogCommand::ShowCacheJobs { .. } => "ShowCacheJobs",
@@ -210,7 +214,7 @@ impl CatalogCommand {
             CatalogCommand::ListCachePolicies => {
                 Vec::<FieldRef>::from_type::<CachePolicyDisplay>(TracingOptions::default())
             }
-            CatalogCommand::RefreshCache { .. } => {
+            CatalogCommand::RefreshCache { .. } | CatalogCommand::RefreshCacheCatalog { .. } => {
                 Vec::<FieldRef>::from_type::<RefreshCacheDisplay>(TracingOptions::default())
             }
             CatalogCommand::ShowTableMetadata { .. } => {
@@ -308,6 +312,10 @@ impl CatalogCommand {
             CatalogCommand::RefreshCache { table } => {
                 let row = manager.refresh_table(table).await?;
                 build_record_batch(schema, &[row])
+            }
+            CatalogCommand::RefreshCacheCatalog { catalog } => {
+                let rows = manager.refresh_catalog(&catalog).await?;
+                build_record_batch(schema, &rows)
             }
             CatalogCommand::ShowTableMetadata { table } => {
                 let row = manager.show_table_metadata(table).await?;

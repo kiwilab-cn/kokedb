@@ -237,6 +237,11 @@ async fn intelligent_sync_end_to_end() {
     }
     assert!(updated, "manual refresh did not pick up the 50 new orders");
 
+    // 5b. Catalog-wide refresh queues every selected table.
+    let cat_refresh = run(&shared, &format!("REFRESH CACHE FROM CATALOG {catalog}")).await;
+    let queued: usize = cat_refresh.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(queued, 3, "REFRESH CACHE FROM CATALOG should queue all 3 tables");
+
     // 6. Disabling the database evicts its cached tables: the cache metadata is
     //    cleared (queries fall back to the live remote source), but the data is
     //    still correct.

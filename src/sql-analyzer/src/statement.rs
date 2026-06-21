@@ -1047,11 +1047,16 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             refresh: _,
             cache: _,
             from: _,
-            table: _,
+            target,
             name,
         } => {
-            let node = spec::CommandNode::RefreshCache {
-                table: from_ast_object_name(name)?,
+            let node = match target {
+                Either::Left(_table) => spec::CommandNode::RefreshCache {
+                    table: from_ast_object_name(name)?,
+                },
+                Either::Right(_catalog) => spec::CommandNode::RefreshCacheCatalog {
+                    catalog: from_ast_object_name(name)?,
+                },
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
@@ -1913,6 +1918,23 @@ mod drop_catalog_tests {
                     assert_eq!(parts, vec!["demo", "public", "orders"]);
                 }
                 other => panic!("expected RefreshCache, got {other:?}"),
+            },
+            _ => panic!("expected a command plan"),
+        }
+    }
+
+    #[test]
+    fn parse_refresh_cache_from_catalog() {
+        let plan = from_ast_statement(
+            parse_one_statement("REFRESH CACHE FROM CATALOG demo").unwrap(),
+        )
+        .unwrap();
+        match plan {
+            spec::Plan::Command(c) => match c.node {
+                spec::CommandNode::RefreshCacheCatalog { catalog } => {
+                    assert_eq!(<Vec<String>>::from(catalog), vec!["demo"]);
+                }
+                other => panic!("expected RefreshCacheCatalog, got {other:?}"),
             },
             _ => panic!("expected a command plan"),
         }

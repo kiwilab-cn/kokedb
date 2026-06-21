@@ -19,6 +19,15 @@ impl PlanResolver<'_> {
         })
     }
 
+    pub(in super::super) fn resolve_cache_refresh_catalog(
+        &self,
+        catalog: spec::ObjectName,
+    ) -> PlanResult<LogicalPlan> {
+        self.resolve_catalog_command(CatalogCommand::RefreshCacheCatalog {
+            catalog: <Vec<String>>::from(catalog).join("."),
+        })
+    }
+
     pub(in super::super) fn resolve_show_table_metadata(
         &self,
         table: spec::ObjectName,

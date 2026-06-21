@@ -5,7 +5,9 @@ use kokedb_common::cache_policy::{parse_cache_policy, CachePolicy};
 use kokedb_common::env::get_env_as;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::adaptive;
-use kokedb_task_manager::cache_sync_task::{execute_catalog_sync_task, refresh_single_table};
+use kokedb_task_manager::cache_sync_task::{
+    execute_catalog_sync_task, refresh_single_table, select_tables_for_policy,
+};
 use kokedb_task_manager::shadow_validate;
 use kokedb_task_manager::task_manager::TaskManager;
 use kokedb_task_manager::error::TaskError;
@@ -110,6 +112,42 @@ impl CatalogManager {
             task_id,
             status: "QUEUED".to_string(),
         })
+    }
+
+    /// Enqueues a sync for every table the catalog's policy selects (backs
+    /// `REFRESH CACHE FROM CATALOG`). Returns one row per queued table.
+    pub async fn refresh_catalog(&self, catalog: &str) -> CatalogResult<Vec<RefreshCacheDisplay>> {
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let info = meta
+            .get_catalog(catalog)
+            .await
+            .map_err(|e| CatalogError::NotFound("catalog", format!("{catalog}: {e}")))?;
+        let policy_str = meta
+            .get_catalog_cache_policy(catalog)
+            .await
+            .map_err(|e| CatalogError::Internal(format!("Failed to read cache policy: {e}")))?;
+        let policy = CachePolicy::from_string(&policy_str).map_err(|e| {
+            CatalogError::Internal(format!("Failed to parse cache policy: {e:?}"))
+        })?;
+
+        let tables = select_tables_for_policy(catalog, &info.dsn, &policy)
+            .await
+            .map_err(|e| CatalogError::External(format!("Failed to select tables: {e}")))?;
+
+        let task_manager = self.state()?.catalog_task_manager.clone();
+        let mut rows = Vec::with_capacity(tables.len());
+        for table in tables {
+            match refresh_single_table(catalog, &info.dsn, &table, task_manager.clone()).await {
+                Ok(task_id) => rows.push(RefreshCacheDisplay {
+                    table: format!("{catalog}.{table}"),
+                    task_id,
+                    status: "QUEUED".to_string(),
+                }),
+                Err(e) => warn!("Failed to enqueue refresh for {catalog}.{table}: {e}"),
+            }
+        }
+        info!("Queued {} table refreshes for catalog '{catalog}'", rows.len());
+        Ok(rows)
     }
 
     /// Reads a table's inferred sync metadata for `SHOW TABLE METADATA`. The

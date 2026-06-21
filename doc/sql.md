@@ -121,8 +121,11 @@ or incremental is decided by the runner from the table's detected metadata and
 its persisted sync state.
 
 ```sql
-REFRESH CACHE FROM TABLE demo.public.orders;
+REFRESH CACHE FROM TABLE demo.public.orders;     -- one table
+REFRESH CACHE FROM CATALOG demo;                 -- every table the policy selects
 ```
+
+`REFRESH CACHE FROM CATALOG` returns one queued-task row per selected table.
 ```
 +--------------------+--------------------------------------+--------+
 | table              | task_id                              | status |

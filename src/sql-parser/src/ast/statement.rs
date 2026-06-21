@@ -383,7 +383,7 @@ pub enum Statement {
         refresh: Refresh,
         cache: Cache,
         from: From,
-        table: Table,
+        target: Either<Table, Catalog>,
         name: ObjectName,
     },
     ShowTableMetadata {
