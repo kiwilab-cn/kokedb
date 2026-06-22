@@ -19,7 +19,7 @@ pub fn parser(sql: &str) -> QueryResult<Plan> {
 pub async fn query(
     ctx: Arc<SessionContext>,
     plan: &Plan,
-    key: u64,
+    key: u128,
 ) -> Result<SendableRecordBatchStream, QueryError> {
     let default_plan_config = PlanConfig::default();
     let df_plan =
@@ -30,16 +30,17 @@ pub async fn query(
     Ok(batches)
 }
 
-pub async fn save_sql_history(sql: &str, plan: &Plan, cost: u64) -> Result<bool, QueryError> {
+pub async fn save_sql_history(
+    meta: &PostgreSQLMetaCatalogProviderList,
+    sql: &str,
+    plan: &Plan,
+    cost: u64,
+) -> Result<bool, QueryError> {
     let key = get_plan_hash(plan)?;
 
-    let meta_client = PostgreSQLMetaCatalogProviderList::new().await?;
-    let ret = meta_client
-        .save_sql_stats(sql, key, cost)
-        .await
-        .map_err(|x| {
-            QueryError::SaveSqlStatsError(format!("Failed to save sql stats with error: {:?}", x))
-        })?;
+    let ret = meta.save_sql_stats(sql, key, cost).await.map_err(|x| {
+        QueryError::SaveSqlStatsError(format!("Failed to save sql stats with error: {:?}", x))
+    })?;
 
     Ok(ret)
 }

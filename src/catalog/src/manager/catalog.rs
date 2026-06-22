@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use kokedb_common::cache_policy::{parse_cache_policy, CachePolicy};
 use kokedb_common::env::get_env_as;
+use kokedb_common::redact::redact_dsn;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::adaptive;
 use kokedb_task_manager::cache_sync_task::{
@@ -511,7 +512,9 @@ impl CatalogManager {
 
         // Re-apply: re-select tables, recompute cadence/inference (best-effort).
         if let Ok(info) = meta.get_catalog(catalog).await {
-            if let Err(e) = adaptive::reevaluate_catalog(catalog, &info.dsn, &policy).await {
+            if let Err(e) =
+                adaptive::reevaluate_catalog(meta.clone(), catalog, &info.dsn, &policy).await
+            {
                 warn!("Re-apply after ALTER CATALOG '{}' failed: {}", catalog, e);
             }
         }
@@ -604,7 +607,9 @@ impl CatalogManager {
             meta.get_catalog_cache_policy(&catalog).await,
         ) {
             if let Ok(policy) = CachePolicy::from_string(&policy_str) {
-                if let Err(e) = adaptive::reevaluate_catalog(&catalog, &info.dsn, &policy).await {
+                if let Err(e) =
+                    adaptive::reevaluate_catalog(meta.clone(), &catalog, &info.dsn, &policy).await
+                {
                     warn!("Re-apply after ALTER DATABASE '{}.{}' failed: {}", catalog, schema, e);
                 }
             }
@@ -675,6 +680,9 @@ impl CatalogManager {
             .map_err(|e| CatalogError::Internal(format!("Failed to get state: {}", e)))?;
 
         let catalog_task_manager = state.catalog_task_manager.clone();
+        // Shared meta handle reused by the initial reeval and every scheduler
+        // tick — avoids opening a fresh PgPool on each tick.
+        let meta = state.dynamic_catalog_list.clone();
         let cache_policy = state
             .dynamic_catalog_list
             .get_catalog_cache_policy(catalog)
@@ -702,12 +710,12 @@ impl CatalogManager {
         {
             error!(
                 "Catalog sync task failed for catalog '{}' with DSN '{}': {}",
-                &catalog, &dsn, e
+                &catalog, redact_dsn(&dsn), e
             );
         } else {
             info!(
                 "Catalog first sync task successed for catalog '{}' with DSN '{}'",
-                &catalog, &dsn
+                &catalog, redact_dsn(&dsn)
             )
         }
 
@@ -720,7 +728,7 @@ impl CatalogManager {
             // tick that enqueues only tables whose cadence has elapsed, and
             // re-evaluate cadences (and discover new tables) periodically.
             if let Err(e) =
-                adaptive::reevaluate_catalog(&catalog, &dsn, &cache_policy).await
+                adaptive::reevaluate_catalog(meta.clone(), &catalog, &dsn, &cache_policy).await
             {
                 warn!("Initial adaptive reeval failed for '{}': {}", catalog, e);
             }
@@ -736,16 +744,19 @@ impl CatalogManager {
                 let task_manager = catalog_task_manager.clone();
                 let cache_policy = cache_policy.clone();
                 let ticks = ticks.clone();
+                let meta = meta.clone();
                 Box::pin(async move {
                     // Enqueue tables that are due this tick.
                     if let Err(e) =
-                        adaptive::tick_refresh_due(&catalog, &dsn, task_manager).await
+                        adaptive::tick_refresh_due(meta.clone(), &catalog, &dsn, task_manager).await
                     {
                         error!("Adaptive tick failed for '{}': {}", catalog, e);
                     }
                     // Shadow-validate audit-due tables (low budget per tick).
                     if get_env_as("KOKEDB_SHADOW_VALIDATE", true) {
-                        if let Err(e) = shadow_validate::sweep_audits(&catalog, &dsn).await {
+                        if let Err(e) =
+                            shadow_validate::sweep_audits(meta.clone(), &catalog, &dsn).await
+                        {
                             error!("Shadow audit sweep failed for '{}': {}", catalog, e);
                         }
                     }
@@ -754,7 +765,8 @@ impl CatalogManager {
                         (ticks.fetch_add(1, AtomicOrdering::Relaxed) + 1) * tick_min as u64;
                     if elapsed_min % reeval_min as u64 == 0 {
                         if let Err(e) =
-                            adaptive::reevaluate_catalog(&catalog, &dsn, &cache_policy).await
+                            adaptive::reevaluate_catalog(meta.clone(), &catalog, &dsn, &cache_policy)
+                                .await
                         {
                             error!("Adaptive reeval failed for '{}': {}", catalog, e);
                         }
@@ -780,7 +792,7 @@ impl CatalogManager {
                     {
                         error!(
                             "Catalog sync task failed for catalog '{}' with DSN '{}': {}",
-                            &catalog, &dsn, e
+                            &catalog, redact_dsn(&dsn), e
                         );
                     }
                 })

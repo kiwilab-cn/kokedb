@@ -57,14 +57,11 @@ fn split_schema_table(name: &str) -> (String, String) {
 /// catalog's cache policy selects. Best-effort per table: a table whose signals
 /// cannot be read keeps its previous policy (or the seeded default).
 pub async fn reevaluate_catalog(
+    meta: Arc<PostgreSQLMetaCatalogProviderList>,
     catalog: &str,
     dsn: &str,
     cache_policy: &CachePolicy,
 ) -> Result<(), TaskError> {
-    let meta = PostgreSQLMetaCatalogProviderList::new().await.map_err(|e| {
-        TaskError::MetaReqeustError(format!("Failed to create meta client: {e}"))
-    })?;
-
     let tables = select_tables_for_policy(catalog, dsn, cache_policy).await?;
     if tables.is_empty() {
         return Ok(());
@@ -215,14 +212,11 @@ async fn infer_and_persist(
 /// Enqueues a sync for every table in the catalog whose refresh interval has
 /// elapsed, skipping tables that already have an in-flight sync task.
 pub async fn tick_refresh_due(
+    meta: Arc<PostgreSQLMetaCatalogProviderList>,
     catalog: &str,
     dsn: &str,
     task_manager: Arc<TaskManager>,
 ) -> Result<(), TaskError> {
-    let meta = PostgreSQLMetaCatalogProviderList::new().await.map_err(|e| {
-        TaskError::MetaReqeustError(format!("Failed to create meta client: {e}"))
-    })?;
-
     let due = meta.get_due_refresh_tables(catalog).await.map_err(|e| {
         TaskError::MetaReqeustError(format!("Failed to query due tables: {e}"))
     })?;
@@ -274,12 +268,8 @@ mod tests {
 
         // Ensure the meta schema exists (init_db via the meta client), then use a
         // separate pool for raw assertion/cleanup queries (local_pool is private).
-        PostgreSQLMetaCatalogProviderList::new()
-            .await
-            .unwrap()
-            .init_db()
-            .await
-            .unwrap();
+        let meta = Arc::new(PostgreSQLMetaCatalogProviderList::new().await.unwrap());
+        meta.init_db().await.unwrap();
         let meta_dsn = std::env::var("PG_META_DSN")
             .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/kokedb".into());
         let meta_pool = PgPool::connect(&meta_dsn).await.unwrap();
@@ -291,7 +281,7 @@ mod tests {
         let policy = CachePolicy::Select {
             table_set: "public.it_e2e_upsert,public.it_e2e_full".into(),
         };
-        reevaluate_catalog("it_e2e", &test_dsn(), &policy)
+        reevaluate_catalog(meta.clone(), "it_e2e", &test_dsn(), &policy)
             .await
             .unwrap();
 

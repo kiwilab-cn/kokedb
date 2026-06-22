@@ -39,6 +39,15 @@ pub struct SharedServices {
     result_cache: LruResultCache,
 }
 
+impl SharedServices {
+    /// The shared meta-store handle. Reuses the process-wide connection pool —
+    /// callers must not construct a fresh `PostgreSQLMetaCatalogProviderList`
+    /// (which would open a brand-new pool on every call).
+    pub fn meta(&self) -> Arc<PostgreSQLMetaCatalogProviderList> {
+        self.catalog_list.clone()
+    }
+}
+
 /// Initializes the process-wide services exactly once: connects to the meta
 /// store, creates the schema, starts the task manager + scheduler, and registers
 /// the periodic catalog-sync jobs.
@@ -91,7 +100,7 @@ struct CacheRefresher {
 
 #[async_trait::async_trait]
 impl ResultRefresher for CacheRefresher {
-    async fn refresh(&self, cache_keys: Vec<u64>) {
+    async fn refresh(&self, cache_keys: Vec<u128>) {
         // A fresh context picks up the just-synced snapshots.
         let ctx = match create_session_context(&self.shared) {
             Ok(ctx) => Arc::new(ctx),
@@ -109,7 +118,7 @@ impl ResultRefresher for CacheRefresher {
 }
 
 impl CacheRefresher {
-    async fn refresh_one(&self, ctx: &Arc<SessionContext>, key: u64) -> Result<(), String> {
+    async fn refresh_one(&self, ctx: &Arc<SessionContext>, key: u128) -> Result<(), String> {
         let sql = self
             .shared
             .catalog_list
@@ -226,7 +235,7 @@ mod tests {
         let shared = init_shared_services(cache.clone()).await.unwrap();
 
         // A table-free query so the test does not depend on any catalog data.
-        let key: u64 = 0xC0FFEE;
+        let key: u128 = 0xC0FFEE;
         shared
             .catalog_list
             .save_sql_stats("SELECT 1 AS x", key, 0)

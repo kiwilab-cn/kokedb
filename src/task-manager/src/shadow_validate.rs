@@ -8,7 +8,10 @@
 //! force-full nudge to self-heal on divergence), so it can never corrupt a
 //! served snapshot.
 
+use std::sync::Arc;
+
 use kokedb_common::env::get_env_as;
+use kokedb_common::file::TempPath;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use log::{info, warn};
 use sqlx::PgPool;
@@ -38,10 +41,11 @@ fn thresholds() -> AuditThresholds {
 
 /// Picks the audit-due tables for a catalog and validates up to a small budget
 /// per call (audits are low-priority and must not crowd out real syncs).
-pub async fn sweep_audits(catalog: &str, dsn: &str) -> Result<(), TaskError> {
-    let meta = PostgreSQLMetaCatalogProviderList::new().await.map_err(|e| {
-        TaskError::MetaReqeustError(format!("Failed to create meta client: {e}"))
-    })?;
+pub async fn sweep_audits(
+    meta: Arc<PostgreSQLMetaCatalogProviderList>,
+    catalog: &str,
+    dsn: &str,
+) -> Result<(), TaskError> {
     let due = meta.get_due_audit_tables(catalog).await.map_err(|e| {
         TaskError::MetaReqeustError(format!("Failed to query audit-due tables: {e}"))
     })?;
@@ -96,8 +100,9 @@ pub async fn validate_table(
         return Ok(());
     }
 
-    // Isolated temp workspace.
+    // Isolated temp workspace, cleaned up on every exit (incl. early return).
     let base = std::env::temp_dir().join(format!("kokedb-validate/{}", Uuid::new_v4()));
+    let _base_guard = TempPath::new(&base);
     let full_dir = base.join("full");
     let delta_dir = base.join("delta");
     let inc_dir = base.join("inc");

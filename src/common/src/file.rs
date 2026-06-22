@@ -125,3 +125,40 @@ pub async fn cleanup_old_directories(
     log::debug!("Cleanup completed for directory: {}", dir_path);
     Ok(())
 }
+
+/// RAII guard for a working directory: removes it on drop unless `disarm`ed.
+/// Use for intermediate sync/validation dirs (always cleaned up, even on early
+/// return or panic), and for a snapshot dir that must be deleted on failure but
+/// kept on success (`disarm` once the snapshot is committed).
+pub struct TempPath {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempPath {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            armed: true,
+        }
+    }
+
+    /// Keep the directory (it has been committed / is no longer temporary).
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        if self.armed {
+            // Best-effort, synchronous (Drop can't await). Removing a local temp
+            // dir is cheap; failures are non-fatal.
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}

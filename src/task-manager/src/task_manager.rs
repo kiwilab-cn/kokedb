@@ -85,7 +85,7 @@ pub struct CacheTableTaskConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResultRefreshTaskConfig {
-    pub sql_id: u64,
+    pub sql_id: u128,
     pub batch_size: Option<usize>,
     pub timeout_seconds: Option<usize>,
     pub priority: TaskPriority,
@@ -403,7 +403,7 @@ impl TaskManager {
 
     /// Invalidates cached query results by key (used when a table is evicted from
     /// the cache so stale results are not served after un-caching).
-    pub async fn invalidate_cache_keys(&self, keys: &[u64]) {
+    pub async fn invalidate_cache_keys(&self, keys: &[u128]) {
         for key in keys {
             let _ = self.result_cache.delete(*key).await;
         }

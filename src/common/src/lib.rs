@@ -7,6 +7,7 @@ pub mod file;
 pub mod hash;
 pub mod object;
 pub mod opentelemetry;
+pub mod redact;
 pub mod spec;
 pub mod string;
 pub mod table;

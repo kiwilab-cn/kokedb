@@ -4,7 +4,9 @@ use arrow::datatypes::Schema;
 use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_common::{
     env::get_env_as,
-    file::{cleanup_old_directories, ensure_dir_exists, get_remote_catalog_parent_local_path},
+    file::{
+        cleanup_old_directories, ensure_dir_exists, get_remote_catalog_parent_local_path, TempPath,
+    },
 };
 use kokedb_meta::{
     catalog_list::{PostgreSQLMetaCatalogProviderList, TableSyncState},
@@ -42,7 +44,7 @@ pub trait TaskExecutor: Send + Sync {
 #[async_trait::async_trait]
 pub trait ResultRefresher: Send + Sync {
     /// Re-execute and re-cache the queries behind the given result-cache keys.
-    async fn refresh(&self, cache_keys: Vec<u64>);
+    async fn refresh(&self, cache_keys: Vec<u128>);
 }
 
 /// A settable slot for the [`ResultRefresher`], filled after the query layer is
@@ -149,6 +151,10 @@ impl DataSyncExecutor {
             local_table.replace('.', "/"),
         );
         let local_path = format!("{}/{}", &table_base_path, uuid::Uuid::new_v4());
+        // Remove the snapshot dir if the sync fails before it is registered in the
+        // meta store (disarmed once save_table_schema commits it). Prevents
+        // orphaned snapshots on partial failure.
+        let mut snapshot_guard = TempPath::new(&local_path);
 
         let (schema, table) = local_table
             .split_once('.')
@@ -239,6 +245,8 @@ impl DataSyncExecutor {
                     // partition column and this table actually has it.
                     Some(col) => {
                         let flat = format!("/tmp/kokedb-flat/{}", uuid::Uuid::new_v4());
+                        // Cleaned up on any exit from this arm (incl. early error).
+                        let _flat_guard = TempPath::new(&flat);
                         let schema = convert_postgres_to_parquet(
                             &dsn,
                             source_table,
@@ -357,6 +365,8 @@ impl DataSyncExecutor {
                 "Failed to save table schema to meta postgresql server.".to_string(),
             )
         })?;
+        // The snapshot is now registered; keep it even if later steps fail.
+        snapshot_guard.disarm();
 
         // Record (or clear) the Hive partition column for the query path.
         if let Err(e) = meta
@@ -533,6 +543,7 @@ async fn run_incremental(
     pk_columns: &[String],
 ) -> Result<(Arc<Schema>, Option<String>), TaskError> {
     let delta_path = format!("/tmp/kokedb-delta/{}", uuid::Uuid::new_v4());
+    let _delta_guard = TempPath::new(&delta_path);
     // Ensure both directories exist so the merge can register them even if the
     // delta turns out empty.
     ensure_dir_exists(&delta_path).await?;

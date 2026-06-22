@@ -3300,6 +3300,7 @@ dependencies = [
  "futures",
  "kokedb-cache",
  "kokedb-common",
+ "kokedb-meta",
  "kokedb-query",
  "log",
  "opensrv-mysql",
