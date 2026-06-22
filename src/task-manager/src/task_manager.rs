@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -208,6 +208,12 @@ impl TaskQueue {
 pub struct TaskManager {
     config: TaskManagerConfig,
     tasks: Arc<DashMap<String, TaskMetadata>>,
+    /// Secondary index `(catalog, source_table) -> candidate task ids`, so
+    /// `has_inflight_table_task` need not scan every task. It is a *candidate*
+    /// set, not ground truth: lookups re-confirm each id against `tasks` and
+    /// prune stale ones, so the index can never drift into a wrong answer even
+    /// when a worker is aborted without running its cleanup.
+    inflight_index: Arc<DashMap<(String, String), HashSet<String>>>,
     task_handles: Arc<DashMap<String, JoinHandle<()>>>,
     executor: Arc<dyn TaskExecutor>,
     /// Settable slot for the result refresher, shared with the data-sync
@@ -238,6 +244,7 @@ impl TaskManager {
         let task_manager = Self {
             config: config.clone(),
             tasks: Arc::new(DashMap::new()),
+            inflight_index: Arc::new(DashMap::new()),
             task_handles: Arc::new(DashMap::new()),
             executor: Arc::new(DataSyncExecutor::new(refresher_slot.clone())),
             refresher_slot,
@@ -413,14 +420,28 @@ impl TaskManager {
     /// queued, or running. Used by the adaptive tick to avoid stacking duplicate
     /// refreshes when a sync runs longer than the tick interval.
     pub fn has_inflight_table_task(&self, catalog: &str, source_table: &str) -> bool {
-        self.tasks.iter().any(|entry| {
-            let t = entry.value();
-            matches!(
-                t.status,
-                TaskStatus::Pending | TaskStatus::Queued | TaskStatus::Running
-            ) && t.config.catalog_name == catalog
-                && t.config.source_table == source_table
-        })
+        let key = (catalog.to_string(), source_table.to_string());
+        let Some(mut candidates) = self.inflight_index.get_mut(&key) else {
+            return false;
+        };
+        // Re-confirm each candidate against the authoritative task map and drop
+        // ids that have finished or vanished, so the answer is always correct
+        // regardless of how the index got populated.
+        candidates.retain(|task_id| {
+            self.tasks.get(task_id).is_some_and(|t| {
+                matches!(
+                    t.status,
+                    TaskStatus::Pending | TaskStatus::Queued | TaskStatus::Running
+                )
+            })
+        });
+        let inflight = !candidates.is_empty();
+        drop(candidates);
+        // Reclaim the key once no live tasks remain (best-effort).
+        if !inflight {
+            self.inflight_index.remove_if(&key, |_, v| v.is_empty());
+        }
+        inflight
     }
 
     pub async fn add_task(&self, config: CacheTableTaskConfig) -> Result<String, TaskError> {
@@ -447,6 +468,10 @@ impl TaskManager {
         };
 
         self.tasks.insert(task_id.clone(), metadata);
+        self.inflight_index
+            .entry((config.catalog_name.clone(), config.source_table.clone()))
+            .or_default()
+            .insert(task_id.clone());
 
         let priority = config.priority;
         self.queue.push(task_id.clone(), config, priority).await;
@@ -736,6 +761,39 @@ mod tests {
         }
         // Critical first (FIFO within: crit1 before crit2), then Normal, then Low.
         assert_eq!(order, vec!["crit1", "crit2", "normal", "low"]);
+    }
+
+    // has_inflight_table_task is keyed by (catalog, source_table) via the
+    // secondary index. A freshly added task is inflight (Pending/Queued/Running,
+    // and stays so across connection-failure retries), so the lookup must see
+    // it for its own key and not for another. DB-free: the task's executor will
+    // fail to connect, but that does not move it out of an inflight state here.
+    #[tokio::test]
+    async fn has_inflight_is_keyed_by_catalog_and_table() {
+        let cache = LruResultCache::new(16, 16).await.unwrap();
+        let mut tm = TaskManager::new_with(TaskManagerConfig::default(), cache)
+            .await
+            .unwrap();
+
+        assert!(!tm.has_inflight_table_task("kokedb", "public.t"));
+
+        // cfg() uses catalog "kokedb", source_table "public.t".
+        let _id = tm.add_task(cfg(TaskPriority::Normal)).await.unwrap();
+
+        assert!(
+            tm.has_inflight_table_task("kokedb", "public.t"),
+            "the just-added table must register as inflight"
+        );
+        assert!(
+            !tm.has_inflight_table_task("kokedb", "public.other"),
+            "a different table must not be considered inflight"
+        );
+        assert!(
+            !tm.has_inflight_table_task("other_catalog", "public.t"),
+            "the same table in a different catalog must not collide"
+        );
+
+        tm.shutdown().await;
     }
 
     #[tokio::test]
