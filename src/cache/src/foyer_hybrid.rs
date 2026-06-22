@@ -15,7 +15,7 @@ const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 #[derive(Clone)]
 pub struct LruResultCache {
-    pub inner: Arc<HybridCache<u64, Vec<u8>>>,
+    pub inner: Arc<HybridCache<u128, Vec<u8>>>,
     compression_level: i32,
 }
 
@@ -37,7 +37,7 @@ impl LruResultCache {
                 CacheError::FoyerError(format!("Failed to build fsdevice with error: {x}"))
             })?;
 
-        let hybrid_cache: HybridCache<u64, Vec<u8>> = HybridCacheBuilder::new()
+        let hybrid_cache: HybridCache<u128, Vec<u8>> = HybridCacheBuilder::new()
             .memory(memory_size * 1024 * 1024)
             .storage()
             .with_engine_config(BlockEngineBuilder::new(device))
@@ -64,19 +64,19 @@ impl LruResultCache {
         })
     }
 
-    pub async fn insert(&self, key: u64, batches: &[RecordBatch]) -> Result<(), CacheError> {
+    pub async fn insert(&self, key: u128, batches: &[RecordBatch]) -> Result<(), CacheError> {
         let encode = RecordBatchCodec::encode(batches, self.compression_level)?;
         let _ret = self.inner.insert(key, encode);
 
         Ok(())
     }
 
-    pub async fn delete(&self, key: u64) -> Result<(), CacheError> {
+    pub async fn delete(&self, key: u128) -> Result<(), CacheError> {
         let _ret = self.inner.remove(&key);
         Ok(())
     }
 
-    pub async fn get(&self, key: u64) -> Result<SendableRecordBatchStream, CacheError> {
+    pub async fn get(&self, key: u128) -> Result<SendableRecordBatchStream, CacheError> {
         if let Some(entry) = self.inner.get(&key).await.map_err(|x| {
             CacheError::Internal(format!("Failed to get cache key: {} with error: {x}", &key))
         })? {

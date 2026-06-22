@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use kokedb_common::cache_policy::{parse_cache_policy, CachePolicy};
 use kokedb_common::env::get_env_as;
+use kokedb_common::redact::redact_dsn;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::adaptive;
 use kokedb_task_manager::cache_sync_task::{
@@ -702,12 +703,12 @@ impl CatalogManager {
         {
             error!(
                 "Catalog sync task failed for catalog '{}' with DSN '{}': {}",
-                &catalog, &dsn, e
+                &catalog, redact_dsn(&dsn), e
             );
         } else {
             info!(
                 "Catalog first sync task successed for catalog '{}' with DSN '{}'",
-                &catalog, &dsn
+                &catalog, redact_dsn(&dsn)
             )
         }
 
@@ -780,7 +781,7 @@ impl CatalogManager {
                     {
                         error!(
                             "Catalog sync task failed for catalog '{}' with DSN '{}': {}",
-                            &catalog, &dsn, e
+                            &catalog, redact_dsn(&dsn), e
                         );
                     }
                 })

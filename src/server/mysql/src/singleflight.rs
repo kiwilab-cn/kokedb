@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
 pub struct Singleflight {
-    inflight: Mutex<HashMap<u64, Arc<Notify>>>,
+    inflight: Mutex<HashMap<u128, Arc<Notify>>>,
 }
 
 pub enum Claim {
@@ -29,7 +29,7 @@ pub enum Claim {
 /// released whether the owner succeeded, errored, or panicked.
 pub struct OwnerGuard {
     sf: Arc<Singleflight>,
-    key: u64,
+    key: u128,
 }
 
 impl Drop for OwnerGuard {
@@ -48,14 +48,14 @@ impl Singleflight {
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Notify>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u128, Arc<Notify>>> {
         // Recover from a poisoned lock instead of panicking; the map is simple
         // shared bookkeeping and a poisoned state is still usable.
         self.inflight.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Claim ownership of `key`, or get a handle to await the current owner.
-    pub fn claim(self: &Arc<Self>, key: u64) -> Claim {
+    pub fn claim(self: &Arc<Self>, key: u128) -> Claim {
         let mut map = self.lock();
         if let Some(notify) = map.get(&key) {
             Claim::Waiter(notify.clone())

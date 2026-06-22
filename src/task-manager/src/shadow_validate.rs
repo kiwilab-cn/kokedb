@@ -9,6 +9,7 @@
 //! served snapshot.
 
 use kokedb_common::env::get_env_as;
+use kokedb_common::file::TempPath;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use log::{info, warn};
 use sqlx::PgPool;
@@ -96,8 +97,9 @@ pub async fn validate_table(
         return Ok(());
     }
 
-    // Isolated temp workspace.
+    // Isolated temp workspace, cleaned up on every exit (incl. early return).
     let base = std::env::temp_dir().join(format!("kokedb-validate/{}", Uuid::new_v4()));
+    let _base_guard = TempPath::new(&base);
     let full_dir = base.join("full");
     let delta_dir = base.join("delta");
     let inc_dir = base.join("inc");

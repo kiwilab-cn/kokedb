@@ -91,7 +91,7 @@ struct CacheRefresher {
 
 #[async_trait::async_trait]
 impl ResultRefresher for CacheRefresher {
-    async fn refresh(&self, cache_keys: Vec<u64>) {
+    async fn refresh(&self, cache_keys: Vec<u128>) {
         // A fresh context picks up the just-synced snapshots.
         let ctx = match create_session_context(&self.shared) {
             Ok(ctx) => Arc::new(ctx),
@@ -109,7 +109,7 @@ impl ResultRefresher for CacheRefresher {
 }
 
 impl CacheRefresher {
-    async fn refresh_one(&self, ctx: &Arc<SessionContext>, key: u64) -> Result<(), String> {
+    async fn refresh_one(&self, ctx: &Arc<SessionContext>, key: u128) -> Result<(), String> {
         let sql = self
             .shared
             .catalog_list
@@ -226,7 +226,7 @@ mod tests {
         let shared = init_shared_services(cache.clone()).await.unwrap();
 
         // A table-free query so the test does not depend on any catalog data.
-        let key: u64 = 0xC0FFEE;
+        let key: u128 = 0xC0FFEE;
         shared
             .catalog_list
             .save_sql_stats("SELECT 1 AS x", key, 0)

@@ -90,7 +90,7 @@ impl CatalogManager {
     pub async fn save_hash_key<T: AsRef<str>>(
         &self,
         table: &[T],
-        cache_key: u64,
+        cache_key: u128,
     ) -> CatalogResult<()> {
         let (provider, database, table) = self.resolve_object(table)?;
         let catalog = provider.get_name();

@@ -105,7 +105,7 @@ impl CoreContex {
 }
 
 // Type aliases for clarity
-type CacheKey = u64;
+type CacheKey = u128;
 type BatchStream = std::pin::Pin<Box<dyn RecordBatchStream + Send>>;
 type Cache = LruResultCache;
 type Context = datafusion::prelude::SessionContext;

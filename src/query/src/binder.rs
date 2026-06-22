@@ -19,7 +19,7 @@ pub fn parser(sql: &str) -> QueryResult<Plan> {
 pub async fn query(
     ctx: Arc<SessionContext>,
     plan: &Plan,
-    key: u64,
+    key: u128,
 ) -> Result<SendableRecordBatchStream, QueryError> {
     let default_plan_config = PlanConfig::default();
     let df_plan =

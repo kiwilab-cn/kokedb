@@ -201,7 +201,7 @@ impl PostgreSQLMetaCatalogProviderList {
             "ALTER TABLE system.catalog ADD COLUMN IF NOT EXISTS partition_by varchar;",
             r#"
             CREATE TABLE IF NOT EXISTS system.sql_stats (
-                sql_hash VARCHAR(20) PRIMARY KEY,
+                sql_hash VARCHAR(40) PRIMARY KEY,
                 sql_text TEXT NOT NULL,
                 execution_time BIGINT NOT NULL DEFAULT 0,
                 count INTEGER NOT NULL DEFAULT 0,
@@ -230,7 +230,7 @@ impl PostgreSQLMetaCatalogProviderList {
                 catalog VARCHAR(255) NOT NULL,
                 schema VARCHAR(255) NOT NULL,
                 table_name VARCHAR(255) NOT NULL,
-                cache_key_list VARCHAR(20)[] NOT NULL,
+                cache_key_list VARCHAR(40)[] NOT NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(catalog, schema, table_name)
@@ -288,6 +288,10 @@ impl PostgreSQLMetaCatalogProviderList {
             "ALTER TABLE system.table_sync_policy ADD COLUMN IF NOT EXISTS cadence_pinned BOOLEAN NOT NULL DEFAULT false;",
             // Hash of the schema facts the last LLM inference saw (cache key).
             "ALTER TABLE system.table_sync_policy ADD COLUMN IF NOT EXISTS schema_hash VARCHAR(64);",
+            // Widen the plan-hash columns from 64-bit (20 digits) to 128-bit
+            // (up to 39 digits) keys. No-op once already widened.
+            "ALTER TABLE system.sql_stats ALTER COLUMN sql_hash TYPE VARCHAR(40);",
+            "ALTER TABLE system.table_stats ALTER COLUMN cache_key_list TYPE VARCHAR(40)[];",
             // One row per table-sync run, for `SHOW CACHE JOBS` observability.
             r#"
             CREATE TABLE IF NOT EXISTS system.cache_job (
@@ -569,7 +573,7 @@ impl PostgreSQLMetaCatalogProviderList {
         catalog: &str,
         schema: &str,
         table: &str,
-    ) -> Result<(Option<String>, Vec<u64>)> {
+) -> Result<(Option<String>, Vec<u128>)> {
         let local_path: Option<String> = sqlx::query(
             "SELECT local_path FROM system.table_arrow_schema \
              WHERE catalog_name = $1 AND schema_name = $2 AND table_name = $3;",
@@ -582,7 +586,7 @@ impl PostgreSQLMetaCatalogProviderList {
         .map_err(|e| DataFusionError::External(Box::new(e)))?
         .and_then(|r| r.try_get::<String, _>("local_path").ok());
 
-        let cache_keys: Vec<u64> = sqlx::query_as::<_, (Vec<String>,)>(
+        let cache_keys: Vec<u128> = sqlx::query_as::<_, (Vec<String>,)>(
             "SELECT cache_key_list FROM system.table_stats \
              WHERE catalog = $1 AND schema = $2 AND table_name = $3;",
         )
@@ -592,7 +596,7 @@ impl PostgreSQLMetaCatalogProviderList {
         .fetch_optional(&self.local_pool)
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?
-        .map(|(list,)| list.iter().filter_map(|s| s.parse::<u64>().ok()).collect())
+        .map(|(list,)| list.iter().filter_map(|s| s.parse::<u128>().ok()).collect())
         .unwrap_or_default();
 
         // Delete the cache metadata from all relevant tables (note the differing
@@ -1508,7 +1512,7 @@ impl PostgreSQLMetaCatalogProviderList {
         catalog: &str,
         schema: &str,
         table: &str,
-        cache_key: u64,
+        cache_key: u128,
     ) -> Result<bool> {
         let insert_sql = r#"
             INSERT INTO system.table_stats (catalog, schema, table_name, cache_key_list)
@@ -1533,7 +1537,7 @@ impl PostgreSQLMetaCatalogProviderList {
     pub async fn get_table_cache_key(
         &self,
         schema_info: &SchemaTable<'_>,
-    ) -> Result<Option<Vec<u64>>> {
+) -> Result<Option<Vec<u128>>> {
         let catalog = schema_info.catalog;
         let schema = schema_info.schema;
         let table_name = schema_info.table;
@@ -1552,18 +1556,18 @@ impl PostgreSQLMetaCatalogProviderList {
 
         match row {
             Some((cache_key_list,)) => {
-                let u64_list: Result<Vec<u64>> = cache_key_list
+                let key_list: Result<Vec<u128>> = cache_key_list
                     .into_iter()
                     .map(|s| {
-                        s.parse::<u64>().map_err(|e| {
+                        s.parse::<u128>().map_err(|e| {
                             DataFusionError::Execution(format!(
-                                "Failed to parse u64 from string: {}",
+                                "Failed to parse u128 from string: {}",
                                 e
                             ))
                         })
                     })
                     .collect();
-                Ok(Some(u64_list?))
+                Ok(Some(key_list?))
             }
             None => Ok(None),
         }
@@ -1618,7 +1622,7 @@ impl PostgreSQLMetaCatalogProviderList {
 
     /// Looks up the original SQL text for a cached query by its plan-hash key.
     /// Used by proactive result refresh to re-execute and re-cache the query.
-    pub async fn get_sql_text_by_hash(&self, key: u64) -> Result<Option<String>> {
+    pub async fn get_sql_text_by_hash(&self, key: u128) -> Result<Option<String>> {
         let sql = "SELECT sql_text FROM system.sql_stats WHERE sql_hash = $1;";
         let row: Option<(String,)> = sqlx::query_as(sql)
             .bind(key.to_string())
@@ -1628,7 +1632,7 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(row.map(|(sql_text,)| sql_text))
     }
 
-    pub async fn save_sql_stats(&self, sql: &str, key: u64, cost: u64) -> Result<bool> {
+    pub async fn save_sql_stats(&self, sql: &str, key: u128, cost: u64) -> Result<bool> {
         //TODO: store cache status / execute status.
         let insert_sql =
             "INSERT INTO system.sql_stats (sql_hash, sql_text, execution_time, count, min_time, max_time)
@@ -1995,7 +1999,7 @@ mod policy_tests {
         assert!(meta.check_table_is_cached(cat, sch, tbl).await.unwrap());
         let (path, keys) = meta.evict_table_cache(cat, sch, tbl).await.unwrap();
         assert_eq!(path.as_deref(), Some("/tmp/kokedb-evict-x/uuid"));
-        assert_eq!(keys, vec![111u64, 222u64]);
+        assert_eq!(keys, vec![111u128, 222u128]);
         assert!(!meta.check_table_is_cached(cat, sch, tbl).await.unwrap(), "no longer cached");
     }
 
