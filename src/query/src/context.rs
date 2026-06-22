@@ -21,6 +21,8 @@ use tokio_cron_scheduler::JobScheduler;
 
 use crate::binder::{parser, query};
 use crate::mem_catalog::MemoryCatalogProvider;
+use crate::plan_cache::PlanCache;
+use kokedb_common::env::get_env_as;
 
 const DEFAULT_CATALOG: &str = "kokedb";
 
@@ -37,6 +39,7 @@ pub struct SharedServices {
     task_scheduler: Arc<JobScheduler>,
     scheduler_jobs: Arc<Mutex<HashMap<String, uuid::Uuid>>>,
     result_cache: LruResultCache,
+    plan_cache: PlanCache,
 }
 
 impl SharedServices {
@@ -45,6 +48,11 @@ impl SharedServices {
     /// (which would open a brand-new pool on every call).
     pub fn meta(&self) -> Arc<PostgreSQLMetaCatalogProviderList> {
         self.catalog_list.clone()
+    }
+
+    /// The shared SQL-text -> parsed-plan cache (process-wide).
+    pub fn plan_cache(&self) -> PlanCache {
+        self.plan_cache.clone()
     }
 }
 
@@ -63,6 +71,8 @@ pub async fn init_shared_services(
     let task_scheduler = Arc::new(JobScheduler::new().await?);
     task_scheduler.start().await?;
 
+    let plan_cache = PlanCache::new(get_env_as("KOKEDB_PLAN_CACHE_SIZE", 2000usize));
+
     let shared = SharedServices {
         runtime,
         catalog_list,
@@ -70,6 +80,7 @@ pub async fn init_shared_services(
         task_scheduler,
         scheduler_jobs: Arc::new(Mutex::new(HashMap::new())),
         result_cache,
+        plan_cache,
     };
 
     // Register the periodic per-catalog sync jobs once, using a throwaway

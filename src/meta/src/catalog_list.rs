@@ -307,6 +307,20 @@ impl PostgreSQLMetaCatalogProviderList {
             "#,
             "CREATE INDEX IF NOT EXISTS idx_cache_job_lookup \
              ON system.cache_job (catalog, schema_name, table_name, started_at DESC);",
+            // get_access_per_day() filters `catalog = $1 AND stat_date >= $2`.
+            // The UNIQUE(catalog, schema_name, table_name, stat_date) index can
+            // only use its `catalog` prefix here (stat_date is the 4th column),
+            // so the date range falls back to a scan. daily_stats is the
+            // fastest-growing meta table (one row per cached table per day), so
+            // give the range its own index.
+            "CREATE INDEX IF NOT EXISTS idx_query_daily_stats_catalog_date \
+             ON system.query_table_daily_stats (catalog, stat_date);",
+            // get_due_audit_tables() runs every scheduler tick per catalog.
+            // A partial index over just the audit-eligible rows turns the
+            // per-tick scan into a direct lookup of the due ones.
+            "CREATE INDEX IF NOT EXISTS idx_table_sync_policy_audit_due \
+             ON system.table_sync_policy (catalog, next_audit_at) \
+             WHERE inc_status IN ('suggested', 'active');",
             // Per-database cache override (the middle tier between catalog and
             // table policy). `mode`: all | none.
             r#"
