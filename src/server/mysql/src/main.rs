@@ -15,6 +15,7 @@ use datafusion::{
 use futures::StreamExt;
 use kokedb_cache::foyer_hybrid::LruResultCache;
 use kokedb_common::{hash::get_plan_hash, opentelemetry::init_logger, spec::Plan};
+use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_query::{
     binder::{parser, query, save_sql_history},
     context::{create_session_context, init_shared_services, use_database},
@@ -80,6 +81,9 @@ struct CoreContex {
     auth: Option<Arc<AuthConfig>>,
     /// Process-wide single-flight registry for cache-miss de-duplication.
     sf: Arc<singleflight::Singleflight>,
+    /// Shared meta-store handle (reuses the process-wide pool) for recording
+    /// SQL execution history.
+    meta: Arc<PostgreSQLMetaCatalogProviderList>,
     /// Per-connection prepared statement registry, keyed by statement id.
     prepared: HashMap<u32, PreparedStatement>,
     /// Monotonic statement id generator for this connection.
@@ -92,12 +96,14 @@ impl CoreContex {
         cache: LruResultCache,
         auth: Option<Arc<AuthConfig>>,
         sf: Arc<singleflight::Singleflight>,
+        meta: Arc<PostgreSQLMetaCatalogProviderList>,
     ) -> Self {
         Self {
             ctx,
             cache,
             auth,
             sf,
+            meta,
             prepared: HashMap::new(),
             next_stmt_id: 1,
         }
@@ -204,7 +210,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
             }
         };
 
-        run_query(self.ctx.clone(), self.cache.clone(), self.sf.clone(), &sql, results).await
+        run_query(
+            self.ctx.clone(),
+            self.cache.clone(),
+            self.sf.clone(),
+            self.meta.clone(),
+            &sql,
+            results,
+        )
+        .await
     }
 
     async fn on_close(&mut self, stmt: u32) {
@@ -252,7 +266,15 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         sql: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), MysqlServerError> {
-        run_query(self.ctx.clone(), self.cache.clone(), self.sf.clone(), sql, results).await
+        run_query(
+            self.ctx.clone(),
+            self.cache.clone(),
+            self.sf.clone(),
+            self.meta.clone(),
+            sql,
+            results,
+        )
+        .await
     }
 }
 
@@ -262,6 +284,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     ctx: Arc<SessionContext>,
     cache: Cache,
     sf: Arc<singleflight::Singleflight>,
+    meta: Arc<PostgreSQLMetaCatalogProviderList>,
     sql: &str,
     results: QueryResultWriter<'_, W>,
 ) -> Result<(), MysqlServerError> {
@@ -293,7 +316,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
         }
         None => {
             // Empty result set
-            return handle_empty_result(results, sql, &plan, instant).await;
+            return handle_empty_result(results, &meta, sql, &plan, instant).await;
         }
     };
 
@@ -318,7 +341,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     write_batches_to_client(&mut writer, &first_batch, &mut batch_stream).await?;
 
     // Step 7: Finalize query execution
-    finalize_query(writer, sql, &plan, instant).await?;
+    finalize_query(writer, &meta, sql, &plan, instant).await?;
 
     Ok(())
 }
@@ -658,6 +681,7 @@ async fn get_batch_stream(
 // Handle empty result set
 async fn handle_empty_result<W: AsyncWrite + Unpin>(
     results: QueryResultWriter<'_, W>,
+    meta: &PostgreSQLMetaCatalogProviderList,
     sql: &str,
     plan: &Plan,
     instant: std::time::Instant,
@@ -676,7 +700,7 @@ async fn handle_empty_result<W: AsyncWrite + Unpin>(
         })?;
 
     let cost = instant.elapsed().as_millis() as u64;
-    if let Err(e) = save_sql_history(sql, plan, cost).await {
+    if let Err(e) = save_sql_history(meta, sql, plan, cost).await {
         error!("Failed to store sql execute info: {:?}", e);
     }
 
@@ -725,6 +749,7 @@ async fn write_batches_to_client<W: AsyncWrite + Unpin>(
 // Finalize query execution
 async fn finalize_query<W: AsyncWrite + Unpin>(
     writer: RowWriter<'_, W>,
+    meta: &PostgreSQLMetaCatalogProviderList,
     sql: &str,
     plan: &Plan,
     instant: std::time::Instant,
@@ -739,7 +764,7 @@ async fn finalize_query<W: AsyncWrite + Unpin>(
         })?;
 
     let cost = instant.elapsed().as_millis() as u64;
-    if let Err(e) = save_sql_history(sql, plan, cost).await {
+    if let Err(e) = save_sql_history(meta, sql, plan, cost).await {
         error!("Failed to store sql execute info: {:?}", e);
     }
 
@@ -878,12 +903,13 @@ async fn main() -> Result<(), MysqlServerError> {
                 continue;
             }
         };
+        let meta = shared.meta();
         tokio::spawn(async move {
             metrics::METRICS
                 .active_connections
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ =
-                AsyncMysqlIntermediary::run_on(CoreContex::new(ctx, cache, auth, sf), r, w).await;
+                AsyncMysqlIntermediary::run_on(CoreContex::new(ctx, cache, auth, sf, meta), r, w).await;
             metrics::METRICS
                 .active_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);

@@ -39,6 +39,15 @@ pub struct SharedServices {
     result_cache: LruResultCache,
 }
 
+impl SharedServices {
+    /// The shared meta-store handle. Reuses the process-wide connection pool —
+    /// callers must not construct a fresh `PostgreSQLMetaCatalogProviderList`
+    /// (which would open a brand-new pool on every call).
+    pub fn meta(&self) -> Arc<PostgreSQLMetaCatalogProviderList> {
+        self.catalog_list.clone()
+    }
+}
+
 /// Initializes the process-wide services exactly once: connects to the meta
 /// store, creates the schema, starts the task manager + scheduler, and registers
 /// the periodic catalog-sync jobs.

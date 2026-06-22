@@ -8,6 +8,8 @@
 //! force-full nudge to self-heal on divergence), so it can never corrupt a
 //! served snapshot.
 
+use std::sync::Arc;
+
 use kokedb_common::env::get_env_as;
 use kokedb_common::file::TempPath;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
@@ -39,10 +41,11 @@ fn thresholds() -> AuditThresholds {
 
 /// Picks the audit-due tables for a catalog and validates up to a small budget
 /// per call (audits are low-priority and must not crowd out real syncs).
-pub async fn sweep_audits(catalog: &str, dsn: &str) -> Result<(), TaskError> {
-    let meta = PostgreSQLMetaCatalogProviderList::new().await.map_err(|e| {
-        TaskError::MetaReqeustError(format!("Failed to create meta client: {e}"))
-    })?;
+pub async fn sweep_audits(
+    meta: Arc<PostgreSQLMetaCatalogProviderList>,
+    catalog: &str,
+    dsn: &str,
+) -> Result<(), TaskError> {
     let due = meta.get_due_audit_tables(catalog).await.map_err(|e| {
         TaskError::MetaReqeustError(format!("Failed to query audit-due tables: {e}"))
     })?;
