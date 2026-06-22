@@ -1104,6 +1104,31 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             let node = spec::CommandNode::ShowCacheJobs { table, catalog };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::ShowCacheSchedule {
+            show: _,
+            cache: _,
+            schedule: _,
+            target,
+        } => {
+            let (table, catalog) = match target {
+                Some((_, Either::Left(_), name)) => (Some(from_ast_object_name(name)?), None),
+                Some((_, Either::Right(_), name)) => (None, Some(from_ast_object_name(name)?)),
+                None => (None, None),
+            };
+            let node = spec::CommandNode::ShowCacheSchedule { table, catalog };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::DiagnoseCache {
+            diagnose: _,
+            cache: _,
+            catalog,
+        } => {
+            let catalog = catalog
+                .map(|(_, _, name)| from_ast_object_name(name))
+                .transpose()?;
+            let node = spec::CommandNode::DiagnoseCache { catalog };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
     }
 }
 
@@ -1935,6 +1960,43 @@ mod drop_catalog_tests {
             },
             _ => panic!("expected a command plan"),
         }
+    }
+
+    #[test]
+    fn parse_diagnose_cache() {
+        let plan = from_ast_statement(parse_one_statement("DIAGNOSE CACHE").unwrap()).unwrap();
+        assert!(matches!(
+            plan,
+            spec::Plan::Command(c) if matches!(c.node, spec::CommandNode::DiagnoseCache { catalog: None })
+        ));
+        let plan = from_ast_statement(
+            parse_one_statement("DIAGNOSE CACHE FROM CATALOG demo").unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            spec::Plan::Command(c) if matches!(c.node, spec::CommandNode::DiagnoseCache { catalog: Some(_) })
+        ));
+    }
+
+    #[test]
+    fn parse_show_cache_schedule() {
+        let plan =
+            from_ast_statement(parse_one_statement("SHOW CACHE SCHEDULE").unwrap()).unwrap();
+        assert!(matches!(
+            plan,
+            spec::Plan::Command(c)
+                if matches!(c.node, spec::CommandNode::ShowCacheSchedule { table: None, catalog: None })
+        ));
+        let plan = from_ast_statement(
+            parse_one_statement("SHOW CACHE SCHEDULE FROM TABLE demo.public.orders").unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan,
+            spec::Plan::Command(c)
+                if matches!(c.node, spec::CommandNode::ShowCacheSchedule { table: Some(_), catalog: None })
+        ));
     }
 
     #[test]

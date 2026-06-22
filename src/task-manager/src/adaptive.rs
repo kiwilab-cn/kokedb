@@ -22,6 +22,28 @@ use crate::llm::{self, LlmConfig, TableStats, TableSummary};
 use crate::table_signals::{bucket, collect_remote_signals, score, ScoreWeights};
 use crate::task_manager::TaskManager;
 
+/// A stable fingerprint of the schema facts that drive inference, used as the
+/// LLM cache key: re-inference reuses a prior LLM decision only while this is
+/// unchanged. DefaultHasher is deterministic (fixed keys), so it is stable
+/// across process restarts.
+fn schema_fingerprint(facts: &crate::incremental_infer::TableFacts) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut pk = facts.pk_columns.clone();
+    pk.sort();
+    pk.hash(&mut h);
+    let mut ts: Vec<_> = facts
+        .timestamp_columns
+        .iter()
+        .map(|c| (c.name.clone(), c.not_null, c.has_default_now))
+        .collect();
+    ts.sort();
+    ts.hash(&mut h);
+    facts.has_update_trigger.hash(&mut h);
+    facts.monotonic_id_pk.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// Splits a `schema.table` (or bare `table`) into `(schema, table)`, defaulting
 /// the schema to `public` like the rest of the sync path.
 fn split_schema_table(name: &str) -> (String, String) {
@@ -113,17 +135,22 @@ async fn infer_and_persist(
     qualified_table: &str,
     signals: &crate::table_signals::TableSignals,
 ) -> Result<(), TaskError> {
-    // Don't overwrite a user override, or an LLM recommendation already in the
-    // validation pipeline.
+    let facts = gather_facts(pool, qualified_table).await?;
+    let schema_hash = schema_fingerprint(&facts);
+
+    // Don't overwrite a user override. Reuse a prior LLM recommendation that is
+    // already in the validation pipeline *only while the schema is unchanged* —
+    // a schema change re-triggers inference (and a fresh LLM call if needed).
     if let Ok(Some(existing)) = meta.get_table_inc_policy(catalog, schema, tbl).await {
         if existing.source == "user"
-            || (existing.source == "llm" && existing.inc_status != "none")
+            || (existing.source == "llm"
+                && existing.inc_status != "none"
+                && existing.schema_hash.as_deref() == Some(schema_hash.as_str()))
         {
             return Ok(());
         }
     }
 
-    let facts = gather_facts(pool, qualified_table).await?;
     let rule = classify(&facts);
 
     // Build the policy from the rule by default.
@@ -138,6 +165,7 @@ async fn infer_and_persist(
         reason: Some(rule.reason.clone()),
         audit_passes: 0,
         divergence_count: 0,
+        schema_hash: Some(schema_hash.clone()),
     };
 
     // When the rule is unsure and an LLM is configured, ask it and prefer a valid

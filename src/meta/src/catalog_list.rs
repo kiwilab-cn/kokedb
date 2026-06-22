@@ -67,6 +67,23 @@ pub struct TableIncPolicy {
     pub reason: Option<String>,
     pub audit_passes: i32,
     pub divergence_count: i32,
+    /// Hash of the schema facts behind the last inference (LLM cache key).
+    pub schema_hash: Option<String>,
+}
+
+/// One row of `SHOW CACHE SCHEDULE`: a table's effective refresh cadence + state.
+#[derive(Debug, Clone)]
+pub struct CacheSchedule {
+    pub catalog: String,
+    pub schema_name: String,
+    pub table_name: String,
+    pub refresh_bucket: String,
+    pub refresh_interval_sec: i32,
+    pub cadence_pinned: bool,
+    pub paused: bool,
+    pub inc_mode: String,
+    pub inc_status: String,
+    pub last_sync_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One sync-run record from `system.cache_job` (`SHOW CACHE JOBS`).
@@ -267,6 +284,10 @@ impl PostgreSQLMetaCatalogProviderList {
             "#,
             // Backfill for policy rows created before `paused` existed.
             "ALTER TABLE system.table_sync_policy ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT false;",
+            // A user-pinned refresh cadence is not overwritten by re-evaluation.
+            "ALTER TABLE system.table_sync_policy ADD COLUMN IF NOT EXISTS cadence_pinned BOOLEAN NOT NULL DEFAULT false;",
+            // Hash of the schema facts the last LLM inference saw (cache key).
+            "ALTER TABLE system.table_sync_policy ADD COLUMN IF NOT EXISTS schema_hash VARCHAR(64);",
             // One row per table-sync run, for `SHOW CACHE JOBS` observability.
             r#"
             CREATE TABLE IF NOT EXISTS system.cache_job (
@@ -748,8 +769,12 @@ impl PostgreSQLMetaCatalogProviderList {
              est_row_count, est_size_bytes, churn_per_hour, access_per_day, score, updated_at) \
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, CURRENT_TIMESTAMP) \
             ON CONFLICT (catalog, schema_name, table_name) DO UPDATE SET \
-                refresh_bucket = EXCLUDED.refresh_bucket, \
-                refresh_interval_sec = EXCLUDED.refresh_interval_sec, \
+                refresh_bucket = CASE WHEN system.table_sync_policy.cadence_pinned \
+                                      THEN system.table_sync_policy.refresh_bucket \
+                                      ELSE EXCLUDED.refresh_bucket END, \
+                refresh_interval_sec = CASE WHEN system.table_sync_policy.cadence_pinned \
+                                            THEN system.table_sync_policy.refresh_interval_sec \
+                                            ELSE EXCLUDED.refresh_interval_sec END, \
                 est_row_count = EXCLUDED.est_row_count, \
                 est_size_bytes = EXCLUDED.est_size_bytes, \
                 churn_per_hour = EXCLUDED.churn_per_hour, \
@@ -801,6 +826,175 @@ impl PostgreSQLMetaCatalogProviderList {
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(())
+    }
+
+    /// Pins a table's refresh cadence (backs `ALTER TABLE ... SET CACHE POLICY
+    /// WITH (refresh_interval=...)`), so re-evaluation will not change it.
+    pub async fn set_table_cadence(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        bucket: &str,
+        interval_sec: i32,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO system.table_sync_policy \
+             (catalog, schema_name, table_name, refresh_bucket, refresh_interval_sec, \
+              cadence_pinned, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, true, CURRENT_TIMESTAMP) \
+             ON CONFLICT (catalog, schema_name, table_name) DO UPDATE SET \
+                 refresh_bucket = EXCLUDED.refresh_bucket, \
+                 refresh_interval_sec = EXCLUDED.refresh_interval_sec, \
+                 cadence_pinned = true, updated_at = CURRENT_TIMESTAMP;",
+        )
+        .bind(catalog)
+        .bind(schema)
+        .bind(table)
+        .bind(bucket)
+        .bind(interval_sec)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
+    /// Returns the effective refresh schedule per table (`SHOW CACHE SCHEDULE`),
+    /// optionally filtered to a catalog and/or `schema.table`.
+    pub async fn get_cache_schedules(
+        &self,
+        catalog: Option<&str>,
+        schema: Option<&str>,
+        table: Option<&str>,
+    ) -> Result<Vec<CacheSchedule>> {
+        let sql = "SELECT p.catalog, p.schema_name, p.table_name, p.refresh_bucket, \
+                p.refresh_interval_sec, p.cadence_pinned, p.paused, p.inc_mode, p.inc_status, \
+                s.last_sync_at \
+            FROM system.table_sync_policy p \
+            LEFT JOIN system.table_sync_state s \
+              ON p.catalog = s.catalog AND p.schema_name = s.schema_name \
+             AND p.table_name = s.table_name \
+            WHERE ($1::text IS NULL OR p.catalog = $1) \
+              AND ($2::text IS NULL OR p.schema_name = $2) \
+              AND ($3::text IS NULL OR p.table_name = $3) \
+            ORDER BY p.catalog, p.schema_name, p.table_name;";
+        let rows = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .fetch_all(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(rows
+            .iter()
+            .map(|r| CacheSchedule {
+                catalog: r.get("catalog"),
+                schema_name: r.get("schema_name"),
+                table_name: r.get("table_name"),
+                refresh_bucket: r.get("refresh_bucket"),
+                refresh_interval_sec: r.try_get("refresh_interval_sec").unwrap_or(0),
+                cadence_pinned: r.try_get("cadence_pinned").unwrap_or(false),
+                paused: r.try_get("paused").unwrap_or(false),
+                inc_mode: r.try_get("inc_mode").unwrap_or_default(),
+                inc_status: r.try_get("inc_status").unwrap_or_default(),
+                last_sync_at: r.try_get("last_sync_at").ok(),
+            })
+            .collect())
+    }
+
+    /// A cache health report (`DIAGNOSE CACHE`): one row per issue found —
+    /// rejected/diverged incrementals, paused tables, failed last sync, and
+    /// stale (overdue) tables. `(issue, catalog, schema, table, detail)`.
+    pub async fn diagnose_cache(
+        &self,
+        catalog: Option<&str>,
+    ) -> Result<Vec<(String, String, String, String, String)>> {
+        let mut out: Vec<(String, String, String, String, String)> = Vec::new();
+        let push_simple = |out: &mut Vec<_>, issue: &str, rows: Vec<sqlx::postgres::PgRow>, detail_col: Option<&str>| {
+            for r in &rows {
+                let detail = detail_col
+                    .and_then(|c| r.try_get::<Option<String>, _>(c).ok().flatten())
+                    .unwrap_or_default();
+                out.push((
+                    issue.to_string(),
+                    r.get::<String, _>("catalog"),
+                    r.get::<String, _>("schema_name"),
+                    r.get::<String, _>("table_name"),
+                    detail,
+                ));
+            }
+        };
+
+        // Rejected incremental strategies (validation found them unsafe).
+        let rejected = sqlx::query(
+            "SELECT catalog, schema_name, table_name, reason FROM system.table_sync_policy \
+             WHERE ($1::text IS NULL OR catalog=$1) AND inc_status='rejected';",
+        )
+        .bind(catalog)
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        push_simple(&mut out, "REJECTED_INCREMENTAL", rejected, Some("reason"));
+
+        // Diverged (but not yet rejected).
+        let diverged = sqlx::query(
+            "SELECT catalog, schema_name, table_name, \
+                    ('divergence_count=' || divergence_count) AS detail \
+             FROM system.table_sync_policy \
+             WHERE ($1::text IS NULL OR catalog=$1) AND inc_status<>'rejected' \
+               AND divergence_count > 0;",
+        )
+        .bind(catalog)
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        push_simple(&mut out, "DIVERGED", diverged, Some("detail"));
+
+        // Paused tables.
+        let paused = sqlx::query(
+            "SELECT catalog, schema_name, table_name FROM system.table_sync_policy \
+             WHERE ($1::text IS NULL OR catalog=$1) AND paused;",
+        )
+        .bind(catalog)
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        push_simple(&mut out, "PAUSED", paused, None);
+
+        // Most recent sync per table that ended in failure.
+        let failed = sqlx::query(
+            "SELECT catalog, schema_name, table_name, error_message FROM ( \
+                SELECT DISTINCT ON (catalog, schema_name, table_name) \
+                       catalog, schema_name, table_name, status, error_message \
+                FROM system.cache_job \
+                WHERE ($1::text IS NULL OR catalog=$1) \
+                ORDER BY catalog, schema_name, table_name, started_at DESC \
+             ) latest WHERE status='failed';",
+        )
+        .bind(catalog)
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        push_simple(&mut out, "FAILED_SYNC", failed, Some("error_message"));
+
+        // Stale: overdue by more than 2x the refresh interval.
+        let stale = sqlx::query(
+            "SELECT p.catalog, p.schema_name, p.table_name, \
+                    ('last_sync ' || s.last_sync_at::text) AS detail \
+             FROM system.table_sync_policy p \
+             JOIN system.table_sync_state s \
+               ON p.catalog=s.catalog AND p.schema_name=s.schema_name AND p.table_name=s.table_name \
+             WHERE ($1::text IS NULL OR p.catalog=$1) AND NOT p.paused \
+               AND s.last_sync_at + ((2*p.refresh_interval_sec) || ' seconds')::interval \
+                   < CURRENT_TIMESTAMP;",
+        )
+        .bind(catalog)
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        push_simple(&mut out, "STALE", stale, Some("detail"));
+
+        Ok(out)
     }
 
     pub async fn get_due_refresh_tables(&self, catalog: &str) -> Result<Vec<String>> {
@@ -873,8 +1067,8 @@ impl PostgreSQLMetaCatalogProviderList {
     ) -> Result<()> {
         let sql = "INSERT INTO system.table_sync_policy \
             (catalog, schema_name, table_name, inc_mode, inc_status, inc_tier, \
-             watermark_column, pk_columns, source, confidence, reason, updated_at) \
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, CURRENT_TIMESTAMP) \
+             watermark_column, pk_columns, source, confidence, reason, schema_hash, updated_at) \
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP) \
             ON CONFLICT (catalog, schema_name, table_name) DO UPDATE SET \
                 inc_mode = EXCLUDED.inc_mode, \
                 watermark_column = EXCLUDED.watermark_column, \
@@ -882,6 +1076,7 @@ impl PostgreSQLMetaCatalogProviderList {
                 source = EXCLUDED.source, \
                 confidence = EXCLUDED.confidence, \
                 reason = EXCLUDED.reason, \
+                schema_hash = EXCLUDED.schema_hash, \
                 inc_status = CASE WHEN system.table_sync_policy.inc_status = 'none' \
                                   THEN EXCLUDED.inc_status \
                                   ELSE system.table_sync_policy.inc_status END, \
@@ -902,6 +1097,7 @@ impl PostgreSQLMetaCatalogProviderList {
             .bind(&inc.source)
             .bind(inc.confidence)
             .bind(&inc.reason)
+            .bind(&inc.schema_hash)
             .execute(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -966,7 +1162,7 @@ impl PostgreSQLMetaCatalogProviderList {
         table: &str,
     ) -> Result<Option<TableIncPolicy>> {
         let sql = "SELECT inc_mode, inc_status, inc_tier, watermark_column, pk_columns, \
-            source, confidence, reason, audit_passes, divergence_count \
+            source, confidence, reason, audit_passes, divergence_count, schema_hash \
             FROM system.table_sync_policy \
             WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
 
@@ -991,6 +1187,7 @@ impl PostgreSQLMetaCatalogProviderList {
             reason: row.try_get("reason").ok(),
             audit_passes: row.try_get("audit_passes").unwrap_or(0),
             divergence_count: row.try_get("divergence_count").unwrap_or(0),
+            schema_hash: row.try_get("schema_hash").ok(),
         }))
     }
 
@@ -1609,6 +1806,7 @@ mod policy_tests {
             reason: Some("conventional watermark".into()),
             audit_passes: 0,
             divergence_count: 0,
+            schema_hash: None,
         };
         meta.upsert_table_inc_policy(cat, schema, table, &suggested)
             .await
@@ -1883,6 +2081,7 @@ mod policy_tests {
             reason: None,
             audit_passes: 0,
             divergence_count: 0,
+            schema_hash: None,
         };
         meta.upsert_table_inc_policy(cat, "public", "t1", &inc)
             .await
