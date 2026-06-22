@@ -10,8 +10,8 @@ use serde_arrow::schema::{SchemaLike, TracingOptions};
 use serde_arrow::to_arrow;
 
 use crate::display::{
-    CacheJobDisplay, CachePolicyDisplay, CatalogDisplay, EmptyDisplay, RefreshCacheDisplay,
-    SingleValueDisplay, TableMetadataDisplay,
+    CacheJobDisplay, CachePolicyDisplay, CacheScheduleDisplay, CatalogDisplay, DiagnoseDisplay,
+    EmptyDisplay, RefreshCacheDisplay, SingleValueDisplay, TableMetadataDisplay,
 };
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
@@ -52,6 +52,13 @@ pub enum CatalogCommand {
     SetTablePaused {
         table: Vec<String>,
         paused: bool,
+    },
+    ShowCacheSchedule {
+        table: Option<Vec<String>>,
+        catalog: Option<String>,
+    },
+    DiagnoseCache {
+        catalog: Option<String>,
     },
     AlterTableCachePolicy {
         table: Vec<String>,
@@ -178,6 +185,8 @@ impl CatalogCommand {
             CatalogCommand::RefreshCache { .. } => "RefreshCache",
             CatalogCommand::RefreshCacheCatalog { .. } => "RefreshCacheCatalog",
             CatalogCommand::SetTablePaused { .. } => "SetTablePaused",
+            CatalogCommand::ShowCacheSchedule { .. } => "ShowCacheSchedule",
+            CatalogCommand::DiagnoseCache { .. } => "DiagnoseCache",
             CatalogCommand::ShowTableMetadata { .. } => "ShowTableMetadata",
             CatalogCommand::AlterTableCachePolicy { .. } => "AlterTableCachePolicy",
             CatalogCommand::ShowCacheJobs { .. } => "ShowCacheJobs",
@@ -227,6 +236,12 @@ impl CatalogCommand {
             }
             CatalogCommand::ShowCacheJobs { .. } => {
                 Vec::<FieldRef>::from_type::<CacheJobDisplay>(TracingOptions::default())
+            }
+            CatalogCommand::ShowCacheSchedule { .. } => {
+                Vec::<FieldRef>::from_type::<CacheScheduleDisplay>(TracingOptions::default())
+            }
+            CatalogCommand::DiagnoseCache { .. } => {
+                Vec::<FieldRef>::from_type::<DiagnoseDisplay>(TracingOptions::default())
             }
             CatalogCommand::GetDatabase { .. } | CatalogCommand::ListDatabases { .. } => {
                 Vec::<FieldRef>::from_type::<D::Database>(TracingOptions::default())
@@ -339,6 +354,14 @@ impl CatalogCommand {
             }
             CatalogCommand::ShowCacheJobs { table, catalog } => {
                 let rows = manager.show_cache_jobs(table, catalog).await?;
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::ShowCacheSchedule { table, catalog } => {
+                let rows = manager.show_cache_schedule(table, catalog).await?;
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::DiagnoseCache { catalog } => {
+                let rows = manager.diagnose_cache(catalog).await?;
                 build_record_batch(schema, &rows)
             }
             CatalogCommand::AlterCatalogCachePolicy { catalog, options } => {

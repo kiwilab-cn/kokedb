@@ -539,6 +539,13 @@ pub enum CommandNode {
         table: ObjectName,
         paused: bool,
     },
+    ShowCacheSchedule {
+        table: Option<ObjectName>,
+        catalog: Option<ObjectName>,
+    },
+    DiagnoseCache {
+        catalog: Option<ObjectName>,
+    },
     AlterCatalogCachePolicy {
         catalog: ObjectName,
         options: Vec<(String, String)>,

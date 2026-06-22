@@ -137,6 +137,37 @@ refresh tick until resumed.
 PAUSE  CACHE SCHEDULE FOR TABLE demo.public.orders;
 RESUME CACHE SCHEDULE FOR TABLE demo.public.orders;
 ```
+
+- SHOW CACHE SCHEDULE
+
+Shows each table's effective refresh schedule: bucket, interval, whether the
+cadence is pinned or paused, the incremental mode/status, last sync and the next
+scheduled run. Optionally scoped to a table or catalog.
+
+```sql
+SHOW CACHE SCHEDULE;
+SHOW CACHE SCHEDULE FROM CATALOG demo;
+SHOW CACHE SCHEDULE FROM TABLE demo.public.orders;
+```
+
+- DIAGNOSE CACHE
+
+A cache health report — one row per detected issue: rejected/diverged
+incrementals, paused tables, a failed last sync, or stale (overdue) tables.
+Optionally scoped to one catalog.
+
+```sql
+DIAGNOSE CACHE;
+DIAGNOSE CACHE FROM CATALOG demo;
+```
+
+`ALTER TABLE ... SET CACHE POLICY` also accepts `refresh_interval` (e.g. `'2m'`,
+`'90s'`, `'1h'`) or `refresh_bucket` (`fast|normal|slow|cold`) to pin a table's
+refresh cadence so adaptive re-evaluation will not change it:
+
+```sql
+ALTER TABLE demo.public.orders SET CACHE POLICY WITH (refresh_interval = '2m');
+```
 ```
 +--------------------+--------------------------------------+--------+
 | table              | task_id                              | status |

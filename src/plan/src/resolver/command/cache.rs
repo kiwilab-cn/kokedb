@@ -48,6 +48,26 @@ impl PlanResolver<'_> {
         })
     }
 
+    pub(in super::super) fn resolve_show_cache_schedule(
+        &self,
+        table: Option<spec::ObjectName>,
+        catalog: Option<spec::ObjectName>,
+    ) -> PlanResult<LogicalPlan> {
+        self.resolve_catalog_command(CatalogCommand::ShowCacheSchedule {
+            table: table.map(|t| t.into()),
+            catalog: catalog.map(|c| <Vec<String>>::from(c).join(".")),
+        })
+    }
+
+    pub(in super::super) fn resolve_diagnose_cache(
+        &self,
+        catalog: Option<spec::ObjectName>,
+    ) -> PlanResult<LogicalPlan> {
+        self.resolve_catalog_command(CatalogCommand::DiagnoseCache {
+            catalog: catalog.map(|c| <Vec<String>>::from(c).join(".")),
+        })
+    }
+
     pub(in super::super) fn resolve_set_table_paused(
         &self,
         table: spec::ObjectName,

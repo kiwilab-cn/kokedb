@@ -15,7 +15,8 @@ use log::{error, info, warn};
 use tokio_cron_scheduler::Job;
 
 use crate::display::{
-    CacheJobDisplay, CachePolicyDisplay, RefreshCacheDisplay, TableMetadataDisplay,
+    CacheJobDisplay, CachePolicyDisplay, CacheScheduleDisplay, DiagnoseDisplay,
+    RefreshCacheDisplay, TableMetadataDisplay,
 };
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
@@ -277,46 +278,74 @@ impl CatalogManager {
             .map(|(k, v)| (k.to_lowercase(), v))
             .collect();
 
-        let inc_mode = opts
-            .get("inc_mode")
-            .map(|s| s.to_lowercase())
-            .ok_or_else(|| {
-                CatalogError::InvalidArgument("missing required option `inc_mode`".to_string())
-            })?;
-        let watermark = opts.get("watermark_column").cloned();
-        let pk = opts.get("pk_columns").cloned();
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let mut applied = false;
 
-        match inc_mode.as_str() {
-            "full" => {}
-            "upsert" => {
-                if watermark.is_none() || pk.is_none() {
-                    return Err(CatalogError::InvalidArgument(
-                        "inc_mode=upsert requires `watermark_column` and `pk_columns`".to_string(),
-                    ));
-                }
-            }
-            "append" => {
-                if watermark.is_none() {
-                    return Err(CatalogError::InvalidArgument(
-                        "inc_mode=append requires `watermark_column`".to_string(),
-                    ));
-                }
-            }
-            other => {
-                return Err(CatalogError::InvalidArgument(format!(
-                    "invalid inc_mode `{other}` (expected full|upsert|append)"
-                )))
-            }
+        // Cadence pin: `refresh_interval` (e.g. '5m'/'90s'/'2h'/seconds) and/or
+        // `refresh_bucket` (fast|normal|slow|cold).
+        let cadence = opts.get("refresh_interval").or(opts.get("refresh_bucket"));
+        if cadence.is_some() {
+            let (bucket, secs) = if let Some(iv) = opts.get("refresh_interval") {
+                ("pinned".to_string(), parse_duration_secs(iv)?)
+            } else {
+                let b = opts.get("refresh_bucket").unwrap().to_lowercase();
+                let secs = match b.as_str() {
+                    "fast" => 120,
+                    "normal" => 900,
+                    "slow" => 3600,
+                    "cold" => 21600,
+                    other => {
+                        return Err(CatalogError::InvalidArgument(format!(
+                            "invalid refresh_bucket `{other}` (expected fast|normal|slow|cold)"
+                        )))
+                    }
+                };
+                (b, secs)
+            };
+            meta.set_table_cadence(&catalog, &schema_name, &table_name, &bucket, secs)
+                .await
+                .map_err(|e| CatalogError::Internal(format!("Failed to pin cadence: {e}")))?;
+            applied = true;
         }
 
-        let meta = self.state()?.dynamic_catalog_list.clone();
-        meta.set_user_inc_policy(&catalog, &schema_name, &table_name, &inc_mode, watermark, pk)
-            .await
-            .map_err(|e| {
-                CatalogError::Internal(format!("Failed to set cache policy: {e}"))
-            })?;
+        // Incremental strategy override (optional).
+        if let Some(inc_mode) = opts.get("inc_mode").map(|s| s.to_lowercase()) {
+            let watermark = opts.get("watermark_column").cloned();
+            let pk = opts.get("pk_columns").cloned();
+            match inc_mode.as_str() {
+                "full" => {}
+                "upsert" => {
+                    if watermark.is_none() || pk.is_none() {
+                        return Err(CatalogError::InvalidArgument(
+                            "inc_mode=upsert requires `watermark_column` and `pk_columns`".to_string(),
+                        ));
+                    }
+                }
+                "append" => {
+                    if watermark.is_none() {
+                        return Err(CatalogError::InvalidArgument(
+                            "inc_mode=append requires `watermark_column`".to_string(),
+                        ));
+                    }
+                }
+                other => {
+                    return Err(CatalogError::InvalidArgument(format!(
+                        "invalid inc_mode `{other}` (expected full|upsert|append)"
+                    )))
+                }
+            }
+            meta.set_user_inc_policy(&catalog, &schema_name, &table_name, &inc_mode, watermark, pk)
+                .await
+                .map_err(|e| CatalogError::Internal(format!("Failed to set cache policy: {e}")))?;
+            applied = true;
+        }
 
-        info!("User set cache policy for {catalog}.{schema_name}.{table_name}: inc_mode={inc_mode}");
+        if !applied {
+            return Err(CatalogError::InvalidArgument(
+                "expected at least one of: inc_mode, refresh_interval, refresh_bucket".to_string(),
+            ));
+        }
+        info!("User set cache policy for {catalog}.{schema_name}.{table_name}");
         Ok(())
     }
 
@@ -374,6 +403,89 @@ impl CatalogManager {
                     .ended_at
                     .map(|e| (e - j.started_at).num_milliseconds()),
                 error: j.error_message,
+            })
+            .collect())
+    }
+
+    /// Returns each table's effective refresh schedule (`SHOW CACHE SCHEDULE`),
+    /// optionally scoped to a table or catalog.
+    pub async fn show_cache_schedule(
+        &self,
+        table: Option<Vec<String>>,
+        catalog: Option<String>,
+    ) -> CatalogResult<Vec<CacheScheduleDisplay>> {
+        let (cat, schema, tbl) = match (&table, &catalog) {
+            (Some(parts), _) => match parts.as_slice() {
+                [c, db, t] => (Some(c.clone()), Some(db.clone()), Some(t.clone())),
+                [db, t] => (
+                    Some(self.default_catalog()?.to_string()),
+                    Some(db.clone()),
+                    Some(t.clone()),
+                ),
+                [t] => (
+                    Some(self.default_catalog()?.to_string()),
+                    Some(self.default_database()?.head.to_string()),
+                    Some(t.clone()),
+                ),
+                _ => {
+                    return Err(CatalogError::InvalidArgument(
+                        "expected catalog.database.table".to_string(),
+                    ))
+                }
+            },
+            (None, Some(c)) => (Some(c.clone()), None, None),
+            (None, None) => (None, None, None),
+        };
+
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let rows = meta
+            .get_cache_schedules(cat.as_deref(), schema.as_deref(), tbl.as_deref())
+            .await
+            .map_err(|e| CatalogError::Internal(format!("Failed to read schedule: {e}")))?;
+
+        let fmt = |t: chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%d %H:%M:%S").to_string();
+        Ok(rows
+            .into_iter()
+            .map(|s| {
+                let next_run_at = (!s.paused).then_some(()).and(s.last_sync_at).map(|t| {
+                    fmt(t + chrono::Duration::seconds(s.refresh_interval_sec as i64))
+                });
+                CacheScheduleDisplay {
+                    catalog: s.catalog,
+                    schema: s.schema_name,
+                    table: s.table_name,
+                    refresh_bucket: s.refresh_bucket,
+                    refresh_interval_sec: s.refresh_interval_sec,
+                    cadence_pinned: s.cadence_pinned,
+                    paused: s.paused,
+                    inc_mode: s.inc_mode,
+                    inc_status: s.inc_status,
+                    last_sync_at: s.last_sync_at.map(fmt),
+                    next_run_at,
+                }
+            })
+            .collect())
+    }
+
+    /// Runs a cache health report (`DIAGNOSE CACHE`), optionally scoped to one
+    /// catalog. Returns one row per detected issue.
+    pub async fn diagnose_cache(
+        &self,
+        catalog: Option<String>,
+    ) -> CatalogResult<Vec<DiagnoseDisplay>> {
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let rows = meta
+            .diagnose_cache(catalog.as_deref())
+            .await
+            .map_err(|e| CatalogError::Internal(format!("Failed to diagnose cache: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|(issue, catalog, schema, table, detail)| DiagnoseDisplay {
+                issue,
+                catalog,
+                schema,
+                table,
+                detail,
             })
             .collect())
     }
@@ -736,4 +848,23 @@ impl CatalogManager {
         info!("Dropped catalog '{}'", catalog);
         Ok(())
     }
+}
+
+/// Parses a refresh-interval string into seconds: a bare integer is seconds, or
+/// an `Ns`/`Nm`/`Nh`/`Nd` suffix (seconds/minutes/hours/days).
+fn parse_duration_secs(s: &str) -> CatalogResult<i32> {
+    let s = s.trim();
+    let invalid = || CatalogError::InvalidArgument(format!("invalid refresh_interval `{s}`"));
+    if let Ok(n) = s.parse::<i32>() {
+        return (n > 0).then_some(n).ok_or_else(invalid);
+    }
+    let (num, mult) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        Some('d') => (&s[..s.len() - 1], 86400),
+        _ => return Err(invalid()),
+    };
+    let n: i32 = num.trim().parse().map_err(|_| invalid())?;
+    (n > 0).then(|| n * mult).ok_or_else(invalid)
 }

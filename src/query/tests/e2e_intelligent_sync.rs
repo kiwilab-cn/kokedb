@@ -50,6 +50,28 @@ fn scalar_count(batches: &[RecordBatch]) -> i64 {
         .value(0)
 }
 
+/// Collects all values of a string column across batches.
+fn collect_col(batches: &[RecordBatch], col: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in batches {
+        let Ok(idx) = b.schema().index_of(col) else { continue };
+        let arr: &dyn Array = b.column(idx);
+        for i in 0..b.num_rows() {
+            let v = if let Some(a) = arr.as_any().downcast_ref::<StringArray>() {
+                a.value(i).to_string()
+            } else if let Some(a) = arr.as_any().downcast_ref::<LargeStringArray>() {
+                a.value(i).to_string()
+            } else if let Some(a) = arr.as_any().downcast_ref::<StringViewArray>() {
+                a.value(i).to_string()
+            } else {
+                continue;
+            };
+            out.push(v);
+        }
+    }
+    out
+}
+
 /// Reads a string column from the single-row `SHOW TABLE METADATA` result.
 fn meta_str(batches: &[RecordBatch], col: &str) -> String {
     let b = &batches[0];
@@ -241,6 +263,42 @@ async fn intelligent_sync_end_to_end() {
     let cat_refresh = run(&shared, &format!("REFRESH CACHE FROM CATALOG {catalog}")).await;
     let queued: usize = cat_refresh.iter().map(|b| b.num_rows()).sum();
     assert_eq!(queued, 3, "REFRESH CACHE FROM CATALOG should queue all 3 tables");
+
+    // 5c. Pin a refresh cadence; SHOW CACHE SCHEDULE reflects it and reeval won't
+    //     overwrite it.
+    run(
+        &shared,
+        &format!("ALTER TABLE {catalog}.public.e2e_orders SET CACHE POLICY WITH (refresh_interval = '2m')"),
+    )
+    .await;
+    let (pinned_secs, pinned): (i32, bool) = sqlx::query_as(
+        "SELECT refresh_interval_sec, cadence_pinned FROM system.table_sync_policy \
+         WHERE catalog=$1 AND schema_name='public' AND table_name='e2e_orders'",
+    )
+    .bind(catalog)
+    .fetch_one(&meta)
+    .await
+    .unwrap();
+    assert_eq!(pinned_secs, 120, "refresh_interval pinned to 2m");
+    assert!(pinned, "cadence should be pinned");
+
+    let sched = run(&shared, &format!("SHOW CACHE SCHEDULE FROM CATALOG {catalog}")).await;
+    let sched_tables = collect_col(&sched, "table");
+    assert!(sched_tables.iter().any(|t| t == "e2e_orders"), "schedule lists orders");
+
+    // 5d. Pause a table; DIAGNOSE CACHE flags it.
+    run(
+        &shared,
+        &format!("PAUSE CACHE SCHEDULE FOR TABLE {catalog}.public.e2e_events"),
+    )
+    .await;
+    let diag = run(&shared, &format!("DIAGNOSE CACHE FROM CATALOG {catalog}")).await;
+    let issues = collect_col(&diag, "issue");
+    let diag_tables = collect_col(&diag, "table");
+    assert!(
+        issues.iter().zip(&diag_tables).any(|(i, t)| i == "PAUSED" && t == "e2e_events"),
+        "DIAGNOSE should report the paused table: issues={issues:?} tables={diag_tables:?}"
+    );
 
     // 6. Disabling the database evicts its cached tables: the cache metadata is
     //    cleared (queries fall back to the live remote source), but the data is

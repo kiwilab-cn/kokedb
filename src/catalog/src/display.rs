@@ -67,6 +67,32 @@ pub struct CacheJobDisplay {
     pub error: Option<String>,
 }
 
+/// One row of `SHOW CACHE SCHEDULE`: a table's effective refresh cadence + state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheScheduleDisplay {
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+    pub refresh_bucket: String,
+    pub refresh_interval_sec: i32,
+    pub cadence_pinned: bool,
+    pub paused: bool,
+    pub inc_mode: String,
+    pub inc_status: String,
+    pub last_sync_at: Option<String>,
+    pub next_run_at: Option<String>,
+}
+
+/// One row of `DIAGNOSE CACHE`: a detected cache-health issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnoseDisplay {
+    pub issue: String,
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+    pub detail: String,
+}
+
 /// A trait for displaying catalog information in a structured format.
 /// This is useful for defining output schemas and producing outputs
 /// for various SQL catalog commands.
