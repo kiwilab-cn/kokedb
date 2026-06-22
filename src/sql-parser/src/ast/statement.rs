@@ -23,6 +23,7 @@ use crate::ast::keywords::{
     Temporary, Terminated, Then, Time, To, Type, Uncache, Unset, Update, Use, Using, Values,
     Verbose, View, Views, When, With, Zone,
 };
+use crate::ast::keywords::{Pause, Resume, Schedule};
 use crate::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
 use crate::ast::operator::{
     Asterisk, Colon, Comma, Equals, ExclamationMark, LeftParenthesis, Minus, Plus, RightParenthesis,
@@ -398,6 +399,14 @@ pub enum Statement {
         cache: Cache,
         jobs: Jobs,
         target: Option<(From, Either<Table, Catalog>, ObjectName)>,
+    },
+    SetCacheSchedule {
+        action: Either<Pause, Resume>,
+        cache: Cache,
+        schedule: Schedule,
+        r#for: For,
+        table: Table,
+        name: ObjectName,
     },
 }
 

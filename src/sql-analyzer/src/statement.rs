@@ -1072,6 +1072,20 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::SetCacheSchedule {
+            action,
+            cache: _,
+            schedule: _,
+            r#for: _,
+            table: _,
+            name,
+        } => {
+            let node = spec::CommandNode::SetTablePaused {
+                table: from_ast_object_name(name)?,
+                paused: matches!(action, Either::Left(_)),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::ShowCacheJobs {
             show: _,
             cache: _,
@@ -1920,6 +1934,26 @@ mod drop_catalog_tests {
                 other => panic!("expected RefreshCache, got {other:?}"),
             },
             _ => panic!("expected a command plan"),
+        }
+    }
+
+    #[test]
+    fn parse_pause_resume_cache_schedule() {
+        for (sql, want_paused) in [
+            ("PAUSE CACHE SCHEDULE FOR TABLE demo.public.orders", true),
+            ("RESUME CACHE SCHEDULE FOR TABLE demo.public.orders", false),
+        ] {
+            let plan = from_ast_statement(parse_one_statement(sql).unwrap()).unwrap();
+            match plan {
+                spec::Plan::Command(c) => match c.node {
+                    spec::CommandNode::SetTablePaused { table, paused } => {
+                        assert_eq!(<Vec<String>>::from(table), vec!["demo", "public", "orders"]);
+                        assert_eq!(paused, want_paused, "for `{sql}`");
+                    }
+                    other => panic!("expected SetTablePaused, got {other:?}"),
+                },
+                _ => panic!("expected a command plan"),
+            }
         }
     }
 

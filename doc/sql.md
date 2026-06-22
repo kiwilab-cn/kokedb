@@ -126,6 +126,17 @@ REFRESH CACHE FROM CATALOG demo;                 -- every table the policy selec
 ```
 
 `REFRESH CACHE FROM CATALOG` returns one queued-task row per selected table.
+
+- PAUSE / RESUME CACHE SCHEDULE FOR TABLE
+
+Temporarily stop (or resume) a table's scheduled refresh without changing its
+policy. A paused table keeps its current cached snapshot but is skipped by the
+refresh tick until resumed.
+
+```sql
+PAUSE  CACHE SCHEDULE FOR TABLE demo.public.orders;
+RESUME CACHE SCHEDULE FOR TABLE demo.public.orders;
+```
 ```
 +--------------------+--------------------------------------+--------+
 | table              | task_id                              | status |

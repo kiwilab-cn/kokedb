@@ -49,6 +49,10 @@ pub enum CatalogCommand {
     RefreshCacheCatalog {
         catalog: String,
     },
+    SetTablePaused {
+        table: Vec<String>,
+        paused: bool,
+    },
     AlterTableCachePolicy {
         table: Vec<String>,
         options: Vec<(String, String)>,
@@ -173,6 +177,7 @@ impl CatalogCommand {
             CatalogCommand::ListCachePolicies => "ListCachePolicies",
             CatalogCommand::RefreshCache { .. } => "RefreshCache",
             CatalogCommand::RefreshCacheCatalog { .. } => "RefreshCacheCatalog",
+            CatalogCommand::SetTablePaused { .. } => "SetTablePaused",
             CatalogCommand::ShowTableMetadata { .. } => "ShowTableMetadata",
             CatalogCommand::AlterTableCachePolicy { .. } => "AlterTableCachePolicy",
             CatalogCommand::ShowCacheJobs { .. } => "ShowCacheJobs",
@@ -262,6 +267,7 @@ impl CatalogCommand {
             | CatalogCommand::AlterTableCachePolicy { .. }
             | CatalogCommand::AlterCatalogCachePolicy { .. }
             | CatalogCommand::AlterDatabaseCachePolicy { .. }
+            | CatalogCommand::SetTablePaused { .. }
             | CatalogCommand::DropCatalog { .. } => {
                 Vec::<FieldRef>::from_type::<SingleValueDisplay<bool>>(TracingOptions::default())
             }
@@ -315,6 +321,11 @@ impl CatalogCommand {
             }
             CatalogCommand::RefreshCacheCatalog { catalog } => {
                 let rows = manager.refresh_catalog(&catalog).await?;
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::SetTablePaused { table, paused } => {
+                manager.set_table_paused(table, paused).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
                 build_record_batch(schema, &rows)
             }
             CatalogCommand::ShowTableMetadata { table } => {

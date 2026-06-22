@@ -260,10 +260,13 @@ impl PostgreSQLMetaCatalogProviderList {
                 next_audit_at TIMESTAMPTZ,
                 audit_passes INTEGER NOT NULL DEFAULT 0,
                 divergence_count INTEGER NOT NULL DEFAULT 0,
+                paused BOOLEAN NOT NULL DEFAULT false,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (catalog, schema_name, table_name)
             );
             "#,
+            // Backfill for policy rows created before `paused` existed.
+            "ALTER TABLE system.table_sync_policy ADD COLUMN IF NOT EXISTS paused BOOLEAN NOT NULL DEFAULT false;",
             // One row per table-sync run, for `SHOW CACHE JOBS` observability.
             r#"
             CREATE TABLE IF NOT EXISTS system.cache_job (
@@ -775,6 +778,31 @@ impl PostgreSQLMetaCatalogProviderList {
     /// Returns the `schema.table` names in `catalog` whose adaptive refresh
     /// interval has elapsed (or that have never been synced). Drives the
     /// per-catalog refresh tick.
+    /// Pauses or resumes a table's scheduled refresh. Upserts a policy row so it
+    /// works even before the table has been evaluated.
+    pub async fn set_table_paused(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        paused: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO system.table_sync_policy (catalog, schema_name, table_name, paused, updated_at) \
+             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) \
+             ON CONFLICT (catalog, schema_name, table_name) DO UPDATE SET \
+                 paused = EXCLUDED.paused, updated_at = CURRENT_TIMESTAMP;",
+        )
+        .bind(catalog)
+        .bind(schema)
+        .bind(table)
+        .bind(paused)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
     pub async fn get_due_refresh_tables(&self, catalog: &str) -> Result<Vec<String>> {
         let sql = "SELECT p.schema_name, p.table_name \
             FROM system.table_sync_policy p \
@@ -782,6 +810,7 @@ impl PostgreSQLMetaCatalogProviderList {
               ON p.catalog = s.catalog AND p.schema_name = s.schema_name \
              AND p.table_name = s.table_name \
             WHERE p.catalog = $1 \
+              AND NOT p.paused \
               AND (s.last_sync_at IS NULL \
                    OR s.last_sync_at + (p.refresh_interval_sec || ' seconds')::interval \
                       <= CURRENT_TIMESTAMP) \
@@ -1680,6 +1709,54 @@ mod policy_tests {
         assert_eq!(got2.inc_mode, "full");
         assert_eq!(got2.inc_status, "none");
         assert_eq!(got2.source, "user");
+
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+    }
+
+    // A paused table is excluded from the refresh tick; resuming re-includes it.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via PG_META_DSN"]
+    async fn paused_table_is_not_due() {
+        let pool = PgPool::connect(&meta_dsn()).await.unwrap();
+        let meta = PostgreSQLMetaCatalogProviderList::from_pool(pool);
+        meta.init_db().await.unwrap();
+        let cat = "it_pause";
+        sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
+            .bind(cat)
+            .execute(&meta.local_pool)
+            .await
+            .unwrap();
+
+        // A policy row with no sync_state is immediately due.
+        let policy = TableSyncPolicy {
+            refresh_bucket: "normal".into(),
+            refresh_interval_sec: 900,
+            est_row_count: None,
+            est_size_bytes: None,
+            churn_per_hour: None,
+            access_per_day: None,
+            score: None,
+        };
+        meta.upsert_table_sync_policy(cat, "public", "t1", &policy)
+            .await
+            .unwrap();
+        assert!(meta.get_due_refresh_tables(cat).await.unwrap().contains(&"public.t1".to_string()));
+
+        meta.set_table_paused(cat, "public", "t1", true).await.unwrap();
+        assert!(
+            !meta.get_due_refresh_tables(cat).await.unwrap().contains(&"public.t1".to_string()),
+            "paused table must not be due"
+        );
+
+        meta.set_table_paused(cat, "public", "t1", false).await.unwrap();
+        assert!(
+            meta.get_due_refresh_tables(cat).await.unwrap().contains(&"public.t1".to_string()),
+            "resumed table is due again"
+        );
 
         sqlx::query("DELETE FROM system.table_sync_policy WHERE catalog = $1")
             .bind(cat)
