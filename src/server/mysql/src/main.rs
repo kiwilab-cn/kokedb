@@ -19,6 +19,7 @@ use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_query::{
     binder::{parser, query, save_sql_history},
     context::{create_session_context, init_shared_services, use_database},
+    plan_cache::PlanCache,
 };
 use log::{error, info, warn};
 use opensrv_mysql::*;
@@ -84,6 +85,8 @@ struct CoreContex {
     /// Shared meta-store handle (reuses the process-wide pool) for recording
     /// SQL execution history.
     meta: Arc<PostgreSQLMetaCatalogProviderList>,
+    /// Shared SQL-text -> parsed-plan cache (process-wide).
+    plan_cache: PlanCache,
     /// Per-connection prepared statement registry, keyed by statement id.
     prepared: HashMap<u32, PreparedStatement>,
     /// Monotonic statement id generator for this connection.
@@ -97,6 +100,7 @@ impl CoreContex {
         auth: Option<Arc<AuthConfig>>,
         sf: Arc<singleflight::Singleflight>,
         meta: Arc<PostgreSQLMetaCatalogProviderList>,
+        plan_cache: PlanCache,
     ) -> Self {
         Self {
             ctx,
@@ -104,6 +108,7 @@ impl CoreContex {
             auth,
             sf,
             meta,
+            plan_cache,
             prepared: HashMap::new(),
             next_stmt_id: 1,
         }
@@ -215,6 +220,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
             self.cache.clone(),
             self.sf.clone(),
             self.meta.clone(),
+            self.plan_cache.clone(),
             &sql,
             results,
         )
@@ -271,6 +277,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
             self.cache.clone(),
             self.sf.clone(),
             self.meta.clone(),
+            self.plan_cache.clone(),
             sql,
             results,
         )
@@ -285,6 +292,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     cache: Cache,
     sf: Arc<singleflight::Singleflight>,
     meta: Arc<PostgreSQLMetaCatalogProviderList>,
+    plan_cache: PlanCache,
     sql: &str,
     results: QueryResultWriter<'_, W>,
 ) -> Result<(), MysqlServerError> {
@@ -292,7 +300,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     metrics::inc_queries();
 
     // Step 1: Parse SQL and generate plan
-    let (plan, cache_key) = match parse_sql_and_get_plan(sql) {
+    let (plan, cache_key) = match parse_sql_and_get_plan(&plan_cache, sql) {
         Ok(result) => result,
         Err((error_kind, error_msg)) => {
             return send_error_to_client(results, error_kind, error_msg).await;
@@ -529,8 +537,18 @@ async fn try_get_from_cache(cache: &Cache, cache_key: CacheKey) -> Option<BatchS
     }
 }
 
-// Parse SQL and generate execution plan
-fn parse_sql_and_get_plan(sql: &str) -> Result<(Plan, CacheKey), (ErrorKind, String)> {
+// Parse SQL and generate execution plan. Consults the process-wide plan cache
+// first: parsing + plan-hashing are pure functions of the SQL text, so a hit
+// skips both on the hot path (including result-cache hits, which still need the
+// cache key before they can look anything up).
+fn parse_sql_and_get_plan(
+    plan_cache: &PlanCache,
+    sql: &str,
+) -> Result<(Plan, CacheKey), (ErrorKind, String)> {
+    if let Some(hit) = plan_cache.get(sql) {
+        return Ok((hit.0.clone(), hit.1));
+    }
+
     let plan = parser(sql).map_err(|e| {
         (
             ErrorKind::ER_PARSE_ERROR,
@@ -545,6 +563,7 @@ fn parse_sql_and_get_plan(sql: &str) -> Result<(Plan, CacheKey), (ErrorKind, Str
         )
     })?;
 
+    plan_cache.insert(sql, Arc::new((plan.clone(), cache_key)));
     Ok((plan, cache_key))
 }
 
@@ -904,12 +923,17 @@ async fn main() -> Result<(), MysqlServerError> {
             }
         };
         let meta = shared.meta();
+        let plan_cache = shared.plan_cache();
         tokio::spawn(async move {
             metrics::METRICS
                 .active_connections
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _ =
-                AsyncMysqlIntermediary::run_on(CoreContex::new(ctx, cache, auth, sf, meta), r, w).await;
+            let _ = AsyncMysqlIntermediary::run_on(
+                CoreContex::new(ctx, cache, auth, sf, meta, plan_cache),
+                r,
+                w,
+            )
+            .await;
             metrics::METRICS
                 .active_connections
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
