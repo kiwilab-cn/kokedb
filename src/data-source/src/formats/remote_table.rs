@@ -8,7 +8,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::Session;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::{TableProvider, TableType};
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
@@ -73,12 +73,32 @@ impl TableProvider for PostgreSQLTableProvider {
         TableType::Base
     }
 
+    /// Translatable filters are pushed to PostgreSQL as `Inexact`: DataFusion
+    /// keeps its own `FilterExec` on top, so correctness never depends on our
+    /// SQL translation being perfect — pushdown is a pure row-reduction
+    /// optimization. Filters we can't translate stay `Unsupported`.
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if expr_to_sql(f).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
+
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let projected_schema = match projection {
             Some(indices) => {
@@ -97,6 +117,7 @@ impl TableProvider for PostgreSQLTableProvider {
             projected_schema,
             projection.cloned(),
             filters.to_vec(),
+            limit,
         )))
     }
 }
@@ -107,6 +128,7 @@ struct PostgreSQLExec {
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
+    limit: Option<usize>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -118,6 +140,7 @@ impl PostgreSQLExec {
         projected_schema: SchemaRef,
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
+        limit: Option<usize>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
@@ -132,6 +155,7 @@ impl PostgreSQLExec {
             projected_schema,
             projection,
             filters,
+            limit,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -161,7 +185,7 @@ impl PostgreSQLExec {
             let where_clauses: Vec<String> = self
                 .filters
                 .iter()
-                .filter_map(|filter| self.expr_to_sql(filter))
+                .filter_map(expr_to_sql)
                 .collect();
 
             if !where_clauses.is_empty() {
@@ -169,43 +193,79 @@ impl PostgreSQLExec {
             }
         }
 
+        // Safe to push: DataFusion only supplies a scan limit when nothing
+        // below it changes row cardinality (it never pushes a limit past a
+        // re-applied filter), so fetching only `n` rows from PostgreSQL cannot
+        // drop rows a downstream operator still needs.
+        if let Some(limit) = self.limit {
+            query.push_str(&format!(" LIMIT {}", limit));
+        }
+
         query
     }
+}
 
-    fn expr_to_sql(&self, expr: &Expr) -> Option<String> {
-        match expr {
-            Expr::BinaryExpr(binary_expr) => {
-                let left = self.expr_to_sql(&binary_expr.left)?;
-                let right = self.expr_to_sql(&binary_expr.right)?;
-                let op = match binary_expr.op {
-                    datafusion::logical_expr::Operator::Eq => "=",
-                    datafusion::logical_expr::Operator::NotEq => "!=",
-                    datafusion::logical_expr::Operator::Lt => "<",
-                    datafusion::logical_expr::Operator::LtEq => "<=",
-                    datafusion::logical_expr::Operator::Gt => ">",
-                    datafusion::logical_expr::Operator::GtEq => ">=",
-                    datafusion::logical_expr::Operator::And => "AND",
-                    datafusion::logical_expr::Operator::Or => "OR",
-                    datafusion::logical_expr::Operator::LikeMatch => "LIKE",
-                    datafusion::logical_expr::Operator::NotLikeMatch => "NOT LIKE",
-                    _ => return None,
-                };
-                Some(format!("({} {} {})", left, op, right))
-            }
-            Expr::Column(col) => Some(format!("\"{}\"", col.name)),
-            Expr::Literal(scalar_value, None) => match scalar_value {
-                datafusion::scalar::ScalarValue::Utf8(Some(s)) => {
-                    Some(format!("'{}'", s.replace("'", "''")))
-                }
-                datafusion::scalar::ScalarValue::Int32(Some(i)) => Some(i.to_string()),
-                datafusion::scalar::ScalarValue::Int64(Some(i)) => Some(i.to_string()),
-                datafusion::scalar::ScalarValue::Float32(Some(f)) => Some(f.to_string()),
-                datafusion::scalar::ScalarValue::Float64(Some(f)) => Some(f.to_string()),
-                datafusion::scalar::ScalarValue::Boolean(Some(b)) => Some(b.to_string()),
-                _ => None,
-            },
-            _ => None,
+/// Translates a DataFusion filter `Expr` into a PostgreSQL boolean SQL
+/// fragment. Returns `None` for anything not confidently translatable; the
+/// caller treats pushdown as `Inexact`, so an untranslated filter is simply
+/// re-applied by DataFusion rather than producing a wrong result.
+fn expr_to_sql(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::BinaryExpr(binary_expr) => {
+            let left = expr_to_sql(&binary_expr.left)?;
+            let right = expr_to_sql(&binary_expr.right)?;
+            let op = match binary_expr.op {
+                datafusion::logical_expr::Operator::Eq => "=",
+                datafusion::logical_expr::Operator::NotEq => "!=",
+                datafusion::logical_expr::Operator::Lt => "<",
+                datafusion::logical_expr::Operator::LtEq => "<=",
+                datafusion::logical_expr::Operator::Gt => ">",
+                datafusion::logical_expr::Operator::GtEq => ">=",
+                datafusion::logical_expr::Operator::And => "AND",
+                datafusion::logical_expr::Operator::Or => "OR",
+                datafusion::logical_expr::Operator::LikeMatch => "LIKE",
+                datafusion::logical_expr::Operator::NotLikeMatch => "NOT LIKE",
+                _ => return None,
+            };
+            Some(format!("({} {} {})", left, op, right))
         }
+        Expr::Column(col) => Some(format!("\"{}\"", col.name)),
+        Expr::IsNull(inner) => Some(format!("({} IS NULL)", expr_to_sql(inner)?)),
+        Expr::IsNotNull(inner) => Some(format!("({} IS NOT NULL)", expr_to_sql(inner)?)),
+        Expr::Not(inner) => Some(format!("(NOT {})", expr_to_sql(inner)?)),
+        Expr::Between(between) => {
+            let what = expr_to_sql(&between.expr)?;
+            let low = expr_to_sql(&between.low)?;
+            let high = expr_to_sql(&between.high)?;
+            let kw = if between.negated {
+                "NOT BETWEEN"
+            } else {
+                "BETWEEN"
+            };
+            Some(format!("({} {} {} AND {})", what, kw, low, high))
+        }
+        Expr::InList(in_list) => {
+            let what = expr_to_sql(&in_list.expr)?;
+            let items: Option<Vec<String>> = in_list.list.iter().map(expr_to_sql).collect();
+            let items = items?;
+            if items.is_empty() {
+                return None;
+            }
+            let kw = if in_list.negated { "NOT IN" } else { "IN" };
+            Some(format!("({} {} ({}))", what, kw, items.join(", ")))
+        }
+        Expr::Literal(scalar_value, None) => match scalar_value {
+            datafusion::scalar::ScalarValue::Utf8(Some(s)) => {
+                Some(format!("'{}'", s.replace("'", "''")))
+            }
+            datafusion::scalar::ScalarValue::Int32(Some(i)) => Some(i.to_string()),
+            datafusion::scalar::ScalarValue::Int64(Some(i)) => Some(i.to_string()),
+            datafusion::scalar::ScalarValue::Float32(Some(f)) => Some(f.to_string()),
+            datafusion::scalar::ScalarValue::Float64(Some(f)) => Some(f.to_string()),
+            datafusion::scalar::ScalarValue::Boolean(Some(b)) => Some(b.to_string()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -359,6 +419,54 @@ mod tests {
     use super::*;
     use datafusion::prelude::*;
     use log::info;
+
+    // Filter translation is DB-free and the core correctness surface of
+    // pushdown, so it is exercised directly here.
+    #[test]
+    fn expr_to_sql_translates_supported_filters() {
+        assert_eq!(
+            expr_to_sql(&col("id").gt(lit(10i64))).as_deref(),
+            Some("(\"id\" > 10)")
+        );
+        assert_eq!(
+            expr_to_sql(&col("name").eq(lit("o'brien"))).as_deref(),
+            Some("(\"name\" = 'o''brien')")
+        );
+        assert_eq!(
+            expr_to_sql(&col("id").is_null()).as_deref(),
+            Some("(\"id\" IS NULL)")
+        );
+        assert_eq!(
+            expr_to_sql(&col("id").is_not_null()).as_deref(),
+            Some("(\"id\" IS NOT NULL)")
+        );
+        assert_eq!(
+            expr_to_sql(&col("id").between(lit(1i64), lit(5i64))).as_deref(),
+            Some("(\"id\" BETWEEN 1 AND 5)")
+        );
+        assert_eq!(
+            expr_to_sql(&col("id").in_list(vec![lit(1i64), lit(2i64), lit(3i64)], false))
+                .as_deref(),
+            Some("(\"id\" IN (1, 2, 3))")
+        );
+        assert_eq!(
+            expr_to_sql(&col("id").in_list(vec![lit(1i64)], true)).as_deref(),
+            Some("(\"id\" NOT IN (1))")
+        );
+        // AND of two simple comparisons.
+        assert_eq!(
+            expr_to_sql(&col("a").gt(lit(1i64)).and(col("b").lt(lit(9i64)))).as_deref(),
+            Some("((\"a\" > 1) AND (\"b\" < 9))")
+        );
+    }
+
+    #[test]
+    fn expr_to_sql_returns_none_for_untranslatable() {
+        // A scalar function we don't translate must yield None so the caller
+        // leaves it to DataFusion's FilterExec instead of emitting bad SQL.
+        let unsupported = col("ts").eq(now());
+        assert!(expr_to_sql(&unsupported).is_none());
+    }
 
     #[tokio::test]
     #[ignore = "requires PostgreSQL; run via `make integration-test`"]
