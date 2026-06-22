@@ -26,10 +26,14 @@ pub async fn query(
     ctx: Arc<SessionContext>,
     plan: &Plan,
     key: u128,
+    max_staleness_secs: Option<u64>,
 ) -> Result<SendableRecordBatchStream, QueryError> {
-    let default_plan_config = PlanConfig::default();
+    let plan_config = PlanConfig {
+        max_staleness_secs,
+        ..PlanConfig::default()
+    };
     let df_plan =
-        resolve_and_execute_plan(&ctx, Arc::new(default_plan_config), plan.clone(), key).await?;
+        resolve_and_execute_plan(&ctx, Arc::new(plan_config), plan.clone(), key).await?;
     let batches = execute_preserving_order(df_plan, ctx.task_ctx())?;
 
     Ok(batches)

@@ -147,7 +147,8 @@ impl CacheRefresher {
             return Ok(());
         }
 
-        let stream = query(ctx.clone(), &plan, key)
+        // Proactive re-cache reads the freshly-synced snapshot; no staleness gate.
+        let stream = query(ctx.clone(), &plan, key, None)
             .await
             .map_err(|e| e.to_string())?;
         let batches = stream
