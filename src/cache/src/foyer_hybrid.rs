@@ -41,7 +41,10 @@ impl LruResultCache {
             .memory(memory_size * 1024 * 1024)
             .storage()
             .with_engine_config(BlockEngineBuilder::new(device))
-            .with_compression(foyer::Compression::Lz4)
+            // Payloads are already zstd-compressed by RecordBatchCodec before
+            // insert, so foyer must NOT compress again — LZ4 over zstd output
+            // burns CPU on both write and read for ~no extra space saving.
+            .with_compression(foyer::Compression::None)
             .with_runtime_options(RuntimeOptions::Separated {
                 read_runtime_options: TokioRuntimeOptions {
                     worker_threads: 4,
