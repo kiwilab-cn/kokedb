@@ -2,7 +2,13 @@ use datafusion_expr::LogicalPlan;
 use kokedb_common::spec;
 
 use crate::error::{PlanError, PlanResult};
-use crate::resolver::command::write::{WriteColumnMatch, WriteMode, WritePlanBuilder, WriteTarget};
+use kokedb_catalog::manager::CatalogManager;
+use kokedb_catalog::provider::TableKind;
+use kokedb_common_datafusion::extension::SessionExtensionAccessor;
+
+use crate::resolver::command::write::{
+    WriteColumnMatch, WriteMode, WritePlanBuilder, WriteTarget,
+};
 use crate::resolver::state::PlanResolverState;
 use crate::resolver::PlanResolver;
 
@@ -60,6 +66,22 @@ impl PlanResolver<'_> {
         state: &mut PlanResolverState,
     ) -> PlanResult<LogicalPlan> {
         use spec::InsertMode;
+
+        // Writing into a cached source table would mutate the read-only snapshot
+        // rather than the source, silently diverging the two. Reject DML against
+        // catalog (source-backed) tables; the write must go to the source DB.
+        // (Non-catalog targets fall through to the normal write path.)
+        let reference: Vec<String> = table.clone().into();
+        if let Ok(status) = self
+            .ctx
+            .extension::<CatalogManager>()?
+            .get_table_or_view(&reference)
+            .await
+        {
+            if matches!(status.kind, TableKind::Table { .. }) {
+                return Err(super::write_not_supported("INSERT INTO"));
+            }
+        }
 
         if if_not_exists {
             return Err(PlanError::todo(

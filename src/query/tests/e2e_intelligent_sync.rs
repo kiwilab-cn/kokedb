@@ -54,6 +54,20 @@ async fn run_fresh(shared: &SharedServices, sql: &str, secs: u64) -> Vec<RecordB
     stream.try_collect().await.expect("collect")
 }
 
+/// Runs a statement expected to be rejected, returning the error text.
+async fn run_expect_err(shared: &SharedServices, sql: &str) -> String {
+    let ctx = Arc::new(create_session_context(shared).expect("session ctx"));
+    let plan = match parser(sql) {
+        Ok(p) => p,
+        Err(e) => return e.to_string(),
+    };
+    let key = get_plan_hash(&plan).unwrap();
+    match query(ctx, &plan, key, None).await {
+        Ok(_) => panic!("expected `{sql}` to be rejected, but it succeeded"),
+        Err(e) => e.to_string(),
+    }
+}
+
 fn scalar_count(batches: &[RecordBatch]) -> i64 {
     batches[0]
         .column(0)
@@ -308,6 +322,20 @@ async fn intelligent_sync_end_to_end() {
         .execute(&source)
         .await
         .unwrap();
+
+    // 5a-writes. DML against a cached source table is rejected with a clear,
+    // actionable message instead of corrupting the snapshot or silently no-oping.
+    for dml in [
+        format!("UPDATE {catalog}.public.e2e_orders SET status='x' WHERE id = 1"),
+        format!("DELETE FROM {catalog}.public.e2e_orders WHERE id = 1"),
+        format!("INSERT INTO {catalog}.public.e2e_orders (id, amount, status) VALUES (9999, 1.0, 'x')"),
+    ] {
+        let err = run_expect_err(&shared, &dml).await;
+        assert!(
+            err.contains("read-only query accelerator"),
+            "DML `{dml}` should be rejected with the accelerator message, got: {err}"
+        );
+    }
 
     // 5b. Catalog-wide refresh queues every selected table.
     let cat_refresh = run(&shared, &format!("REFRESH CACHE FROM CATALOG {catalog}")).await;
