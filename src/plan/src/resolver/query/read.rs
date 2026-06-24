@@ -11,7 +11,9 @@ use kokedb_common::spec;
 use kokedb_common_datafusion::datasource::SourceInfo;
 use kokedb_common_datafusion::extension::SessionExtensionAccessor;
 use kokedb_common_datafusion::utils::rename_logical_plan;
+use kokedb_common::env::get_env_as;
 use kokedb_data_source::default_registry;
+use kokedb_data_source::formats::hybrid_table::HybridTableProvider;
 use kokedb_data_source::formats::remote_table::{PostgreSQLConfig, PostgreSQLTableProvider};
 use kokedb_python_udf::udf::pyspark_unresolved_udf::PySparkUnresolvedUDF;
 use log::error;
@@ -114,24 +116,39 @@ impl PlanResolver<'_> {
                     }
                 };
 
+                let schema_name = if database.is_empty() {
+                    None
+                } else {
+                    Some(database.first().unwrap().clone())
+                };
                 let table_provider: Arc<dyn datafusion::catalog::TableProvider> = if read_remote {
-                    let schema_name = if database.is_empty() {
-                        None
-                    } else {
-                        Some(database.first().unwrap().clone())
-                    };
                     let config = PostgreSQLConfig {
-                        connection_string: dsn.unwrap(),
+                        connection_string: dsn.clone().unwrap(),
                         table_name: table_reference.table().to_string(),
                         schema_name,
                     };
                     let remote_table = PostgreSQLTableProvider::new(config).await?;
                     Arc::new(remote_table)
                 } else {
-                    default_registry()
+                    let cached = default_registry()
                         .get_format(&format)?
                         .create_provider(&self.ctx.state(), info)
-                        .await?
+                        .await?;
+                    // Opt-in cost-based routing: a big, primary-keyed cached table
+                    // is wrapped so a point-lookup scan can go to the live source.
+                    if is_cached && dsn.is_some() && get_env_as("KOKEDB_COST_BASED_ROUTING", false)
+                    {
+                        self.maybe_cost_routing_provider(
+                            cached,
+                            &reference,
+                            dsn.unwrap(),
+                            schema_name,
+                            table_reference.table(),
+                        )
+                        .await
+                    } else {
+                        cached
+                    }
                 };
 
                 let names = state.register_fields(table_provider.schema().fields());
@@ -151,6 +168,40 @@ impl PlanResolver<'_> {
             }
         };
         Ok(plan)
+    }
+
+    /// Wraps a cached table provider so point-lookup scans can route to the live
+    /// source (opt-in cost-based routing). Only wraps when the table is large
+    /// enough and has primary-key columns to route on; otherwise returns the
+    /// snapshot provider unchanged so nothing is paid for tables that can't
+    /// benefit.
+    async fn maybe_cost_routing_provider(
+        &self,
+        cached: Arc<dyn datafusion::catalog::TableProvider>,
+        reference: &[String],
+        dsn: String,
+        schema_name: Option<String>,
+        table_name: &str,
+    ) -> Arc<dyn datafusion::catalog::TableProvider> {
+        let Ok(manager) = self.ctx.extension::<CatalogManager>() else {
+            return cached;
+        };
+        let (est_rows, pk_columns) = manager
+            .get_table_routing_info(reference)
+            .await
+            .unwrap_or((None, Vec::new()));
+        let min_rows = get_env_as("KOKEDB_COST_ROUTING_MIN_ROWS", 100_000usize);
+        if pk_columns.is_empty() || est_rows.map(|n| n < min_rows).unwrap_or(true) {
+            return cached;
+        }
+        let pg_config = PostgreSQLConfig {
+            connection_string: dsn,
+            table_name: table_name.to_string(),
+            schema_name,
+        };
+        Arc::new(HybridTableProvider::new(
+            cached, pg_config, pk_columns, est_rows, min_rows,
+        ))
     }
 
     /// Whether a cached table's snapshot is older than `max_secs` and should be

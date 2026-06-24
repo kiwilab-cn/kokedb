@@ -113,6 +113,41 @@ impl CatalogManager {
         Ok(())
     }
 
+    /// Cost-routing inputs for a table: `(estimated_rows, pk_columns)` from the
+    /// sync policy. Empty/None when no policy exists yet.
+    pub async fn get_table_routing_info<T: AsRef<str>>(
+        &self,
+        table: &[T],
+    ) -> CatalogResult<(Option<usize>, Vec<String>)> {
+        let (provider, database, table) = self.resolve_object(table)?;
+        let catalog = provider.get_name();
+        let schema = database.head;
+
+        let remote_catalog = {
+            let state = self.state()?;
+            state.dynamic_catalog_list.clone()
+        };
+
+        let info = remote_catalog
+            .get_table_routing_info(catalog, &schema, &table)
+            .await
+            .map_err(|x| CatalogError::External(format!("Failed to read routing info: {x}")))?;
+
+        let Some((est_rows, pk_csv)) = info else {
+            return Ok((None, Vec::new()));
+        };
+        let rows = est_rows.filter(|n| *n >= 0).map(|n| n as usize);
+        let pk = pk_csv
+            .map(|s| {
+                s.split(',')
+                    .map(|c| c.trim().to_string())
+                    .filter(|c| !c.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((rows, pk))
+    }
+
     /// Timestamp of the table's last completed sync, or `None` if never synced.
     /// Consulted by the query-time freshness guard.
     pub async fn get_table_last_sync_at<T: AsRef<str>>(
