@@ -13,6 +13,7 @@ members = [
   "src/sql-analyzer",
   "src/server/mysql",
   "src/server/pg",
+  "src/server/kokedb",
   "src/common-datafusion",
   "src/catalog",
   "src/plan",
@@ -21,7 +22,7 @@ members = [
   "src/task-manager",
   "src/meta",
   "src/cache"]
-default-members = ["src/server/mysql"]
+default-members = ["src/server/kokedb"]
 
 
 [workspace.lints.rust]
@@ -50,6 +51,8 @@ kokedb-data-source = { path = "src/data-source" }
 kokedb-task-manager = { path = "src/task-manager" }
 kokedb-meta = { path = "src/meta" }
 kokedb-cache = { path = "src/cache" }
+kokedb-mysql-svc = { path = "src/server/mysql" }
+kokedb-pg-svc = { path = "src/server/pg" }
 
 
 

@@ -31,8 +31,8 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p kokedb-mysql-svc && \
-    cp /app/target/release/kokedb-mysql-svc /usr/local/bin/kokedb-mysql-svc
+    cargo build --release -p kokedb-server && \
+    cp /app/target/release/kokedb-server /usr/local/bin/kokedb-server
 
 # ── runtime ──────────────────────────────────────────────────────────────────
 FROM python:3.12-slim-bookworm AS runtime
@@ -47,7 +47,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/cache
 
-COPY --from=builder /usr/local/bin/kokedb-mysql-svc /usr/local/bin/kokedb-mysql-svc
+COPY --from=builder /usr/local/bin/kokedb-server /usr/local/bin/kokedb-server
 
-EXPOSE 3306
-ENTRYPOINT ["/usr/local/bin/kokedb-mysql-svc"]
+# 3306 = MySQL wire, 5433 = PostgreSQL wire, 9090 = Prometheus metrics.
+EXPOSE 3306 5433 9090
+ENTRYPOINT ["/usr/local/bin/kokedb-server"]

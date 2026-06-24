@@ -1,0 +1,25 @@
+[package]
+name = "kokedb-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kokedb-mysql-svc.workspace = true
+kokedb-pg-svc.workspace = true
+kokedb-cache.workspace = true
+kokedb-common.workspace = true
+kokedb-query.workspace = true
+
+tokio.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tokio-postgres = "0.7"
+sqlx.workspace = true
+
+[[bin]]
+path = "src/main.rs"
+name = "kokedb-server"
+
+[lints]
+workspace = true
