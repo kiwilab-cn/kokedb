@@ -13,10 +13,12 @@ use kokedb_meta::catalog_list::{
     PostgreSQLMetaCatalogProviderList, TableIncPolicy, TableSyncPolicy,
 };
 use log::{info, warn};
+use sqlx::mysql::MySqlPool;
 use sqlx::postgres::PgPool;
 
 use crate::cache_sync_task::{refresh_single_table, select_tables_for_policy};
 use crate::error::TaskError;
+use crate::mysql_incremental;
 use crate::incremental_infer::{classify, gather_facts, IncTier};
 use crate::llm::{self, LlmConfig, TableStats, TableSummary};
 use crate::table_signals::{bucket, collect_remote_signals, score, ScoreWeights};
@@ -67,37 +69,60 @@ pub async fn reevaluate_catalog(
         return Ok(());
     }
 
-    // MySQL sources don't have the PostgreSQL-specific signal queries used for
-    // adaptive cadence/incremental inference yet, so seed each selected table
-    // with a default full-sync policy (normal cadence) and skip the rest.
+    let access = meta.get_access_per_day(catalog).await.unwrap_or_default();
+    let weights = ScoreWeights::from_env();
+
+    // MySQL adaptive path: data-driven cadence from size/access signals plus a
+    // conservative incremental inference. MySQL lacks PostgreSQL's pg_stat write
+    // counters, so churn is unknown (cadence is driven by size + access), and
+    // inference only trusts a DB-enforced `ON UPDATE` watermark (-> upsert);
+    // everything else stays full. No shadow-validation pipeline is needed because
+    // an `ON UPDATE` watermark is reliable by construction.
     if kokedb_common::source::is_mysql(dsn) {
+        let pool = mysql_incremental::connect(dsn).await?;
+        let mut updated = 0usize;
         for table in &tables {
+            let access_per_day = access.get(table).copied().unwrap_or(0.0) as f64;
+            let signals = match mysql_incremental::collect_signals(&pool, table, access_per_day).await
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Skipping MySQL reeval for {catalog}.{table}: {e}");
+                    continue;
+                }
+            };
+            let b = bucket(&signals, &weights);
             let (schema, tbl) = split_schema_table(table);
             let policy = TableSyncPolicy {
-                refresh_bucket: "normal".to_string(),
-                refresh_interval_sec: 900,
-                est_row_count: None,
-                est_size_bytes: None,
+                refresh_bucket: b.as_str().to_string(),
+                refresh_interval_sec: b.interval_sec(),
+                est_row_count: Some(signals.est_rows as i64),
+                est_size_bytes: Some(signals.est_size_bytes as i64),
                 churn_per_hour: None,
-                access_per_day: None,
-                score: None,
+                access_per_day: Some(signals.access_per_day as f32),
+                score: Some(score(&signals, &weights) as f32),
             };
             if let Err(e) = meta
                 .upsert_table_sync_policy(catalog, &schema, &tbl, &policy)
                 .await
             {
-                warn!("Failed to persist default MySQL policy for {catalog}.{table}: {e}");
+                warn!("Failed to persist MySQL policy for {catalog}.{table}: {e}");
+                continue;
             }
+            if get_env_as("KOKEDB_INFER_INCREMENTAL", true) {
+                if let Err(e) =
+                    infer_and_persist_mysql(&pool, meta.as_ref(), catalog, &schema, &tbl, table)
+                        .await
+                {
+                    warn!("MySQL incremental inference failed for {catalog}.{table}: {e}");
+                }
+            }
+            updated += 1;
         }
-        info!(
-            "Adaptive reeval for MySQL catalog '{catalog}': seeded {} default policies",
-            tables.len()
-        );
+        pool.close().await;
+        info!("Adaptive reeval for MySQL catalog '{catalog}': updated {updated}/{} policies", tables.len());
         return Ok(());
     }
-
-    let access = meta.get_access_per_day(catalog).await.unwrap_or_default();
-    let weights = ScoreWeights::from_env();
 
     let pool = PgPool::connect(dsn)
         .await
@@ -146,6 +171,63 @@ pub async fn reevaluate_catalog(
     pool.close().await;
 
     info!("Adaptive reeval for catalog '{catalog}': updated {updated}/{} table policies", tables.len());
+    Ok(())
+}
+
+/// Conservative MySQL incremental inference: a DB-enforced `ON UPDATE`
+/// watermark plus a primary key yields a trusted `upsert` strategy; otherwise
+/// `full`. (No shadow-validation pipeline is needed — the `ON UPDATE` guarantee
+/// makes the watermark reliable.) A user override is never clobbered.
+async fn infer_and_persist_mysql(
+    pool: &MySqlPool,
+    meta: &PostgreSQLMetaCatalogProviderList,
+    catalog: &str,
+    schema: &str,
+    tbl: &str,
+    source_table: &str,
+) -> Result<(), TaskError> {
+    if let Ok(Some(existing)) = meta.get_table_inc_policy(catalog, schema, tbl).await {
+        if existing.source == "user" {
+            return Ok(());
+        }
+    }
+
+    let pk = mysql_incremental::detect_primary_keys(pool, source_table).await?;
+    let watermark = mysql_incremental::detect_watermark_column(pool, source_table).await?;
+
+    let inc = if !pk.is_empty() && watermark.is_some() {
+        TableIncPolicy {
+            inc_mode: "upsert".to_string(),
+            inc_status: "active".to_string(),
+            inc_tier: "trusted".to_string(),
+            watermark_column: watermark,
+            pk_columns: Some(pk.join(",")),
+            source: "rule".to_string(),
+            confidence: Some(1.0),
+            reason: Some("MySQL ON UPDATE watermark + primary key".to_string()),
+            audit_passes: 0,
+            divergence_count: 0,
+            schema_hash: None,
+        }
+    } else {
+        TableIncPolicy {
+            inc_mode: "full".to_string(),
+            inc_status: "none".to_string(),
+            inc_tier: "trusted".to_string(),
+            watermark_column: None,
+            pk_columns: (!pk.is_empty()).then(|| pk.join(",")),
+            source: "rule".to_string(),
+            confidence: Some(1.0),
+            reason: Some("no DB-enforced watermark; full sync".to_string()),
+            audit_passes: 0,
+            divergence_count: 0,
+            schema_hash: None,
+        }
+    };
+
+    meta.upsert_table_inc_policy(catalog, schema, tbl, &inc)
+        .await
+        .map_err(|e| TaskError::MetaReqeustError(format!("persist MySQL inc policy failed: {e}")))?;
     Ok(())
 }
 
