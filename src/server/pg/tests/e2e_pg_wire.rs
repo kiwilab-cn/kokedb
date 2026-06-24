@@ -1,0 +1,161 @@
+//! End-to-end test of the PostgreSQL wire server: a real libpq client
+//! (tokio-postgres) connects to the in-process server and runs DDL + queries
+//! through the same engine as the MySQL server.
+//!
+//!   KOKEDB_TEST_DSN=postgresql://postgres:123456@127.0.0.1:25433/postgres
+//!   PG_META_DSN=postgresql://postgres:123456@127.0.0.1:25433/kokedb
+//!   cargo test -p kokedb-pg-svc --test e2e_pg_wire -- --ignored --test-threads=1
+
+use std::time::Duration;
+
+use kokedb_cache::result_cache::ResultCache;
+use kokedb_pg_svc::handler::KokedbHandlers;
+use kokedb_query::context::init_shared_services;
+use pgwire::tokio::process_socket;
+use sqlx::postgres::PgPool;
+use sqlx::Row as _;
+use tokio::net::TcpListener;
+use tokio_postgres::SimpleQueryMessage;
+
+fn source_dsn() -> String {
+    std::env::var("KOKEDB_TEST_DSN")
+        .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25433/postgres".into())
+}
+fn meta_dsn() -> String {
+    std::env::var("PG_META_DSN")
+        .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25433/kokedb".into())
+}
+
+async fn clean_meta(pool: &PgPool, catalog: &str) {
+    for sql in [
+        "DELETE FROM system.catalog WHERE name = $1",
+        "DELETE FROM system.table_sync_policy WHERE catalog = $1",
+        "DELETE FROM system.table_sync_state WHERE catalog = $1",
+        "DELETE FROM system.table_arrow_schema WHERE catalog_name = $1",
+        "DELETE FROM system.cache_job WHERE catalog = $1",
+        "DELETE FROM system.database_policy WHERE catalog = $1",
+    ] {
+        let _ = sqlx::query(sql).bind(catalog).execute(pool).await;
+    }
+}
+
+async fn wait_until_cached(meta: &PgPool, catalog: &str, table: &str, timeout: Duration) -> bool {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        let row = sqlx::query(
+            "SELECT local_path FROM system.table_arrow_schema \
+             WHERE catalog_name = $1 AND table_name = $2",
+        )
+        .bind(catalog)
+        .bind(table)
+        .fetch_optional(meta)
+        .await
+        .ok()
+        .flatten();
+        if let Some(r) = row {
+            if r.try_get::<Option<String>, _>("local_path")
+                .ok()
+                .flatten()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    false
+}
+
+/// Extracts a single-column value from the first row of a simple-query result.
+fn first_value(msgs: &[SimpleQueryMessage], col: &str) -> Option<String> {
+    msgs.iter().find_map(|m| match m {
+        SimpleQueryMessage::Row(r) => r.get(col).map(|s| s.to_string()),
+        _ => None,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (source + meta)"]
+async fn pg_wire_create_catalog_and_query() {
+    let catalog = "pgwire_shop";
+    std::env::set_var("PG_META_DSN", meta_dsn());
+    std::env::set_var("KOKEDB_REEVALUATE_INTERVAL_MIN", "60");
+
+    let source = PgPool::connect(&source_dsn()).await.unwrap();
+    for stmt in [
+        "DROP TABLE IF EXISTS pgw_items",
+        "CREATE TABLE pgw_items (id int PRIMARY KEY, name text)",
+        "INSERT INTO pgw_items SELECT g, 'n' || g FROM generate_series(1, 50) g",
+    ] {
+        sqlx::query(stmt).execute(&source).await.unwrap();
+    }
+    let meta = PgPool::connect(&meta_dsn()).await.unwrap();
+    clean_meta(&meta, catalog).await;
+
+    let result_cache = ResultCache::local(64, 64).await.unwrap();
+    let shared = init_shared_services(result_cache).await.unwrap();
+    let handlers = KokedbHandlers::new(shared);
+
+    // Start the wire server on an ephemeral port.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let h = handlers.clone();
+            tokio::spawn(async move {
+                let _ = process_socket(sock, None, h).await;
+            });
+        }
+    });
+
+    // Connect a real libpq client and drive DDL + queries over the wire.
+    let conn_str = format!("host=127.0.0.1 port={} user=postgres dbname=kokedb", addr.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("connect to kokedb pg wire");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .simple_query(&format!(
+            "CREATE CATALOG {catalog} USING '{}' WITH properties(cache_policy=\"select\", \
+             table_set=\"public.pgw_items\")",
+            source_dsn()
+        ))
+        .await
+        .expect("CREATE CATALOG over pg wire");
+
+    assert!(
+        wait_until_cached(&meta, catalog, "pgw_items", Duration::from_secs(60)).await,
+        "pgw_items was not cached in time"
+    );
+
+    let total = client
+        .simple_query(&format!("SELECT count(*) AS c FROM {catalog}.public.pgw_items"))
+        .await
+        .unwrap();
+    assert_eq!(first_value(&total, "c").as_deref(), Some("50"), "row count over pg wire");
+
+    let filtered = client
+        .simple_query(&format!(
+            "SELECT count(*) AS c FROM {catalog}.public.pgw_items WHERE id <= 10"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_value(&filtered, "c").as_deref(), Some("10"), "filtered query over pg wire");
+
+    // A value query exercises text encoding of a non-aggregate column.
+    let named = client
+        .simple_query(&format!(
+            "SELECT name AS n FROM {catalog}.public.pgw_items WHERE id = 7"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_value(&named, "n").as_deref(), Some("n7"), "text column over pg wire");
+
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS pgw_items").execute(&source).await;
+}

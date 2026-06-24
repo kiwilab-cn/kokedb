@@ -1,0 +1,27 @@
+[package]
+name = "kokedb-pg-svc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kokedb-common.workspace = true
+kokedb-query.workspace = true
+kokedb-cache.workspace = true
+
+pgwire.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+datafusion.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tokio-postgres = "0.7"
+sqlx.workspace = true
+
+[[bin]]
+path = "src/main.rs"
+name = "kokedb-pg-svc"
+
+[lints]
+workspace = true
