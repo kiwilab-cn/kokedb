@@ -38,3 +38,8 @@ hex.workspace = true
 
 xxhash-rust.workspace = true
 log.workspace = true
+
+object_store.workspace = true
+url.workspace = true
+futures.workspace = true
+bytes.workspace = true

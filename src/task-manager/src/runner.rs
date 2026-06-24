@@ -7,6 +7,7 @@ use kokedb_common::{
     file::{
         cleanup_old_directories, ensure_dir_exists, get_remote_catalog_parent_local_path, TempPath,
     },
+    snapshot_store,
 };
 use kokedb_meta::{
     catalog_list::{PostgreSQLMetaCatalogProviderList, TableSyncState},
@@ -150,7 +151,8 @@ impl DataSyncExecutor {
             catalog,
             local_table.replace('.', "/"),
         );
-        let local_path = format!("{}/{}", &table_base_path, uuid::Uuid::new_v4());
+        let snap_uuid = uuid::Uuid::new_v4().to_string();
+        let local_path = format!("{}/{}", &table_base_path, snap_uuid);
         // Remove the snapshot dir if the sync fails before it is registered in the
         // meta store (disarmed once save_table_schema commits it). Prevents
         // orphaned snapshots on partial failure.
@@ -190,6 +192,24 @@ impl DataSyncExecutor {
                     pk_columns,
                 },
                 full => full,
+            }
+        } else {
+            plan
+        };
+        // Incremental merge reads back the previous snapshot; reading it from a
+        // shared object store is not supported yet, so remote snapshots always
+        // rebuild fully. (SkipUnchanged still skips — it reads nothing.)
+        let plan = if snapshot_store::is_remote() {
+            match plan {
+                SyncPlan::Incremental {
+                    watermark_column,
+                    pk_columns,
+                    ..
+                } => SyncPlan::Full {
+                    watermark_column: Some(watermark_column),
+                    pk_columns,
+                },
+                other => other,
             }
         } else {
             plan
@@ -352,12 +372,30 @@ impl DataSyncExecutor {
         };
         report(0.8);
 
+        // When a shared object store is configured, upload the finished snapshot
+        // and record its remote URI; the local directory is then just scratch
+        // that the guard removes. Otherwise the local path is what we register.
+        let table_rel = format!("{}/{}", catalog, local_table.replace('.', "/"));
+        let stored_path = if snapshot_store::is_remote() {
+            let store = snapshot_store::SnapshotStore::from_env()
+                .map_err(|e| TaskError::ExecutionFailed(e.to_string()))?
+                .ok_or_else(|| {
+                    TaskError::ExecutionFailed("remote snapshot store unavailable".to_string())
+                })?;
+            store
+                .upload_dir(&local_path, &format!("{table_rel}/{snap_uuid}"))
+                .await
+                .map_err(|e| TaskError::ExecutionFailed(format!("snapshot upload failed: {e}")))?
+        } else {
+            local_path.clone()
+        };
+
         let schema_info = SchemaTable {
             catalog: catalog.as_str(),
             schema: schema.as_str(),
             table: table.as_str(),
             arrow_schema: arrow_schema.clone(),
-            local_path: &local_path,
+            local_path: &stored_path,
         };
 
         meta.save_table_schema(&schema_info).await.map_err(|_x| {
@@ -365,8 +403,11 @@ impl DataSyncExecutor {
                 "Failed to save table schema to meta postgresql server.".to_string(),
             )
         })?;
-        // The snapshot is now registered; keep it even if later steps fail.
-        snapshot_guard.disarm();
+        // Local snapshots are kept even if later steps fail; remote ones live in
+        // the object store, so the local scratch dir is left for the guard.
+        if !snapshot_store::is_remote() {
+            snapshot_guard.disarm();
+        }
 
         // Record (or clear) the Hive partition column for the query path.
         if let Err(e) = meta
@@ -412,7 +453,16 @@ impl DataSyncExecutor {
         report(0.95);
 
         let cache_versions = get_env_as("CACHE_KEEP_NUM", 3usize);
-        if let Err(x) =
+        if snapshot_store::is_remote() {
+            if let Ok(Some(store)) = snapshot_store::SnapshotStore::from_env() {
+                if let Err(e) = store
+                    .prune_snapshots(&table_rel, cache_versions, &stored_path)
+                    .await
+                {
+                    error!("Failed to prune remote snapshots for {}: {}", &table_rel, e);
+                }
+            }
+        } else if let Err(x) =
             cleanup_old_directories(&table_base_path, cache_versions, Some(&local_path)).await
         {
             error!(
