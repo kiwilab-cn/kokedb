@@ -112,4 +112,27 @@ impl CatalogManager {
             })?;
         Ok(())
     }
+
+    /// Timestamp of the table's last completed sync, or `None` if never synced.
+    /// Consulted by the query-time freshness guard.
+    pub async fn get_table_last_sync_at<T: AsRef<str>>(
+        &self,
+        table: &[T],
+    ) -> CatalogResult<Option<chrono::DateTime<chrono::Utc>>> {
+        let (provider, database, table) = self.resolve_object(table)?;
+        let catalog = provider.get_name();
+        let schema = database.head;
+
+        let remote_catalog = {
+            let state = self.state()?;
+            state.dynamic_catalog_list.clone()
+        };
+
+        remote_catalog
+            .get_table_last_sync_at(catalog, &schema, &table)
+            .await
+            .map_err(|x| {
+                CatalogError::External(format!("Failed to read table last_sync_at: {x}"))
+            })
+    }
 }

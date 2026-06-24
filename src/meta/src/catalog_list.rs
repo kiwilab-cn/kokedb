@@ -710,6 +710,27 @@ impl PostgreSQLMetaCatalogProviderList {
     }
 
     /// Reads the persisted incremental-sync state for a table, if any.
+    /// The timestamp of the table's last completed sync (when its cached
+    /// snapshot was last written). `None` if the table has never synced. Used by
+    /// the query-time freshness guard to decide whether the snapshot is too old.
+    pub async fn get_table_last_sync_at(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let sql = "SELECT last_sync_at FROM system.table_sync_state \
+            WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
+        let row = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(row.and_then(|r| r.try_get("last_sync_at").ok()))
+    }
+
     pub async fn get_table_sync_state(
         &self,
         catalog: &str,

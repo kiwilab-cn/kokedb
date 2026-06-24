@@ -33,6 +33,10 @@ pub struct PlanConfig<F: ?Sized = dyn PlanFormatter> {
     pub default_warehouse_directory: String,
     pub session_user_id: String,
     pub ansi_mode: bool,
+    /// Per-query freshness requirement, in seconds. When set, a cached table
+    /// whose snapshot is older than this is read live from its source instead
+    /// of from the (stale) snapshot. `None` (the default) serves cache as-is.
+    pub max_staleness_secs: Option<u64>,
 }
 
 impl PlanConfig {
@@ -56,6 +60,7 @@ impl Default for PlanConfig {
             default_warehouse_directory: "spark-warehouse".to_string(),
             session_user_id: "kokedb".to_string(),
             ansi_mode: false,
+            max_staleness_secs: None,
         }
     }
 }

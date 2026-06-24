@@ -87,6 +87,9 @@ struct CoreContex {
     meta: Arc<PostgreSQLMetaCatalogProviderList>,
     /// Shared SQL-text -> parsed-plan cache (process-wide).
     plan_cache: PlanCache,
+    /// Per-connection freshness requirement (seconds) set via
+    /// `SET kokedb_max_staleness = N`. 0/None means serve cache as-is.
+    session_max_staleness: Option<u64>,
     /// Per-connection prepared statement registry, keyed by statement id.
     prepared: HashMap<u32, PreparedStatement>,
     /// Monotonic statement id generator for this connection.
@@ -109,6 +112,7 @@ impl CoreContex {
             sf,
             meta,
             plan_cache,
+            session_max_staleness: None,
             prepared: HashMap::new(),
             next_stmt_id: 1,
         }
@@ -221,6 +225,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
             self.sf.clone(),
             self.meta.clone(),
             self.plan_cache.clone(),
+            self.session_max_staleness,
             &sql,
             results,
         )
@@ -272,12 +277,19 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         sql: &'a str,
         results: QueryResultWriter<'a, W>,
     ) -> Result<(), MysqlServerError> {
+        // `SET kokedb_max_staleness = N` is a kokedb session knob, not a real
+        // query: store it on the connection and acknowledge.
+        if let Some(secs) = parse_set_max_staleness(sql) {
+            self.session_max_staleness = if secs == 0 { None } else { Some(secs) };
+            return reply_ok(results, "kokedb_max_staleness set").await;
+        }
         run_query(
             self.ctx.clone(),
             self.cache.clone(),
             self.sf.clone(),
             self.meta.clone(),
             self.plan_cache.clone(),
+            self.session_max_staleness,
             sql,
             results,
         )
@@ -293,11 +305,18 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     sf: Arc<singleflight::Singleflight>,
     meta: Arc<PostgreSQLMetaCatalogProviderList>,
     plan_cache: PlanCache,
+    session_max_staleness: Option<u64>,
     sql: &str,
     results: QueryResultWriter<'_, W>,
 ) -> Result<(), MysqlServerError> {
     let instant = std::time::Instant::now();
     metrics::inc_queries();
+
+    // A per-query `/*+ max_staleness(N) */` hint overrides the session value.
+    // 0 (either source) means "no freshness requirement", treated as None.
+    let max_staleness = parse_staleness_hint(sql)
+        .or(session_max_staleness)
+        .filter(|&s| s > 0);
 
     // Step 1: Parse SQL and generate plan
     let (plan, cache_key) = match parse_sql_and_get_plan(&plan_cache, sql) {
@@ -308,7 +327,9 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     };
 
     // Step 2: Get batch stream from cache or query
-    let mut batch_stream = match get_batch_stream(&cache, &sf, ctx, &plan, cache_key).await {
+    let mut batch_stream = match get_batch_stream(&cache, &sf, ctx, &plan, cache_key, max_staleness)
+        .await
+    {
         Ok(stream) => stream,
         Err(error_msg) => {
             return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
@@ -571,6 +592,45 @@ fn should_cache_plan(plan: &Plan) -> bool {
     matches!(plan, Plan::Query(_))
 }
 
+/// Recognizes `SET kokedb_max_staleness = N` (optionally `SET SESSION ...`,
+/// trailing `;`, quoted value) and returns N seconds. Any other statement
+/// returns None so it flows through the normal query path.
+fn parse_set_max_staleness(sql: &str) -> Option<u64> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let lower = s.to_ascii_lowercase();
+    let rest = lower.strip_prefix("set ")?.trim_start();
+    let rest = rest.strip_prefix("session ").unwrap_or(rest).trim_start();
+    let after = rest.strip_prefix("kokedb_max_staleness")?.trim_start();
+    let value = after.strip_prefix('=')?.trim();
+    let value = value.trim_matches(|c| c == '\'' || c == '"').trim();
+    value.parse::<u64>().ok()
+}
+
+/// Extracts the seconds from a `/*+ max_staleness(N) */` query hint, if present.
+fn parse_staleness_hint(sql: &str) -> Option<u64> {
+    let lower = sql.to_ascii_lowercase();
+    let key = "max_staleness(";
+    let start = lower.find(key)? + key.len();
+    let rel_end = sql[start..].find(')')?;
+    sql[start..start + rel_end].trim().parse::<u64>().ok()
+}
+
+/// Sends an empty-result OK packet with an info message (used for accepted
+/// session-control statements like `SET kokedb_max_staleness`).
+async fn reply_ok<W: AsyncWrite + Unpin>(
+    results: QueryResultWriter<'_, W>,
+    info: &str,
+) -> Result<(), MysqlServerError> {
+    let writer = results
+        .start(&[])
+        .await
+        .map_err(|e| MysqlServerError::CreateMysqlResultWriterError(e.to_string()))?;
+    writer
+        .finish_with_info(info)
+        .await
+        .map_err(|e| MysqlServerError::WriteMysqlResultError(e.to_string()))
+}
+
 fn spawn_cache_task(
     cache: Cache,
     cache_key: CacheKey,
@@ -611,14 +671,17 @@ async fn execute_query_with_cache(
     cache_key: CacheKey,
     cache: Cache,
     owner: Option<singleflight::OwnerGuard>,
+    max_staleness: Option<u64>,
 ) -> Result<BatchStream, String> {
     info!("Not hitted cache, execute query from kokedb");
     // On error the `owner` guard drops here, releasing any single-flight waiters.
-    let query_stream = query(ctx, plan, cache_key)
+    let query_stream = query(ctx, plan, cache_key, max_staleness)
         .await
         .map_err(|e| format!("Query execution error: {}", e))?;
 
-    if !should_cache_plan(plan) {
+    // Don't cache a result produced under a freshness requirement: it may have
+    // read tables live, and the cache has no notion of result age.
+    if !should_cache_plan(plan) || max_staleness.is_some() {
         return Ok(query_stream);
     }
 
@@ -656,10 +719,16 @@ async fn get_batch_stream(
     ctx: Arc<Context>,
     plan: &Plan,
     cache_key: CacheKey,
+    max_staleness: Option<u64>,
 ) -> Result<BatchStream, String> {
-    if !should_cache_plan(plan) {
-        // Commands and non-cacheable plans bypass the cache entirely.
-        return execute_query_with_cache(ctx, plan, cache_key, cache.clone(), None).await;
+    // A freshness-demanding query must not read a possibly-stale cached result
+    // (cached results carry no age), nor pollute the cache with a result whose
+    // tables were routed live. Bypass the result cache entirely; the staleness
+    // value flows on into per-table routing.
+    if !should_cache_plan(plan) || max_staleness.is_some() {
+        // Commands, non-cacheable plans, and fresh-required queries bypass cache.
+        return execute_query_with_cache(ctx, plan, cache_key, cache.clone(), None, max_staleness)
+            .await;
     }
 
     loop {
@@ -674,8 +743,15 @@ async fn get_batch_stream(
                 // moved into the cache-writer task so waiters are released once
                 // the result is cached (or immediately if execution fails).
                 metrics::inc_cache_miss();
-                return execute_query_with_cache(ctx, plan, cache_key, cache.clone(), Some(guard))
-                    .await;
+                return execute_query_with_cache(
+                    ctx,
+                    plan,
+                    cache_key,
+                    cache.clone(),
+                    Some(guard),
+                    max_staleness,
+                )
+                .await;
             }
             singleflight::Claim::Waiter(notify) => {
                 // Register the wakeup before re-checking the cache to avoid a
@@ -807,6 +883,34 @@ async fn write_batch_to_mysql<'a, W: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_set_max_staleness() {
+        assert_eq!(parse_set_max_staleness("SET kokedb_max_staleness = 60"), Some(60));
+        assert_eq!(parse_set_max_staleness("set  kokedb_max_staleness=0;"), Some(0));
+        assert_eq!(
+            parse_set_max_staleness("SET SESSION kokedb_max_staleness = '120'"),
+            Some(120)
+        );
+        // Unrelated SET statements must pass through (None).
+        assert_eq!(parse_set_max_staleness("SET autocommit = 1"), None);
+        assert_eq!(parse_set_max_staleness("SET NAMES utf8mb4"), None);
+        assert_eq!(parse_set_max_staleness("SELECT 1"), None);
+    }
+
+    #[test]
+    fn parses_staleness_hint() {
+        assert_eq!(
+            parse_staleness_hint("SELECT /*+ max_staleness(30) */ * FROM t"),
+            Some(30)
+        );
+        assert_eq!(
+            parse_staleness_hint("select /*+ MAX_STALENESS( 5 ) */ a from t"),
+            Some(5)
+        );
+        // No hint -> None (default cache behavior).
+        assert_eq!(parse_staleness_hint("SELECT * FROM t"), None);
+    }
 
     #[test]
     fn counts_placeholders_outside_quotes() {

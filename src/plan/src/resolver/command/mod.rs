@@ -22,6 +22,18 @@ mod write;
 mod write_v1;
 mod write_v2;
 
+/// kokedb caches read-only snapshots of source tables; mutating a cached table
+/// here would corrupt the snapshot (and never reach the source). DML must go to
+/// the source database, which the cache then picks up on its next sync. This is
+/// the single, intentional rejection message for all table-targeting DML.
+pub(crate) fn write_not_supported(op: &str) -> PlanError {
+    PlanError::unsupported(format!(
+        "{op} is not supported: kokedb is a read-only query accelerator. \
+         Run the write against the source database directly; the cached \
+         snapshot refreshes automatically."
+    ))
+}
+
 impl PlanResolver<'_> {
     pub(super) async fn resolve_command_plan(
         &self,
@@ -263,12 +275,12 @@ impl PlanResolver<'_> {
                 )
                 .await
             }
-            CommandNode::MergeInto { .. } => Err(PlanError::todo("CommandNode::MergeInto")),
+            CommandNode::MergeInto { .. } => Err(write_not_supported("MERGE")),
             CommandNode::SetVariable { variable, value } => {
                 self.resolve_command_set_variable(variable, value).await
             }
-            CommandNode::Update { .. } => Err(PlanError::todo("CommandNode::Update")),
-            CommandNode::Delete { .. } => Err(PlanError::todo("CommandNode::Delete")),
+            CommandNode::Update { .. } => Err(write_not_supported("UPDATE")),
+            CommandNode::Delete { .. } => Err(write_not_supported("DELETE")),
             CommandNode::AlterTable { .. } => Err(PlanError::todo("CommandNode::AlterTable")),
             CommandNode::AlterView { .. } => Err(PlanError::todo("CommandNode::AlterView")),
             CommandNode::LoadData { .. } => Err(PlanError::todo("CommandNode::LoadData")),

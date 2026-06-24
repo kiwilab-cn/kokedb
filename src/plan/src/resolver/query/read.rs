@@ -100,8 +100,21 @@ impl PlanResolver<'_> {
                     ],
                 };
 
-                // TODO: should added field to dispatch remote / local catalog;
-                let table_provider = if !is_cached && dsn.is_some() {
+                // Route to the live source when the table isn't cached, or when
+                // it IS cached but the caller demanded freshness this query
+                // (`max_staleness_secs`) and the snapshot is older than that.
+                let read_remote = if !is_cached {
+                    dsn.is_some()
+                } else {
+                    match self.config.max_staleness_secs {
+                        Some(max) if dsn.is_some() => {
+                            self.cached_snapshot_is_stale(&reference, max).await
+                        }
+                        _ => false,
+                    }
+                };
+
+                let table_provider: Arc<dyn datafusion::catalog::TableProvider> = if read_remote {
                     let schema_name = if database.is_empty() {
                         None
                     } else {
@@ -138,6 +151,28 @@ impl PlanResolver<'_> {
             }
         };
         Ok(plan)
+    }
+
+    /// Whether a cached table's snapshot is older than `max_secs` and should be
+    /// read live instead. A never-synced table counts as stale (no trustworthy
+    /// snapshot). If the timestamp can't be read (e.g. meta hiccup) we keep
+    /// serving the snapshot rather than stampede the source.
+    async fn cached_snapshot_is_stale(&self, reference: &[String], max_secs: u64) -> bool {
+        let manager = match self.ctx.extension::<CatalogManager>() {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        match manager.get_table_last_sync_at(reference).await {
+            Ok(Some(last_sync_at)) => {
+                let age = chrono::Utc::now().signed_duration_since(last_sync_at);
+                age.num_seconds() > max_secs as i64
+            }
+            Ok(None) => true,
+            Err(e) => {
+                error!("Freshness check failed for {reference:?}, serving snapshot: {e}");
+                false
+            }
+        }
     }
 
     pub(super) async fn resolve_query_read_udtf(

@@ -35,10 +35,37 @@ async fn run(shared: &SharedServices, sql: &str) -> Vec<RecordBatch> {
     let ctx = Arc::new(create_session_context(shared).expect("session ctx"));
     let plan = parser(sql).unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
     let key = get_plan_hash(&plan).unwrap();
-    let stream = query(ctx, &plan, key)
+    let stream = query(ctx, &plan, key, None)
         .await
         .unwrap_or_else(|e| panic!("exec `{sql}`: {e}"));
     stream.try_collect().await.expect("collect")
+}
+
+/// Like `run`, but with a freshness requirement (seconds): a cached table whose
+/// snapshot is older than `secs` is read live from its source instead.
+async fn run_fresh(shared: &SharedServices, sql: &str, secs: u64) -> Vec<RecordBatch> {
+    use futures::TryStreamExt;
+    let ctx = Arc::new(create_session_context(shared).expect("session ctx"));
+    let plan = parser(sql).unwrap_or_else(|e| panic!("parse `{sql}`: {e}"));
+    let key = get_plan_hash(&plan).unwrap();
+    let stream = query(ctx, &plan, key, Some(secs))
+        .await
+        .unwrap_or_else(|e| panic!("exec `{sql}`: {e}"));
+    stream.try_collect().await.expect("collect")
+}
+
+/// Runs a statement expected to be rejected, returning the error text.
+async fn run_expect_err(shared: &SharedServices, sql: &str) -> String {
+    let ctx = Arc::new(create_session_context(shared).expect("session ctx"));
+    let plan = match parser(sql) {
+        Ok(p) => p,
+        Err(e) => return e.to_string(),
+    };
+    let key = get_plan_hash(&plan).unwrap();
+    match query(ctx, &plan, key, None).await {
+        Ok(_) => panic!("expected `{sql}` to be rejected, but it succeeded"),
+        Err(e) => e.to_string(),
+    }
 }
 
 fn scalar_count(batches: &[RecordBatch]) -> i64 {
@@ -258,6 +285,57 @@ async fn intelligent_sync_end_to_end() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     assert!(updated, "manual refresh did not pick up the 50 new orders");
+
+    // 5a-fresh. Query-time freshness guard. Add rows to the SOURCE only, so the
+    // cached snapshot (350) trails the live table (360).
+    sqlx::query(
+        "INSERT INTO e2e_orders(id, amount, status) \
+         SELECT g, (g*1.5)::numeric, 'fresh' FROM generate_series(351, 360) g",
+    )
+    .execute(&source)
+    .await
+    .unwrap();
+
+    // No freshness requirement -> the cached snapshot is served (still 350).
+    let cached = run(&shared, &format!("SELECT count(id) FROM {catalog}.public.e2e_orders")).await;
+    assert_eq!(scalar_count(&cached), 350, "default path serves the cached snapshot");
+
+    // Make the snapshot look old, then demand freshness -> read live (360).
+    sqlx::query(
+        "UPDATE system.table_sync_state SET last_sync_at = now() - interval '1 hour' \
+         WHERE catalog=$1 AND schema_name='public' AND table_name='e2e_orders'",
+    )
+    .bind(catalog)
+    .execute(&meta)
+    .await
+    .unwrap();
+    let fresh = run_fresh(
+        &shared,
+        &format!("SELECT count(id) FROM {catalog}.public.e2e_orders"),
+        1,
+    )
+    .await;
+    assert_eq!(scalar_count(&fresh), 360, "freshness-demanding query reads the live source");
+
+    // Restore the source so the later fixed-count assertions hold.
+    sqlx::query("DELETE FROM e2e_orders WHERE id > 350")
+        .execute(&source)
+        .await
+        .unwrap();
+
+    // 5a-writes. DML against a cached source table is rejected with a clear,
+    // actionable message instead of corrupting the snapshot or silently no-oping.
+    for dml in [
+        format!("UPDATE {catalog}.public.e2e_orders SET status='x' WHERE id = 1"),
+        format!("DELETE FROM {catalog}.public.e2e_orders WHERE id = 1"),
+        format!("INSERT INTO {catalog}.public.e2e_orders (id, amount, status) VALUES (9999, 1.0, 'x')"),
+    ] {
+        let err = run_expect_err(&shared, &dml).await;
+        assert!(
+            err.contains("read-only query accelerator"),
+            "DML `{dml}` should be rejected with the accelerator message, got: {err}"
+        );
+    }
 
     // 5b. Catalog-wide refresh queues every selected table.
     let cat_refresh = run(&shared, &format!("REFRESH CACHE FROM CATALOG {catalog}")).await;
