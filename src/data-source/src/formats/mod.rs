@@ -3,6 +3,7 @@ pub mod avro;
 pub mod csv;
 pub mod hybrid_table;
 pub mod json;
+pub mod mysql_table;
 pub mod listing;
 pub mod parquet;
 pub mod remote_table;

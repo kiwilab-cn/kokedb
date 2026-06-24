@@ -12,8 +12,10 @@ use kokedb_common_datafusion::datasource::SourceInfo;
 use kokedb_common_datafusion::extension::SessionExtensionAccessor;
 use kokedb_common_datafusion::utils::rename_logical_plan;
 use kokedb_common::env::get_env_as;
+use kokedb_common::source::is_mysql;
 use kokedb_data_source::default_registry;
 use kokedb_data_source::formats::hybrid_table::HybridTableProvider;
+use kokedb_data_source::formats::mysql_table::{MySqlTableProvider, MysqlConfig};
 use kokedb_data_source::formats::remote_table::{PostgreSQLConfig, PostgreSQLTableProvider};
 use kokedb_python_udf::udf::pyspark_unresolved_udf::PySparkUnresolvedUDF;
 use log::error;
@@ -121,14 +123,29 @@ impl PlanResolver<'_> {
                 } else {
                     Some(database.first().unwrap().clone())
                 };
+                let dsn_is_mysql = dsn.as_deref().map(is_mysql).unwrap_or(false);
                 let table_provider: Arc<dyn datafusion::catalog::TableProvider> = if read_remote {
-                    let config = PostgreSQLConfig {
-                        connection_string: dsn.clone().unwrap(),
-                        table_name: table_reference.table().to_string(),
-                        schema_name,
-                    };
-                    let remote_table = PostgreSQLTableProvider::new(config).await?;
-                    Arc::new(remote_table)
+                    let connection_string = dsn.clone().unwrap();
+                    let table_name = table_reference.table().to_string();
+                    if dsn_is_mysql {
+                        Arc::new(
+                            MySqlTableProvider::new(MysqlConfig {
+                                connection_string,
+                                table_name,
+                                schema_name,
+                            })
+                            .await?,
+                        )
+                    } else {
+                        Arc::new(
+                            PostgreSQLTableProvider::new(PostgreSQLConfig {
+                                connection_string,
+                                table_name,
+                                schema_name,
+                            })
+                            .await?,
+                        )
+                    }
                 } else {
                     let cached = default_registry()
                         .get_format(&format)?
@@ -136,7 +153,11 @@ impl PlanResolver<'_> {
                         .await?;
                     // Opt-in cost-based routing: a big, primary-keyed cached table
                     // is wrapped so a point-lookup scan can go to the live source.
-                    if is_cached && dsn.is_some() && get_env_as("KOKEDB_COST_BASED_ROUTING", false)
+                    // Only for PostgreSQL sources for now.
+                    if is_cached
+                        && dsn.is_some()
+                        && !dsn_is_mysql
+                        && get_env_as("KOKEDB_COST_BASED_ROUTING", false)
                     {
                         self.maybe_cost_routing_provider(
                             cached,

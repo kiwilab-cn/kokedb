@@ -19,7 +19,8 @@ use sqlx::PgPool;
 use crate::{
     error::TaskError,
     incremental,
-    read_postgres::{convert_postgres_to_parquet, PostgresToParquetConverter},
+    read_mysql::convert_remote_to_parquet,
+    read_postgres::PostgresToParquetConverter,
     task_manager::CacheTableTaskConfig,
 };
 
@@ -173,7 +174,16 @@ impl DataSyncExecutor {
         let partition_by = meta.get_catalog_partition_by(catalog).await.ok().flatten();
 
         // Decide full vs incremental vs skip from detected metadata + state.
-        let plan = plan_sync(&dsn, source_table, catalog, &schema, &table, &meta).await?;
+        // MySQL sources use full sync only (incremental signal detection is
+        // PostgreSQL-specific), so skip the PG-only planner for them.
+        let plan = if kokedb_common::source::is_mysql(&dsn) {
+            SyncPlan::Full {
+                watermark_column: None,
+                pk_columns: vec![],
+            }
+        } else {
+            plan_sync(&dsn, source_table, catalog, &schema, &table, &meta).await?
+        };
         // Partitioned tables are always rebuilt fully (incremental + partitioned
         // merge is not supported); reuse the columns already detected.
         let plan = if partition_by.is_some() {
@@ -249,7 +259,7 @@ impl DataSyncExecutor {
                         let flat = format!("/tmp/kokedb-flat/{}", uuid::Uuid::new_v4());
                         // Cleaned up on any exit from this arm (incl. early error).
                         let _flat_guard = TempPath::new(&flat);
-                        let schema = convert_postgres_to_parquet(
+                        let schema = convert_remote_to_parquet(
                             &dsn,
                             source_table,
                             &flat,
@@ -283,7 +293,7 @@ impl DataSyncExecutor {
                         }
                         schema
                     }
-                    None => convert_postgres_to_parquet(
+                    None => convert_remote_to_parquet(
                         &dsn,
                         source_table,
                         &local_path,

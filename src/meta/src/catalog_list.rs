@@ -1504,8 +1504,18 @@ impl PostgreSQLMetaCatalogProviderList {
             tokio::runtime::Handle::current().block_on(async {
                 // Validate the DSN by actually connecting before persisting, so a
                 // bad DSN fails CREATE CATALOG instead of leaving a broken entry.
-                let probe = PgPool::connect(dsn).await?;
-                probe.close().await;
+                // Use the right driver for the source so a MySQL DSN isn't probed
+                // with a PostgreSQL client.
+                match kokedb_common::source::source_kind(dsn) {
+                    kokedb_common::source::SourceKind::Mysql => {
+                        let probe = sqlx::mysql::MySqlPool::connect(dsn).await?;
+                        probe.close().await;
+                    }
+                    kokedb_common::source::SourceKind::Postgres => {
+                        let probe = PgPool::connect(dsn).await?;
+                        probe.close().await;
+                    }
+                }
 
                 sqlx::query(insert_sql)
                     .bind(catalog)
@@ -1801,7 +1811,17 @@ impl CatalogProviderList for PostgreSQLMetaCatalogProviderList {
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 if let Ok(catalog_info) = self.get_catalog(name).await {
-                    if let Ok(remote_pool) = PgPool::connect(&catalog_info.dsn).await {
+                    // The provider's `remote_pool` is a PostgreSQL-typed pool used
+                    // for live source listing / uncached reads. MySQL sources
+                    // resolve cached tables entirely from the meta store, so reuse
+                    // the meta pool as an unused placeholder rather than connecting
+                    // a PostgreSQL client to MySQL (which would fail).
+                    let remote_pool = if kokedb_common::source::is_mysql(&catalog_info.dsn) {
+                        Some(self.local_pool.clone())
+                    } else {
+                        PgPool::connect(&catalog_info.dsn).await.ok()
+                    };
+                    if let Some(remote_pool) = remote_pool {
                         let provider: Arc<dyn CatalogProvider> = Arc::new(
                             PostgreSQLCatalogProvider::new(
                                 catalog_info,
