@@ -196,24 +196,6 @@ impl DataSyncExecutor {
         } else {
             plan
         };
-        // Incremental merge reads back the previous snapshot; reading it from a
-        // shared object store is not supported yet, so remote snapshots always
-        // rebuild fully. (SkipUnchanged still skips — it reads nothing.)
-        let plan = if snapshot_store::is_remote() {
-            match plan {
-                SyncPlan::Incremental {
-                    watermark_column,
-                    pk_columns,
-                    ..
-                } => SyncPlan::Full {
-                    watermark_column: Some(watermark_column),
-                    pk_columns,
-                },
-                other => other,
-            }
-        } else {
-            plan
-        };
         report(0.1);
 
         // Tracks the partition column actually used (persisted after the schema).

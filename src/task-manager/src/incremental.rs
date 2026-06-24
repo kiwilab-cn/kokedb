@@ -489,6 +489,86 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(base.as_path());
     }
+
+    // Incremental merge must read its previous snapshot from a shared object
+    // store, not just local disk. Uploads an "old" snapshot to the store, then
+    // merges a local delta against it and checks delta-wins semantics.
+    #[tokio::test]
+    #[ignore = "requires MinIO + KOKEDB_SNAPSHOT_URI (object-store snapshots)"]
+    async fn merge_reads_previous_snapshot_from_object_store() {
+        use super::{merge_snapshot, scalar_count};
+        use datafusion::catalog::TableProvider;
+        use kokedb_common::snapshot_store::SnapshotStore;
+
+        let base = std::env::temp_dir().join("kokedb-inc-s3-test");
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let old_local = base.join("old").to_string_lossy().to_string();
+        let delta_local = base.join("delta").to_string_lossy().to_string();
+        let new_local = base.join("new").to_string_lossy().to_string();
+
+        // old: id 0..100, v = id ; delta: id 95..105, v = id + 1000.
+        let ctx = SessionContext::new();
+        ctx.sql("SELECT value AS id, value AS v FROM range(0, 100)")
+            .await
+            .unwrap()
+            .write_parquet(&old_local, DataFrameWriteOptions::new(), None)
+            .await
+            .unwrap();
+        ctx.sql("SELECT value AS id, value + 1000 AS v FROM range(95, 105)")
+            .await
+            .unwrap()
+            .write_parquet(&delta_local, DataFrameWriteOptions::new(), None)
+            .await
+            .unwrap();
+
+        // Upload the previous snapshot to the object store; merge reads it back.
+        let store = SnapshotStore::from_env()
+            .unwrap()
+            .expect("KOKEDB_SNAPSHOT_URI must point at the object store");
+        let old_uri = store.upload_dir(&old_local, "test/inc/old-uuid").await.unwrap();
+        assert!(old_uri.contains("://"), "old snapshot should be a remote URI");
+
+        let infer = SessionContext::new();
+        let cfg = ListingTableConfig::new(ListingTableUrl::parse(&old_local).unwrap())
+            .with_listing_options(ListingOptions::new(Arc::new(ParquetFormat::default())))
+            .infer_schema(&infer.state())
+            .await
+            .unwrap();
+        let schema = ListingTable::try_new(cfg).unwrap().schema();
+
+        merge_snapshot(
+            &old_uri,
+            &delta_local,
+            &new_local,
+            &["id".to_string()],
+            schema,
+            Some("id"),
+        )
+        .await
+        .unwrap();
+
+        let q = SessionContext::new();
+        q.register_parquet("m", &new_local, ParquetReadOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            scalar_count(&q, "SELECT count(*) FROM m").await.unwrap(),
+            105,
+            "merged rows = 100 old + 5 new inserts (overlap deduped)"
+        );
+        assert_eq!(
+            scalar_count(&q, "SELECT v FROM m WHERE id = 99").await.unwrap(),
+            1099,
+            "delta supersedes the old row for an overlapping id"
+        );
+        assert_eq!(
+            scalar_count(&q, "SELECT v FROM m WHERE id = 50").await.unwrap(),
+            50,
+            "non-overlapping old row is retained from the remote snapshot"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+    }
 }
 
 /// Rewrites a flat snapshot into a Hive-partitioned layout (`out_path/{col}=v/…`)
@@ -523,6 +603,22 @@ async fn register_parquet_dir(
     path: &str,
     schema: Arc<Schema>,
 ) -> Result<(), TaskError> {
+    // A snapshot that lives in a shared object store needs its store registered
+    // in this context before the URL can be resolved. Local paths are untouched.
+    if path.contains("://") && !path.starts_with("file://") {
+        match kokedb_common::snapshot_store::SnapshotStore::from_env() {
+            Ok(Some(store)) => {
+                let (url, object_store) = store.for_registration();
+                ctx.runtime_env().register_object_store(&url, object_store);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                return Err(TaskError::ExecutionFailed(format!(
+                    "failed to init snapshot store for {path}: {e}"
+                )));
+            }
+        }
+    }
     let url = ListingTableUrl::parse(path)
         .map_err(|e| TaskError::ExecutionFailed(format!("invalid listing path {path}: {e}")))?;
     let options = ListingOptions::new(Arc::new(ParquetFormat::default()));
