@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use datafusion::catalog::CatalogProviderList;
-use kokedb_cache::foyer_hybrid::LruResultCache;
+use kokedb_cache::result_cache::ResultCache;
 use kokedb_common_datafusion::extension::SessionExtension;
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_task_manager::task_manager::TaskManager;
@@ -24,7 +24,7 @@ pub mod view;
 /// Each catalog has a name and a corresponding [`CatalogProvider`] instance.
 pub struct CatalogManager {
     state: Arc<Mutex<CatalogManagerState>>,
-    pub result_cache: LruResultCache,
+    pub result_cache: ResultCache,
     pub(super) temporary_views: TemporaryViewManager,
     /// Maps a catalog name to its scheduled sync job id, so `DROP CATALOG` can
     /// stop the background job it started.
@@ -49,7 +49,7 @@ pub struct CatalogManagerOptions {
     /// Shared map of catalog name -> scheduled sync job id. Shared across all
     /// per-connection managers since the scheduler itself is a singleton.
     pub scheduler_jobs: Arc<Mutex<HashMap<String, uuid::Uuid>>>,
-    pub result_cache: LruResultCache,
+    pub result_cache: ResultCache,
     pub default_catalog: String,
     pub default_database: Vec<String>,
     pub global_temporary_database: Vec<String>,

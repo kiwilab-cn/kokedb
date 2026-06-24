@@ -13,7 +13,7 @@ use datafusion::{
     physical_plan::stream::RecordBatchStreamAdapter, prelude::SessionContext,
 };
 use futures::StreamExt;
-use kokedb_cache::foyer_hybrid::LruResultCache;
+use kokedb_cache::result_cache::ResultCache;
 use kokedb_common::{hash::get_plan_hash, opentelemetry::init_logger, spec::Plan};
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_query::{
@@ -77,7 +77,7 @@ struct PreparedStatement {
 
 struct CoreContex {
     ctx: Arc<SessionContext>,
-    cache: LruResultCache,
+    cache: ResultCache,
     /// Optional auth credentials shared across connections (read once at startup).
     auth: Option<Arc<AuthConfig>>,
     /// Process-wide single-flight registry for cache-miss de-duplication.
@@ -99,7 +99,7 @@ struct CoreContex {
 impl CoreContex {
     fn new(
         ctx: Arc<SessionContext>,
-        cache: LruResultCache,
+        cache: ResultCache,
         auth: Option<Arc<AuthConfig>>,
         sf: Arc<singleflight::Singleflight>,
         meta: Arc<PostgreSQLMetaCatalogProviderList>,
@@ -122,7 +122,7 @@ impl CoreContex {
 // Type aliases for clarity
 type CacheKey = u128;
 type BatchStream = std::pin::Pin<Box<dyn RecordBatchStream + Send>>;
-type Cache = LruResultCache;
+type Cache = ResultCache;
 type Context = datafusion::prelude::SessionContext;
 
 #[async_trait::async_trait]
@@ -548,7 +548,7 @@ fn quote_sql_string(s: &str) -> String {
 
 // Try to retrieve result from cache
 async fn try_get_from_cache(cache: &Cache, cache_key: CacheKey) -> Option<BatchStream> {
-    if !cache.inner.contains(&cache_key) {
+    if !cache.contains(cache_key).await {
         info!("Cache miss for key: {}, querying from kokedb.", cache_key);
         return None;
     }
@@ -1054,7 +1054,7 @@ async fn main() -> Result<(), MysqlServerError> {
         tokio::spawn(metrics::serve_metrics(metrics_addr));
     }
 
-    let result_cache = LruResultCache::new(2000, 40000).await?;
+    let result_cache = ResultCache::from_env(2000, 40000).await?;
     // Heavy services (meta store, task manager, scheduler, sync jobs) are created
     // once and shared; each connection gets its own lightweight session context.
     let shared = init_shared_services(result_cache.clone()).await.unwrap();
