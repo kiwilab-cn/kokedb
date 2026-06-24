@@ -9,6 +9,7 @@ pub mod object;
 pub mod opentelemetry;
 pub mod redact;
 pub mod snapshot_store;
+pub mod source;
 pub mod spec;
 pub mod string;
 pub mod table;

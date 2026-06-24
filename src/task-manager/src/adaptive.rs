@@ -67,6 +67,35 @@ pub async fn reevaluate_catalog(
         return Ok(());
     }
 
+    // MySQL sources don't have the PostgreSQL-specific signal queries used for
+    // adaptive cadence/incremental inference yet, so seed each selected table
+    // with a default full-sync policy (normal cadence) and skip the rest.
+    if kokedb_common::source::is_mysql(dsn) {
+        for table in &tables {
+            let (schema, tbl) = split_schema_table(table);
+            let policy = TableSyncPolicy {
+                refresh_bucket: "normal".to_string(),
+                refresh_interval_sec: 900,
+                est_row_count: None,
+                est_size_bytes: None,
+                churn_per_hour: None,
+                access_per_day: None,
+                score: None,
+            };
+            if let Err(e) = meta
+                .upsert_table_sync_policy(catalog, &schema, &tbl, &policy)
+                .await
+            {
+                warn!("Failed to persist default MySQL policy for {catalog}.{table}: {e}");
+            }
+        }
+        info!(
+            "Adaptive reeval for MySQL catalog '{catalog}': seeded {} default policies",
+            tables.len()
+        );
+        return Ok(());
+    }
+
     let access = meta.get_access_per_day(catalog).await.unwrap_or_default();
     let weights = ScoreWeights::from_env();
 
