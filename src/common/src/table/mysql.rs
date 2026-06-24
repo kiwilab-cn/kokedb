@@ -170,12 +170,19 @@ pub fn build_array_from_mysql_rows(
             ))
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let vals = col::<NaiveDateTime>(rows, idx)?;
-            Arc::new(TimestampMicrosecondArray::from(
-                vals.into_iter()
+            // MySQL DATETIME decodes as NaiveDateTime; TIMESTAMP as DateTime<Utc>.
+            // Both map to UTC microseconds; try naive first, fall back to UTC.
+            let micros: Vec<Option<i64>> = match col::<NaiveDateTime>(rows, idx) {
+                Ok(vals) => vals
+                    .into_iter()
                     .map(|d| d.map(|d| d.and_utc().timestamp_micros()))
-                    .collect::<Vec<_>>(),
-            ))
+                    .collect(),
+                Err(_) => col::<chrono::DateTime<chrono::Utc>>(rows, idx)?
+                    .into_iter()
+                    .map(|d| d.map(|d| d.timestamp_micros()))
+                    .collect(),
+            };
+            Arc::new(TimestampMicrosecondArray::from(micros))
         }
         DataType::Time64(TimeUnit::Microsecond) => {
             let vals = col::<NaiveTime>(rows, idx)?;

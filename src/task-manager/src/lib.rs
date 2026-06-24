@@ -4,6 +4,7 @@ pub mod error;
 pub mod incremental;
 pub mod incremental_infer;
 pub mod llm;
+pub mod mysql_incremental;
 pub mod postgres_table_analyzer;
 pub mod read_mysql;
 pub mod read_postgres;

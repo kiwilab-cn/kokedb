@@ -85,11 +85,13 @@ impl MysqlToParquetConverter {
     }
 
     /// Streams `table_name` (`db.table` or bare table) to parquet under
-    /// `output_path`, optionally sorted by `sort_column` for prune-friendly files.
+    /// `output_path`, with an optional `WHERE` clause (incremental delta) and an
+    /// optional `sort_column` for prune-friendly files.
     pub async fn convert_table_to_parquet_where(
         &self,
         table_name: &str,
         output_path: &str,
+        where_clause: Option<&str>,
         sort_column: Option<&str>,
     ) -> Result<Arc<Schema>, TaskError> {
         let arrow_schema = Arc::new(self.get_table_schema(table_name).await?);
@@ -98,11 +100,20 @@ impl MysqlToParquetConverter {
             .set_max_row_group_size(self.row_group_size)
             .build();
 
+        let where_sql = match where_clause {
+            Some(clause) => format!(" WHERE {}", clause),
+            None => String::new(),
+        };
         let order_sql = match sort_column {
             Some(col) => format!(" ORDER BY {}", quote_ident(col)),
             None => String::new(),
         };
-        let query = format!("SELECT * FROM {}{}", quote_table(table_name), order_sql);
+        let query = format!(
+            "SELECT * FROM {}{}{}",
+            quote_table(table_name),
+            where_sql,
+            order_sql
+        );
 
         let mut stream = sqlx::query(&query).fetch(&self.pool);
         let mut rows: Vec<MySqlRow> = Vec::with_capacity(self.batch_size);
@@ -199,6 +210,6 @@ pub async fn convert_mysql_to_parquet(
     MysqlToParquetConverter::new(dsn)
         .await?
         .with_batch_size(batch_size)
-        .convert_table_to_parquet_where(remote_table, output_path, sort_column)
+        .convert_table_to_parquet_where(remote_table, output_path, None, sort_column)
         .await
 }
