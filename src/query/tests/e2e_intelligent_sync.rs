@@ -337,6 +337,52 @@ async fn intelligent_sync_end_to_end() {
         );
     }
 
+    // 5a-route. Opt-in cost-based routing: a primary-key point lookup against a
+    // large cached table is served from the live source. The source has a row
+    // (id=99999) the snapshot does not, so live vs cache is observable.
+    sqlx::query("INSERT INTO e2e_orders(id, amount, status) VALUES (99999, 7.0, 'live')")
+        .execute(&source)
+        .await
+        .unwrap();
+    // Pin the routing inputs deterministically (big table, PK on id).
+    sqlx::query(
+        "UPDATE system.table_sync_policy SET pk_columns='id', est_row_count=1000 \
+         WHERE catalog=$1 AND schema_name='public' AND table_name='e2e_orders'",
+    )
+    .bind(catalog)
+    .execute(&meta)
+    .await
+    .unwrap();
+
+    std::env::set_var("KOKEDB_COST_BASED_ROUTING", "true");
+    std::env::set_var("KOKEDB_COST_ROUTING_MIN_ROWS", "100");
+    let live = run(
+        &shared,
+        &format!("SELECT amount FROM {catalog}.public.e2e_orders WHERE id = 99999"),
+    )
+    .await;
+    let live_rows: usize = live.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(
+        live_rows, 1,
+        "a PK point-lookup on a big cached table routes to the live source"
+    );
+
+    // With routing off, the same lookup hits the snapshot, which lacks the row.
+    std::env::remove_var("KOKEDB_COST_BASED_ROUTING");
+    let cached = run(
+        &shared,
+        &format!("SELECT amount FROM {catalog}.public.e2e_orders WHERE id = 99999"),
+    )
+    .await;
+    let cached_rows: usize = cached.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(cached_rows, 0, "with routing off the same lookup serves the snapshot");
+
+    std::env::remove_var("KOKEDB_COST_ROUTING_MIN_ROWS");
+    sqlx::query("DELETE FROM e2e_orders WHERE id = 99999")
+        .execute(&source)
+        .await
+        .unwrap();
+
     // 5b. Catalog-wide refresh queues every selected table.
     let cat_refresh = run(&shared, &format!("REFRESH CACHE FROM CATALOG {catalog}")).await;
     let queued: usize = cat_refresh.iter().map(|b| b.num_rows()).sum();

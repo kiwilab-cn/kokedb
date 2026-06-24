@@ -709,6 +709,27 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(row.and_then(|r| r.try_get::<Option<String>, _>("col").ok().flatten()))
     }
 
+    /// Inputs for cost-based cache-vs-live routing: the table's estimated row
+    /// count and its primary-key columns (comma-separated), both from the
+    /// adaptive sync policy. `None` if the table has no policy row yet.
+    pub async fn get_table_routing_info(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Option<(Option<i64>, Option<String>)>> {
+        let sql = "SELECT est_row_count, pk_columns FROM system.table_sync_policy \
+            WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
+        let row = sqlx::query(sql)
+            .bind(catalog)
+            .bind(schema)
+            .bind(table)
+            .fetch_optional(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(row.map(|r| (r.try_get("est_row_count").ok(), r.try_get("pk_columns").ok())))
+    }
+
     /// Reads the persisted incremental-sync state for a table, if any.
     /// The timestamp of the table's last completed sync (when its cached
     /// snapshot was last written). `None` if the table has never synced. Used by
