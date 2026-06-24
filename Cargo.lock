@@ -3564,6 +3564,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kokedb-server"
+version = "0.1.0"
+dependencies = [
+ "kokedb-cache",
+ "kokedb-common",
+ "kokedb-mysql-svc",
+ "kokedb-pg-svc",
+ "kokedb-query",
+ "log",
+ "sqlx",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "kokedb-sql-analyzer"
 version = "0.1.0"
 dependencies = [
