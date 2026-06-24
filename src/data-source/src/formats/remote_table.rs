@@ -6,7 +6,8 @@ use std::task::{Context, Poll};
 use arrow::datatypes::*;
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::Session;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::stats::Precision;
+use datafusion::common::{DataFusionError, Result, Statistics};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -32,6 +33,10 @@ pub struct PostgreSQLTableProvider {
     config: PostgreSQLConfig,
     schema: SchemaRef,
     pool: Arc<PgPool>,
+    /// PostgreSQL's `reltuples` estimate, fed to the optimizer so it can cost
+    /// this live scan against cached (parquet) tables in a mixed-source query.
+    /// `None` when the table has never been analyzed (estimate unavailable).
+    estimated_rows: Option<usize>,
 }
 
 impl PostgreSQLTableProvider {
@@ -41,11 +46,13 @@ impl PostgreSQLTableProvider {
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
         let schema = Self::infer_schema(&pool, &config).await?;
+        let estimated_rows = Self::estimate_row_count(&pool, &config).await;
 
         Ok(Self {
             config,
             schema: Arc::new(schema),
             pool: Arc::new(pool),
+            estimated_rows,
         })
     }
 
@@ -56,6 +63,25 @@ impl PostgreSQLTableProvider {
         get_postgresql_table_schema(pool, schema_name, table_name)
             .await
             .map_err(|x| DataFusionError::External(Box::new(x)))
+    }
+
+    /// Reads PostgreSQL's cached `reltuples` row estimate from `pg_class` (no
+    /// table scan). Best-effort: any failure, or a not-yet-analyzed table
+    /// (`reltuples < 0`), yields `None` so the optimizer falls back to unknown.
+    async fn estimate_row_count(pool: &PgPool, config: &PostgreSQLConfig) -> Option<usize> {
+        let schema_name = config.schema_name.as_deref().unwrap_or("public");
+        let qualified = format!("\"{}\".\"{}\"", schema_name, config.table_name);
+        let reltuples: f32 = sqlx::query_scalar("SELECT reltuples FROM pg_class WHERE oid = $1::regclass")
+            .bind(&qualified)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()?;
+        if reltuples < 0.0 {
+            None
+        } else {
+            Some(reltuples as usize)
+        }
     }
 }
 
@@ -71,6 +97,17 @@ impl TableProvider for PostgreSQLTableProvider {
 
     fn table_type(&self) -> TableType {
         TableType::Base
+    }
+
+    /// Table-level row estimate (unprojected), mirroring the per-scan estimate
+    /// in `PostgreSQLExec::statistics`, so the optimizer sees a size for this
+    /// live table on both the logical and physical surfaces.
+    fn statistics(&self) -> Option<Statistics> {
+        let mut stats = Statistics::new_unknown(&self.schema);
+        if let Some(rows) = self.estimated_rows {
+            stats.num_rows = Precision::Inexact(rows);
+        }
+        Some(stats)
     }
 
     /// Translatable filters are pushed to PostgreSQL as `Inexact`: DataFusion
@@ -118,6 +155,7 @@ impl TableProvider for PostgreSQLTableProvider {
             projection.cloned(),
             filters.to_vec(),
             limit,
+            self.estimated_rows,
         )))
     }
 }
@@ -129,6 +167,7 @@ struct PostgreSQLExec {
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
     limit: Option<usize>,
+    estimated_rows: Option<usize>,
     properties: PlanProperties,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -141,6 +180,7 @@ impl PostgreSQLExec {
         projection: Option<Vec<usize>>,
         filters: Vec<Expr>,
         limit: Option<usize>,
+        estimated_rows: Option<usize>,
     ) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
@@ -156,6 +196,7 @@ impl PostgreSQLExec {
             projection,
             filters,
             limit,
+            estimated_rows,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         }
@@ -325,6 +366,19 @@ impl ExecutionPlan for PostgreSQLExec {
         Some(self.metrics.clone_inner())
     }
 
+    /// Reports PostgreSQL's row estimate so the optimizer can cost this live
+    /// scan against cached parquet scans (e.g. choosing the hash-join build
+    /// side) in a mixed-source query. The estimate is the base-table count; any
+    /// pushed-down filter only reduces it, so this is a safe upper bound. Column
+    /// statistics remain unknown.
+    fn statistics(&self) -> Result<Statistics> {
+        let mut stats = Statistics::new_unknown(&self.projected_schema);
+        if let Some(rows) = self.estimated_rows {
+            stats.num_rows = Precision::Inexact(rows);
+        }
+        Ok(stats)
+    }
+
     fn name(&self) -> &str {
         "PostgreSQLExec"
     }
@@ -466,6 +520,44 @@ mod tests {
         // leaves it to DataFusion's FilterExec instead of emitting bad SQL.
         let unsupported = col("ts").eq(now());
         assert!(expr_to_sql(&unsupported).is_none());
+    }
+
+    // The provider must surface PostgreSQL's reltuples estimate so the optimizer
+    // can size this live table against cached parquet scans in mixed queries.
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL; run via KOKEDB_TEST_DSN"]
+    async fn reports_reltuples_estimate() {
+        let dsn = std::env::var("KOKEDB_TEST_DSN")
+            .unwrap_or_else(|_| "postgresql://postgres:123456@127.0.0.1:25432/postgres".to_string());
+        let pool = PgPool::connect(&dsn).await.unwrap();
+        for stmt in [
+            "DROP TABLE IF EXISTS it_remote_stats",
+            "CREATE TABLE it_remote_stats (id int, v int)",
+            "INSERT INTO it_remote_stats SELECT g, g FROM generate_series(1, 5000) g",
+            "ANALYZE it_remote_stats",
+        ] {
+            sqlx::query(stmt).execute(&pool).await.unwrap();
+        }
+
+        let provider = PostgreSQLTableProvider::new(PostgreSQLConfig {
+            connection_string: dsn.clone(),
+            table_name: "it_remote_stats".to_string(),
+            schema_name: Some("public".to_string()),
+        })
+        .await
+        .unwrap();
+
+        match provider.statistics().expect("statistics present").num_rows {
+            Precision::Inexact(n) => {
+                assert!((4500..=5500).contains(&n), "reltuples estimate off: {n}")
+            }
+            other => panic!("expected an inexact row estimate, got {other:?}"),
+        }
+
+        sqlx::query("DROP TABLE IF EXISTS it_remote_stats")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
