@@ -326,18 +326,31 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
         }
     };
 
-    // Step 2: Get batch stream from cache or query
-    let mut batch_stream = match get_batch_stream(&cache, &sf, ctx, &plan, cache_key, max_staleness)
-        .await
-    {
-        Ok(stream) => stream,
-        Err(error_msg) => {
+    // Steps 2+3: produce the stream and pull its first batch, bounded by the
+    // optional query timeout. Both happen before we start writing to the client
+    // (Step 5), so on timeout we can still return a clean error packet. This is
+    // where a hung source or a runaway query would otherwise block forever.
+    let produce_first = async {
+        let mut stream = get_batch_stream(&cache, &sf, ctx, &plan, cache_key, max_staleness).await?;
+        let first = stream.next().await;
+        Ok::<_, String>((stream, first))
+    };
+    let (mut batch_stream, first) = match apply_query_timeout(produce_first).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(error_msg)) => {
             return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
+        }
+        Err(secs) => {
+            return send_error_to_client(
+                results,
+                ErrorKind::ER_QUERY_INTERRUPTED,
+                format!("query exceeded the {secs}s timeout (KOKEDB_QUERY_TIMEOUT_SECS)"),
+            )
+            .await;
         }
     };
 
-    // Step 3: Get first batch
-    let first_batch = match batch_stream.next().await {
+    let first_batch = match first {
         Some(Ok(batch)) => batch,
         Some(Err(e)) => {
             let error_msg = format!("Error reading first batch: {}", e);
@@ -604,6 +617,24 @@ fn parse_set_max_staleness(sql: &str) -> Option<u64> {
     let value = after.strip_prefix('=')?.trim();
     let value = value.trim_matches(|c| c == '\'' || c == '"').trim();
     value.parse::<u64>().ok()
+}
+
+/// Bounds a query's time-to-first-batch by `KOKEDB_QUERY_TIMEOUT_SECS` (0 =
+/// disabled, the default). On timeout returns `Err(secs)` so the caller can
+/// report it; otherwise returns the future's value. Applied before any result
+/// is written, so a clean error packet is still possible.
+async fn apply_query_timeout<F, T>(fut: F) -> Result<T, u64>
+where
+    F: std::future::Future<Output = T>,
+{
+    let secs = kokedb_common::env::get_env_as("KOKEDB_QUERY_TIMEOUT_SECS", 0u64);
+    if secs == 0 {
+        return Ok(fut.await);
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+        Ok(v) => Ok(v),
+        Err(_) => Err(secs),
+    }
 }
 
 /// Extracts the seconds from a `/*+ max_staleness(N) */` query hint, if present.
@@ -896,6 +927,22 @@ mod tests {
         assert_eq!(parse_set_max_staleness("SET autocommit = 1"), None);
         assert_eq!(parse_set_max_staleness("SET NAMES utf8mb4"), None);
         assert_eq!(parse_set_max_staleness("SELECT 1"), None);
+    }
+
+    #[tokio::test]
+    async fn query_timeout_disabled_passes_through_and_enabled_trips() {
+        // Disabled (default) -> the future runs to completion.
+        std::env::remove_var("KOKEDB_QUERY_TIMEOUT_SECS");
+        assert_eq!(apply_query_timeout(async { 7u8 }).await, Ok(7));
+
+        // Enabled -> a slow future trips the timeout and reports the bound.
+        std::env::set_var("KOKEDB_QUERY_TIMEOUT_SECS", "1");
+        let slow = async {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            7u8
+        };
+        assert_eq!(apply_query_timeout(slow).await, Err(1));
+        std::env::remove_var("KOKEDB_QUERY_TIMEOUT_SECS");
     }
 
     #[test]

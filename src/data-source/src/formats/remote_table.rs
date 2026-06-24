@@ -18,8 +18,10 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 use futures::stream::{Stream, StreamExt};
+use kokedb_common::env::get_env_as;
 use kokedb_common::table::postgresql::{get_postgresql_table_schema, rows_to_record_batch};
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgPool, PgPoolOptions};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub struct PostgreSQLConfig {
@@ -39,11 +41,26 @@ pub struct PostgreSQLTableProvider {
     estimated_rows: Option<usize>,
 }
 
+/// Bounds how long a connection to a source database may take before it is
+/// treated as unavailable, so a query that routes to a dead or slow source
+/// fails promptly instead of hanging the client connection forever.
+async fn connect_source(dsn: &str) -> Result<PgPool> {
+    let secs = get_env_as("KOKEDB_SOURCE_CONNECT_TIMEOUT_SECS", 10u64);
+    let pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_secs(secs))
+        .connect(dsn);
+    match tokio::time::timeout(Duration::from_secs(secs), pool).await {
+        Ok(Ok(pool)) => Ok(pool),
+        Ok(Err(e)) => Err(DataFusionError::External(Box::new(e))),
+        Err(_) => Err(DataFusionError::Execution(format!(
+            "source database is unavailable: connection timed out after {secs}s"
+        ))),
+    }
+}
+
 impl PostgreSQLTableProvider {
     pub async fn new(config: PostgreSQLConfig) -> Result<Self> {
-        let pool = PgPool::connect(&config.connection_string)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        let pool = connect_source(&config.connection_string).await?;
 
         let schema = Self::infer_schema(&pool, &config).await?;
         let estimated_rows = Self::estimate_row_count(&pool, &config).await;
@@ -511,6 +528,34 @@ mod tests {
         assert_eq!(
             expr_to_sql(&col("a").gt(lit(1i64)).and(col("b").lt(lit(9i64)))).as_deref(),
             Some("((\"a\" > 1) AND (\"b\" < 9))")
+        );
+    }
+
+    // A source that accepts TCP but never completes the Postgres handshake must
+    // not hang the caller: connect_source has to give up at the bound. DB-free.
+    #[tokio::test]
+    async fn source_connect_times_out_on_a_hung_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Accept and hold connections open without ever responding.
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((s, _)) = listener.accept().await {
+                held.push(s);
+            }
+        });
+
+        std::env::set_var("KOKEDB_SOURCE_CONNECT_TIMEOUT_SECS", "1");
+        let dsn = format!("postgresql://postgres:x@127.0.0.1:{}/x", addr.port());
+        let start = std::time::Instant::now();
+        let res = connect_source(&dsn).await;
+        std::env::remove_var("KOKEDB_SOURCE_CONNECT_TIMEOUT_SECS");
+
+        assert!(res.is_err(), "connecting to a hung server must fail, not hang");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "must give up near the 1s bound, took {:?}",
+            start.elapsed()
         );
     }
 

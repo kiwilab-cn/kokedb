@@ -12,6 +12,8 @@ use datafusion::error::{DataFusionError, Result};
 
 use datafusion::sql::sqlparser::parser::ParserError;
 use kokedb_common::cache_policy::parse_cache_policy;
+use kokedb_common::env::get_env_as;
+use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use crate::datafusion_catalog::PostgreSQLCatalogProvider;
@@ -131,7 +133,13 @@ impl PostgreSQLMetaCatalogProviderList {
     pub async fn new() -> Result<Self> {
         let local_dsn = std::env::var("PG_META_DSN")
             .unwrap_or("postgresql://postgres:123456@127.0.0.1:25432/kokedb".to_string());
-        let local_pool = PgPool::connect(&local_dsn)
+        // Bound how long any meta operation waits for a connection, so when the
+        // meta store is unreachable, queries fail fast with a clear error rather
+        // than blocking on it indefinitely.
+        let acquire_secs = get_env_as("KOKEDB_META_ACQUIRE_TIMEOUT_SECS", 10u64);
+        let local_pool = PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(acquire_secs))
+            .connect(&local_dsn)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(Self {
