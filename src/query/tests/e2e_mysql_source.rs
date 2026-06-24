@@ -112,7 +112,9 @@ async fn mysql_source_sync_and_query() {
             qty INT UNSIGNED NOT NULL, \
             status VARCHAR(32) NOT NULL, \
             is_paid TINYINT(1) NOT NULL, \
-            created_at DATETIME NOT NULL)",
+            created_at DATETIME NOT NULL, \
+            updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) \
+                ON UPDATE CURRENT_TIMESTAMP(6))",
     ] {
         sqlx::query(stmt).execute(&my).await.unwrap();
     }
@@ -169,6 +171,51 @@ async fn mysql_source_sync_and_query() {
     .await;
     assert_eq!(scalar_count(&done), 100, "varchar decode + predicate");
 
+    // Incremental sync: the `ON UPDATE` watermark + primary key qualify the
+    // table for incremental. Update one row and insert another (both bump the
+    // microsecond watermark), refresh, and confirm the snapshot merges the delta
+    // rather than rebuilding.
+    sqlx::query("UPDATE m_orders SET status = 'changed', amount = 999.99 WHERE id = 1")
+        .execute(&my)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO m_orders(id, amount, qty, status, is_paid, created_at) \
+         VALUES (201, 5.0, 5, 'new', 1, NOW())",
+    )
+    .execute(&my)
+    .await
+    .unwrap();
+    run(&shared, &format!("REFRESH CACHE FROM TABLE {catalog}.testdb.m_orders")).await;
+
+    let mut merged = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(60) {
+        let c = run(&shared, &format!("SELECT count(*) FROM {catalog}.testdb.m_orders")).await;
+        if scalar_count(&c) == 201 {
+            merged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(merged, "incremental sync did not pick up the insert (count != 201)");
+    let changed = run(
+        &shared,
+        &format!("SELECT count(*) FROM {catalog}.testdb.m_orders WHERE status = 'changed'"),
+    )
+    .await;
+    assert_eq!(scalar_count(&changed), 1, "incremental merge applied the update");
+    // The sync state records incremental mode after a delta merge.
+    let mode: (String,) = sqlx::query_as(
+        "SELECT sync_mode FROM system.table_sync_state \
+         WHERE catalog=$1 AND table_name='m_orders'",
+    )
+    .bind(catalog)
+    .fetch_one(&meta)
+    .await
+    .unwrap();
+    assert_eq!(mode.0, "incremental", "second sync ran incrementally");
+
     // Live read via the freshness guard: add a row to the MySQL source the
     // snapshot lacks, mark the snapshot stale, and demand freshness -> the read
     // routes to the live MySqlTableProvider and sees 201 rows.
@@ -190,7 +237,7 @@ async fn mysql_source_sync_and_query() {
         1,
     )
     .await;
-    assert_eq!(scalar_count(&live), 201, "freshness guard reads live MySQL source");
+    assert_eq!(scalar_count(&live), 202, "freshness guard reads live MySQL source");
 
     // Cleanup.
     clean_meta(&meta, catalog).await;

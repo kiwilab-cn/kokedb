@@ -18,7 +18,7 @@ use sqlx::PgPool;
 
 use crate::{
     error::TaskError,
-    incremental,
+    incremental, mysql_incremental,
     read_mysql::convert_remote_to_parquet,
     read_postgres::PostgresToParquetConverter,
     task_manager::CacheTableTaskConfig,
@@ -173,14 +173,10 @@ impl DataSyncExecutor {
         // Catalog-level Hive partition column (e.g. `with properties(partition_by="dt")`).
         let partition_by = meta.get_catalog_partition_by(catalog).await.ok().flatten();
 
-        // Decide full vs incremental vs skip from detected metadata + state.
-        // MySQL sources use full sync only (incremental signal detection is
-        // PostgreSQL-specific), so skip the PG-only planner for them.
+        // Decide full vs incremental vs skip from detected metadata + state,
+        // using the right planner for the source.
         let plan = if kokedb_common::source::is_mysql(&dsn) {
-            SyncPlan::Full {
-                watermark_column: None,
-                pk_columns: vec![],
-            }
+            plan_sync_mysql(&dsn, source_table, catalog, &schema, &table, &meta).await?
         } else {
             plan_sync(&dsn, source_table, catalog, &schema, &table, &meta).await?
         };
@@ -309,12 +305,7 @@ impl DataSyncExecutor {
                 };
 
                 let last_watermark = match &watermark_column {
-                    Some(col) => {
-                        let pool = connect_source(&dsn).await?;
-                        let wm = incremental::max_watermark(&pool, source_table, col).await?;
-                        pool.close().await;
-                        wm
-                    }
+                    Some(col) => max_watermark_for(&dsn, source_table, col).await?,
                     None => None,
                 };
 
@@ -591,19 +582,32 @@ async fn run_incremental(
     ensure_dir_exists(&delta_path).await?;
     ensure_dir_exists(new_local_path).await?;
 
-    let where_clause = incremental::incremental_where(watermark_column, last_watermark);
     let batch_size = get_env_as("KOKEDB_READ_TABLE_BATCH_SIZE", 300000usize);
-    let converter = PostgresToParquetConverter::new(dsn)
-        .await?
-        .with_batch_size(batch_size);
-    let arrow_schema = converter
-        .convert_table_to_parquet_where(
-            source_table,
-            &delta_path,
-            Some(&where_clause),
-            Some(watermark_column),
-        )
-        .await?;
+    let arrow_schema = if kokedb_common::source::is_mysql(dsn) {
+        let where_clause = mysql_incremental::incremental_where(watermark_column, last_watermark);
+        crate::read_mysql::MysqlToParquetConverter::new(dsn)
+            .await?
+            .with_batch_size(batch_size)
+            .convert_table_to_parquet_where(
+                source_table,
+                &delta_path,
+                Some(&where_clause),
+                Some(watermark_column),
+            )
+            .await?
+    } else {
+        let where_clause = incremental::incremental_where(watermark_column, last_watermark);
+        PostgresToParquetConverter::new(dsn)
+            .await?
+            .with_batch_size(batch_size)
+            .convert_table_to_parquet_where(
+                source_table,
+                &delta_path,
+                Some(&where_clause),
+                Some(watermark_column),
+            )
+            .await?
+    };
 
     incremental::merge_snapshot(
         old_path,
@@ -618,11 +622,92 @@ async fn run_incremental(
     let _ = tokio::fs::remove_dir_all(&delta_path).await;
 
     // The new watermark is the current source max (read fresh).
-    let pool = connect_source(dsn).await?;
-    let new_watermark = incremental::max_watermark(&pool, source_table, watermark_column).await?;
-    pool.close().await;
+    let new_watermark = max_watermark_for(dsn, source_table, watermark_column).await?;
 
     Ok((arrow_schema, new_watermark))
+}
+
+/// Reads the current MAX of `watermark_column` from the source, dispatching by
+/// source kind.
+async fn max_watermark_for(
+    dsn: &str,
+    source_table: &str,
+    watermark_column: &str,
+) -> Result<Option<String>, TaskError> {
+    if kokedb_common::source::is_mysql(dsn) {
+        let pool = mysql_incremental::connect(dsn).await?;
+        let wm = mysql_incremental::max_watermark(&pool, source_table, watermark_column).await?;
+        pool.close().await;
+        Ok(wm)
+    } else {
+        let pool = connect_source(dsn).await?;
+        let wm = incremental::max_watermark(&pool, source_table, watermark_column).await?;
+        pool.close().await;
+        Ok(wm)
+    }
+}
+
+/// MySQL counterpart of [`plan_sync`]: incremental only when the table has a
+/// primary key and a DB-enforced `ON UPDATE` watermark, else full.
+async fn plan_sync_mysql(
+    dsn: &str,
+    source_table: &str,
+    catalog: &str,
+    schema: &str,
+    table: &str,
+    meta: &PostgreSQLMetaCatalogProviderList,
+) -> Result<SyncPlan, TaskError> {
+    let pool = mysql_incremental::connect(dsn).await?;
+    let pk_columns = mysql_incremental::detect_primary_keys(&pool, source_table).await?;
+    let watermark_column = mysql_incremental::detect_watermark_column(&pool, source_table).await?;
+
+    let sync_state = meta
+        .get_table_sync_state(catalog, schema, table)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let old_path = meta
+        .get_table_schema(catalog, schema, table)
+        .await
+        .map(|(_, path)| path)
+        .unwrap_or_default();
+    let force_full = sync_state.incremental_runs >= force_full_every();
+
+    let can_incremental = !pk_columns.is_empty()
+        && watermark_column.is_some()
+        && !old_path.is_empty()
+        && sync_state.last_watermark.is_some()
+        && !force_full;
+
+    if !can_incremental {
+        pool.close().await;
+        return Ok(SyncPlan::Full {
+            watermark_column,
+            pk_columns,
+        });
+    }
+
+    let wm_col = watermark_column.unwrap_or_default();
+    let last_watermark = sync_state.last_watermark.unwrap_or_default();
+    let changed =
+        mysql_incremental::has_changes_since(&pool, source_table, &wm_col, &last_watermark).await?;
+    pool.close().await;
+
+    if changed {
+        Ok(SyncPlan::Incremental {
+            watermark_column: wm_col,
+            pk_columns,
+            last_watermark,
+            old_path,
+        })
+    } else {
+        Ok(SyncPlan::SkipUnchanged {
+            watermark_column: wm_col,
+            pk_columns,
+            last_watermark,
+        })
+    }
 }
 
 #[cfg(test)]
