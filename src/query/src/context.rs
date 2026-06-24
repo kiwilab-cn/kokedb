@@ -54,6 +54,11 @@ impl SharedServices {
     pub fn plan_cache(&self) -> PlanCache {
         self.plan_cache.clone()
     }
+
+    /// The shared result cache (process-wide; local or Redis-backed).
+    pub fn result_cache(&self) -> ResultCache {
+        self.result_cache.clone()
+    }
 }
 
 /// Initializes the process-wide services exactly once: connects to the meta
