@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use arrow::datatypes::Schema;
-use kokedb_cache::foyer_hybrid::LruResultCache;
+use kokedb_cache::result_cache::ResultCache;
 use kokedb_common::{
     env::get_env_as,
     file::{
@@ -33,7 +33,7 @@ pub trait TaskExecutor: Send + Sync {
     async fn execute(
         &self,
         config: CacheTableTaskConfig,
-        cache: LruResultCache,
+        cache: ResultCache,
         progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError>;
 }
@@ -89,7 +89,7 @@ impl TaskExecutor for DataSyncExecutor {
     async fn execute(
         &self,
         config: CacheTableTaskConfig,
-        cache: LruResultCache,
+        cache: ResultCache,
         progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError> {
         // Record a cache_job row around the sync (best-effort observability).
@@ -127,7 +127,7 @@ impl DataSyncExecutor {
     async fn run_sync(
         &self,
         config: CacheTableTaskConfig,
-        cache: LruResultCache,
+        cache: ResultCache,
         progress_callback: Option<Box<dyn Fn(f32) + Send + Sync>>,
     ) -> Result<(), TaskError> {
         // Report coarse progress at the natural milestones of a sync.
@@ -587,7 +587,7 @@ async fn run_incremental(
 mod tests {
     use super::*;
     use datafusion::prelude::{ParquetReadOptions, SessionContext};
-    use kokedb_cache::foyer_hybrid::LruResultCache;
+    use kokedb_cache::result_cache::ResultCache;
 
     fn test_dsn() -> String {
         std::env::var("KOKEDB_TEST_DSN")
@@ -675,7 +675,7 @@ mod tests {
         .await
         .unwrap();
 
-        let cache = LruResultCache::new(64, 64).await.unwrap();
+        let cache = ResultCache::local(64, 64).await.unwrap();
         let exec = DataSyncExecutor::new(Arc::new(Mutex::new(None)));
         let config = CacheTableTaskConfig::new(
             "kokedb".to_string(),

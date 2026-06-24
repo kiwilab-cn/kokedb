@@ -6,7 +6,7 @@ use datafusion::{
     prelude::{SessionConfig, SessionContext},
 };
 use datafusion_common::plan_datafusion_err;
-use kokedb_cache::foyer_hybrid::LruResultCache;
+use kokedb_cache::result_cache::ResultCache;
 use kokedb_catalog::{
     manager::{CatalogManager, CatalogManagerOptions},
     provider::CatalogProvider,
@@ -38,7 +38,7 @@ pub struct SharedServices {
     task_manager: Arc<TaskManager>,
     task_scheduler: Arc<JobScheduler>,
     scheduler_jobs: Arc<Mutex<HashMap<String, uuid::Uuid>>>,
-    result_cache: LruResultCache,
+    result_cache: ResultCache,
     plan_cache: PlanCache,
 }
 
@@ -60,7 +60,7 @@ impl SharedServices {
 /// store, creates the schema, starts the task manager + scheduler, and registers
 /// the periodic catalog-sync jobs.
 pub async fn init_shared_services(
-    result_cache: LruResultCache,
+    result_cache: ResultCache,
 ) -> Result<SharedServices, Box<dyn std::error::Error>> {
     let runtime = Arc::new(RuntimeEnv::default());
 
@@ -235,7 +235,7 @@ fn build_catalog_manager(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kokedb_cache::foyer_hybrid::LruResultCache;
+    use kokedb_cache::result_cache::ResultCache;
 
     // Verifies the proactive refresh path end to end (against the meta DB):
     // record a query's SQL, then refresh its key and confirm the result is
@@ -243,7 +243,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PostgreSQL; run via `make integration-test`"]
     async fn cache_refresher_recomputes_and_caches() {
-        let cache = LruResultCache::new(64, 64).await.unwrap();
+        let cache = ResultCache::local(64, 64).await.unwrap();
         let shared = init_shared_services(cache.clone()).await.unwrap();
 
         // A table-free query so the test does not depend on any catalog data.
@@ -253,7 +253,7 @@ mod tests {
             .save_sql_stats("SELECT 1 AS x", key, 0)
             .await
             .unwrap();
-        assert!(!cache.inner.contains(&key), "cache should start empty");
+        assert!(!cache.contains(key).await, "cache should start empty");
 
         let refresher = CacheRefresher {
             shared: shared.clone(),
@@ -261,7 +261,7 @@ mod tests {
         refresher.refresh(vec![key]).await;
 
         assert!(
-            cache.inner.contains(&key),
+            cache.contains(key).await,
             "refresh should have recomputed and cached the result"
         );
     }

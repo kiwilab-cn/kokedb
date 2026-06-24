@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray, StringViewArray};
-use kokedb_cache::foyer_hybrid::LruResultCache;
+use kokedb_cache::result_cache::ResultCache;
 use kokedb_common::hash::get_plan_hash;
 use kokedb_query::binder::{parser, query};
 use kokedb_query::context::{create_session_context, init_shared_services, SharedServices};
@@ -194,7 +194,7 @@ async fn intelligent_sync_end_to_end() {
     seed_source(&source).await;
     clean_meta(&meta, catalog).await;
 
-    let result_cache = LruResultCache::new(2000, 40000).await.unwrap();
+    let result_cache = ResultCache::local(2000, 40000).await.unwrap();
     let shared = init_shared_services(result_cache).await.unwrap();
 
     // 1. Create the catalog (triggers initial sync + adaptive reeval + inference).

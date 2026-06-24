@@ -9,7 +9,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use kokedb_cache::foyer_hybrid::LruResultCache;
+use kokedb_cache::result_cache::ResultCache;
 use kokedb_common::env::get_env_as;
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -224,18 +224,18 @@ pub struct TaskManager {
     shutdown_tx: Option<mpsc::UnboundedSender<()>>,
     is_shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// The shared result cache, kept so callers can invalidate keys on eviction.
-    result_cache: LruResultCache,
+    result_cache: ResultCache,
 }
 
 impl TaskManager {
-    pub async fn new(cache: LruResultCache) -> Result<Self, TaskError> {
+    pub async fn new(cache: ResultCache) -> Result<Self, TaskError> {
         let config: TaskManagerConfig = TaskManagerConfig::default();
         Self::new_with(config, cache).await
     }
 
     pub async fn new_with(
         config: TaskManagerConfig,
-        cache: LruResultCache,
+        cache: ResultCache,
     ) -> Result<Self, TaskError> {
         let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
 
@@ -263,7 +263,7 @@ impl TaskManager {
     async fn start_scheduler(
         &self,
         mut shutdown_rx: mpsc::UnboundedReceiver<()>,
-        cache: LruResultCache,
+        cache: ResultCache,
     ) {
         let tasks = self.tasks.clone();
         let task_handles = self.task_handles.clone();
@@ -723,7 +723,7 @@ impl TaskManager {
 mod tests {
     use std::collections::HashMap;
 
-    use kokedb_cache::foyer_hybrid::LruResultCache;
+    use kokedb_cache::result_cache::ResultCache;
     use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
     use log::info;
 
@@ -770,7 +770,7 @@ mod tests {
     // fail to connect, but that does not move it out of an inflight state here.
     #[tokio::test]
     async fn has_inflight_is_keyed_by_catalog_and_table() {
-        let cache = LruResultCache::new(16, 16).await.unwrap();
+        let cache = ResultCache::local(16, 16).await.unwrap();
         let mut tm = TaskManager::new_with(TaskManagerConfig::default(), cache)
             .await
             .unwrap();
@@ -809,7 +809,7 @@ mod tests {
             .unwrap();
 
         let config = TaskManagerConfig::default();
-        let cache = LruResultCache::new(100, 100).await.unwrap();
+        let cache = ResultCache::local(100, 100).await.unwrap();
         let task_manager = TaskManager::new_with(config, cache).await.unwrap();
         let runtime_info = task_manager.get_runtime_info();
         info!("Runtime Info: {:?}", runtime_info);
