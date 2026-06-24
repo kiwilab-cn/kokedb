@@ -15,6 +15,7 @@ use pgwire::tokio::process_socket;
 use sqlx::postgres::PgPool;
 use sqlx::Row as _;
 use tokio::net::TcpListener;
+use tokio_postgres::types::Type;
 use tokio_postgres::SimpleQueryMessage;
 
 fn source_dsn() -> String {
@@ -158,4 +159,115 @@ async fn pg_wire_create_catalog_and_query() {
 
     clean_meta(&meta, catalog).await;
     let _ = sqlx::query("DROP TABLE IF EXISTS pgw_items").execute(&source).await;
+}
+
+/// Drives the extended/prepared protocol (Parse/Bind/Execute with bound `$N`
+/// parameters and binary result formats) end to end via tokio-postgres'
+/// `prepare`/`query`, which always uses the extended protocol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (source + meta)"]
+async fn pg_wire_extended_prepared_query() {
+    let catalog = "pgwire_ext";
+    std::env::set_var("PG_META_DSN", meta_dsn());
+    std::env::set_var("KOKEDB_REEVALUATE_INTERVAL_MIN", "60");
+
+    let source = PgPool::connect(&source_dsn()).await.unwrap();
+    for stmt in [
+        "DROP TABLE IF EXISTS pgw_ext",
+        "CREATE TABLE pgw_ext (id int PRIMARY KEY, name text, price float8)",
+        "INSERT INTO pgw_ext SELECT g, 'n' || g, g * 1.5 FROM generate_series(1, 20) g",
+    ] {
+        sqlx::query(stmt).execute(&source).await.unwrap();
+    }
+    let meta = PgPool::connect(&meta_dsn()).await.unwrap();
+    clean_meta(&meta, catalog).await;
+
+    let result_cache = ResultCache::local(64, 64).await.unwrap();
+    let shared = init_shared_services(result_cache).await.unwrap();
+    let handlers = KokedbHandlers::new(shared);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let h = handlers.clone();
+            tokio::spawn(async move {
+                let _ = process_socket(sock, None, h).await;
+            });
+        }
+    });
+
+    let conn_str = format!("host=127.0.0.1 port={} user=postgres dbname=kokedb", addr.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("connect to kokedb pg wire");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .simple_query(&format!(
+            "CREATE CATALOG {catalog} USING '{}' WITH properties(cache_policy=\"select\", \
+             table_set=\"public.pgw_ext\")",
+            source_dsn()
+        ))
+        .await
+        .expect("CREATE CATALOG over pg wire");
+    assert!(
+        wait_until_cached(&meta, catalog, "pgw_ext", Duration::from_secs(60)).await,
+        "pgw_ext was not cached in time"
+    );
+
+    // Integer parameter, binary result decode of text + float8 columns. We use
+    // `prepare_typed` so the client sends parameter OIDs in Parse (as JDBC,
+    // asyncpg and libpq do); kokedb's parser can't infer placeholder types.
+    let stmt = client
+        .prepare_typed(
+            &format!("SELECT name, price FROM {catalog}.public.pgw_ext WHERE id = $1"),
+            &[Type::INT4],
+        )
+        .await
+        .expect("prepare with int param");
+    let row = client.query_one(&stmt, &[&7i32]).await.expect("execute int param");
+    assert_eq!(row.get::<_, String>("name"), "n7");
+    assert!((row.get::<_, f64>("price") - 10.5).abs() < 1e-9, "float8 binary decode");
+
+    // Integer parameter feeding an aggregate (int8 result, binary decode).
+    let stmt = client
+        .prepare_typed(
+            &format!("SELECT count(*) AS c FROM {catalog}.public.pgw_ext WHERE id <= $1"),
+            &[Type::INT4],
+        )
+        .await
+        .expect("prepare aggregate");
+    let row = client.query_one(&stmt, &[&10i32]).await.expect("execute aggregate");
+    assert_eq!(row.get::<_, i64>("c"), 10, "int8 binary decode of count");
+
+    // Text parameter substitution (quoted literal).
+    let stmt = client
+        .prepare_typed(
+            &format!("SELECT id FROM {catalog}.public.pgw_ext WHERE name = $1"),
+            &[Type::TEXT],
+        )
+        .await
+        .expect("prepare text param");
+    let row = client.query_one(&stmt, &[&"n3"]).await.expect("execute text param");
+    assert_eq!(row.get::<_, i32>("id"), 3, "text param + int4 binary decode");
+
+    // Two parameters in one statement.
+    let stmt = client
+        .prepare_typed(
+            &format!(
+                "SELECT count(*) AS c FROM {catalog}.public.pgw_ext WHERE id >= $1 AND id <= $2"
+            ),
+            &[Type::INT4, Type::INT4],
+        )
+        .await
+        .expect("prepare two params");
+    let row = client.query_one(&stmt, &[&5i32, &10i32]).await.expect("execute two params");
+    assert_eq!(row.get::<_, i64>("c"), 6, "two-parameter range");
+
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS pgw_ext").execute(&source).await;
 }
