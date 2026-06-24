@@ -61,6 +61,27 @@ impl SharedServices {
     }
 }
 
+/// Seeds a superuser from `KOKEDB_ADMIN_USER` / `KOKEDB_ADMIN_PASSWORD` when
+/// both are set, so an otherwise-empty deployment has a way to authenticate
+/// (and thereby turn authentication on). Idempotent — it upserts on each start.
+async fn seed_admin_user(
+    meta: &PostgreSQLMetaCatalogProviderList,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (Ok(user), Ok(password)) = (
+        std::env::var("KOKEDB_ADMIN_USER"),
+        std::env::var("KOKEDB_ADMIN_PASSWORD"),
+    ) else {
+        return Ok(());
+    };
+    if user.is_empty() {
+        return Ok(());
+    }
+    let digest = kokedb_common::auth::password_digest(&password);
+    meta.upsert_app_user(&user, &digest, true, "*").await?;
+    log::info!("Seeded admin user '{user}' (superuser)");
+    Ok(())
+}
+
 /// Initializes the process-wide services exactly once: connects to the meta
 /// store, creates the schema, starts the task manager + scheduler, and registers
 /// the periodic catalog-sync jobs.
@@ -79,6 +100,7 @@ pub async fn init_shared_services(
 
     let catalog_list = Arc::new(PostgreSQLMetaCatalogProviderList::new().await?);
     catalog_list.init_db().await?;
+    seed_admin_user(&catalog_list).await?;
 
     let task_manager = Arc::new(TaskManager::new(result_cache.clone()).await?);
     let task_scheduler = Arc::new(JobScheduler::new().await?);
@@ -212,6 +234,27 @@ pub fn use_database(ctx: &SessionContext, name: &str) -> Result<(), String> {
         .extension::<CatalogManager>()
         .map_err(|e| format!("catalog manager unavailable: {e}"))?;
     manager.set_default_catalog(name).map_err(|e| e.to_string())
+}
+
+/// Scopes a connection's session to a catalog allow-list (after authentication).
+/// `None` leaves it unrestricted (superuser or authentication disabled).
+pub fn set_session_acl(
+    ctx: &SessionContext,
+    allowed_catalogs: Option<Arc<std::collections::HashSet<String>>>,
+) -> Result<(), String> {
+    let manager = ctx
+        .extension::<CatalogManager>()
+        .map_err(|e| format!("catalog manager unavailable: {e}"))?;
+    manager.set_acl(allowed_catalogs);
+    Ok(())
+}
+
+/// Whether the connection's session is scoped to a catalog allow-list. Used to
+/// bypass the shared result cache for restricted sessions.
+pub fn session_is_restricted(ctx: &SessionContext) -> bool {
+    ctx.extension::<CatalogManager>()
+        .map(|m| m.is_restricted())
+        .unwrap_or(false)
 }
 
 fn build_catalog_manager(

@@ -18,55 +18,12 @@ use kokedb_common::{hash::get_plan_hash, spec::Plan};
 use kokedb_meta::catalog_list::PostgreSQLMetaCatalogProviderList;
 use kokedb_query::{
     binder::{parser, query, save_sql_history},
-    context::{create_session_context, use_database, SharedServices},
+    context::{create_session_context, set_session_acl, use_database, SharedServices},
     plan_cache::PlanCache,
 };
 use log::{error, info, warn};
 use opensrv_mysql::*;
-use sha1::{Digest, Sha1};
 use tokio::{io::AsyncWrite, net::TcpListener};
-
-/// Optional MySQL authentication credentials, read once from the environment.
-/// When `None`, authentication is disabled (any client is accepted).
-#[derive(Clone)]
-struct AuthConfig {
-    user: String,
-    password: String,
-}
-
-impl AuthConfig {
-    /// Reads credentials from `KOKEDB_MYSQL_USER` (default `root`) and
-    /// `KOKEDB_MYSQL_PASSWORD`. Auth is only enforced when a password is set.
-    fn from_env() -> Option<Self> {
-        match std::env::var("KOKEDB_MYSQL_PASSWORD") {
-            Ok(password) if !password.is_empty() => Some(Self {
-                user: std::env::var("KOKEDB_MYSQL_USER").unwrap_or_else(|_| "root".to_string()),
-                password,
-            }),
-            _ => None,
-        }
-    }
-
-    /// Verifies a `mysql_native_password` response:
-    ///   token == SHA1(password) XOR SHA1(salt + SHA1(SHA1(password)))
-    fn verify_native_password(&self, salt: &[u8], token: &[u8]) -> bool {
-        if token.len() != 20 {
-            return false;
-        }
-        let hash1 = Sha1::digest(self.password.as_bytes());
-        let hash2 = Sha1::digest(hash1);
-        let mut hasher = Sha1::new();
-        hasher.update(salt);
-        hasher.update(hash2);
-        let scramble = hasher.finalize();
-        // recovered = scramble XOR token should equal hash1 for a valid password.
-        scramble
-            .iter()
-            .zip(token.iter())
-            .map(|(s, t)| s ^ t)
-            .eq(hash1.iter().copied())
-    }
-}
 
 /// A prepared statement bound to a single client connection.
 #[derive(Clone)]
@@ -78,8 +35,9 @@ struct PreparedStatement {
 struct CoreContex {
     ctx: Arc<SessionContext>,
     cache: ResultCache,
-    /// Optional auth credentials shared across connections (read once at startup).
-    auth: Option<Arc<AuthConfig>>,
+    /// Whether authentication is enforced (true when `system.app_user` is
+    /// non-empty). When false, all clients are accepted with full access.
+    auth_enabled: bool,
     /// Process-wide single-flight registry for cache-miss de-duplication.
     sf: Arc<singleflight::Singleflight>,
     /// Shared meta-store handle (reuses the process-wide pool) for recording
@@ -100,7 +58,7 @@ impl CoreContex {
     fn new(
         ctx: Arc<SessionContext>,
         cache: ResultCache,
-        auth: Option<Arc<AuthConfig>>,
+        auth_enabled: bool,
         sf: Arc<singleflight::Singleflight>,
         meta: Arc<PostgreSQLMetaCatalogProviderList>,
         plan_cache: PlanCache,
@@ -108,7 +66,7 @@ impl CoreContex {
         Self {
             ctx,
             cache,
-            auth,
+            auth_enabled,
             sf,
             meta,
             plan_cache,
@@ -129,8 +87,10 @@ type Context = datafusion::prelude::SessionContext;
 impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
     type Error = MysqlServerError;
 
-    /// Validates the client's credentials with `mysql_native_password`. When no
-    /// `KOKEDB_MYSQL_PASSWORD` is configured, all clients are accepted.
+    /// Validates the client's credentials with `mysql_native_password` against
+    /// the `system.app_user` table, and scopes the connection to the user's
+    /// allowed catalogs. When authentication is disabled (no users defined), all
+    /// clients are accepted with full access.
     async fn authenticate(
         &self,
         _auth_plugin: &str,
@@ -138,20 +98,35 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         salt: &[u8],
         auth_data: &[u8],
     ) -> bool {
-        match &self.auth {
-            None => true,
-            Some(cfg) => {
-                if username != cfg.user.as_bytes() {
-                    warn!("Auth failed: unknown user");
-                    return false;
-                }
-                let ok = cfg.verify_native_password(salt, auth_data);
-                if !ok {
-                    warn!("Auth failed: bad password for user");
-                }
-                ok
-            }
+        if !self.auth_enabled {
+            return true;
         }
+        let Ok(username) = std::str::from_utf8(username) else {
+            warn!("Auth failed: non-UTF8 username");
+            return false;
+        };
+        let user = match self.meta.get_app_user(username).await {
+            Ok(Some(user)) => user,
+            Ok(None) => {
+                warn!("Auth failed: unknown user '{username}'");
+                return false;
+            }
+            Err(e) => {
+                error!("Auth failed: meta lookup error: {e}");
+                return false;
+            }
+        };
+        if !kokedb_common::auth::verify_mysql_native(&user.auth_digest, salt, auth_data) {
+            warn!("Auth failed: bad password for user '{username}'");
+            return false;
+        }
+        // Scope the connection to the user's catalogs (None = unrestricted).
+        let acl = user.allowed_catalogs.map(Arc::new);
+        if let Err(e) = set_session_acl(&self.ctx, acl) {
+            error!("Failed to apply catalog ACL for '{username}': {e}");
+            return false;
+        }
+        true
     }
 
     /// Prepare a statement: validate the SQL, count its `?` placeholders, and
@@ -330,8 +305,10 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     // optional query timeout. Both happen before we start writing to the client
     // (Step 5), so on timeout we can still return a clean error packet. This is
     // where a hung source or a runaway query would otherwise block forever.
+    let restricted = kokedb_query::context::session_is_restricted(&ctx);
     let produce_first = async {
-        let mut stream = get_batch_stream(&cache, &sf, ctx, &plan, cache_key, max_staleness).await?;
+        let mut stream =
+            get_batch_stream(&cache, &sf, ctx, &plan, cache_key, max_staleness, restricted).await?;
         let first = stream.next().await;
         Ok::<_, String>((stream, first))
     };
@@ -751,12 +728,17 @@ async fn get_batch_stream(
     plan: &Plan,
     cache_key: CacheKey,
     max_staleness: Option<u64>,
+    restricted: bool,
 ) -> Result<BatchStream, String> {
     // A freshness-demanding query must not read a possibly-stale cached result
     // (cached results carry no age), nor pollute the cache with a result whose
     // tables were routed live. Bypass the result cache entirely; the staleness
     // value flows on into per-table routing.
-    if !should_cache_plan(plan) || max_staleness.is_some() {
+    //
+    // Restricted (ACL-scoped) sessions also bypass the shared, user-agnostic
+    // cache: a hit would skip catalog-ACL enforcement, which only happens during
+    // planning. Their queries always plan, which errors on a denied catalog.
+    if !should_cache_plan(plan) || max_staleness.is_some() || restricted {
         // Commands, non-cacheable plans, and fresh-required queries bypass cache.
         return execute_query_with_cache(ctx, plan, cache_key, cache.clone(), None, max_staleness)
             .await;
@@ -1000,36 +982,8 @@ mod tests {
         assert_eq!(quote_sql_string("a\\b"), "'a\\\\b'");
     }
 
-    /// Computes the `mysql_native_password` token a client would send.
-    fn client_token(password: &str, salt: &[u8]) -> Vec<u8> {
-        let hash1 = Sha1::digest(password.as_bytes());
-        let hash2 = Sha1::digest(hash1);
-        let mut hasher = Sha1::new();
-        hasher.update(salt);
-        hasher.update(hash2);
-        let scramble = hasher.finalize();
-        scramble
-            .iter()
-            .zip(hash1.iter())
-            .map(|(s, h)| s ^ h)
-            .collect()
-    }
-
-    #[test]
-    fn native_password_accepts_correct_and_rejects_wrong() {
-        let cfg = AuthConfig {
-            user: "root".to_string(),
-            password: "s3cret".to_string(),
-        };
-        let salt = b"01234567890123456789";
-        let good = client_token("s3cret", salt);
-        assert!(cfg.verify_native_password(salt, &good));
-
-        let bad = client_token("wrong", salt);
-        assert!(!cfg.verify_native_password(salt, &bad));
-        // Malformed (wrong length) tokens are rejected.
-        assert!(!cfg.verify_native_password(salt, b"short"));
-    }
+    // mysql_native_password verification lives in kokedb_common::auth and is
+    // tested there.
 }
 
 /// Runs the MySQL wire server on `bind_addr` using already-initialized shared
@@ -1039,11 +993,12 @@ pub async fn serve(shared: SharedServices, bind_addr: String) -> Result<(), Mysq
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("kokedb MySQL server listening on {}", bind_addr);
 
-    let auth = AuthConfig::from_env().map(Arc::new);
-    if auth.is_some() {
-        info!("MySQL authentication enabled");
+    // Auth is enforced when any application user exists in the meta store.
+    let auth_enabled = shared.meta().count_app_users().await.unwrap_or(0) > 0;
+    if auth_enabled {
+        info!("MySQL authentication enabled (system.app_user)");
     } else {
-        warn!("MySQL authentication disabled (set KOKEDB_MYSQL_PASSWORD to enable)");
+        warn!("MySQL authentication disabled (no rows in system.app_user; seed via KOKEDB_ADMIN_USER/PASSWORD)");
     }
 
     let result_cache = shared.result_cache();
@@ -1053,7 +1008,6 @@ pub async fn serve(shared: SharedServices, bind_addr: String) -> Result<(), Mysq
         let (stream, _) = listener.accept().await?;
         let (r, w) = stream.into_split();
         let cache = result_cache.clone();
-        let auth = auth.clone();
         let sf = singleflight.clone();
         let ctx = match create_session_context(&shared) {
             Ok(ctx) => Arc::new(ctx),
@@ -1069,7 +1023,7 @@ pub async fn serve(shared: SharedServices, bind_addr: String) -> Result<(), Mysq
                 .active_connections
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = AsyncMysqlIntermediary::run_on(
-                CoreContex::new(ctx, cache, auth, sf, meta, plan_cache),
+                CoreContex::new(ctx, cache, auth_enabled, sf, meta, plan_cache),
                 r,
                 w,
             )

@@ -25,6 +25,42 @@ pub struct CatalogInfo {
     pub dsn: String,
 }
 
+/// An application account used to authenticate wire-protocol clients and scope
+/// which catalogs they may access.
+#[derive(Debug, Clone)]
+pub struct AppUser {
+    pub username: String,
+    /// Uppercase hex of `SHA1(SHA1(password))`; empty = passwordless.
+    pub auth_digest: String,
+    pub is_superuser: bool,
+    /// Catalogs this user may access. `None` means unrestricted (superuser or a
+    /// `*` allow-list); `Some(set)` is an explicit allow-list (possibly empty).
+    pub allowed_catalogs: Option<std::collections::HashSet<String>>,
+}
+
+/// Parses a comma-separated catalog allow-list into a scoping set. `*` (or a
+/// blank list for a superuser) yields `None` (unrestricted).
+fn parse_allowed_catalogs(
+    raw: &str,
+    is_superuser: bool,
+) -> Option<std::collections::HashSet<String>> {
+    if is_superuser {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed == "*" {
+        return None;
+    }
+    Some(
+        trimmed
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect(),
+    )
+}
+
 /// Persisted incremental-sync state for a single cached table.
 #[derive(Debug, Clone, Default)]
 pub struct TableSyncState {
@@ -340,6 +376,22 @@ impl PostgreSQLMetaCatalogProviderList {
                 PRIMARY KEY (catalog, schema_name)
             );
             "#,
+            // Application accounts for the wire front-ends (multi-tenancy/auth).
+            // `auth_digest` is uppercase hex of SHA1(SHA1(password)) (the MySQL
+            // `mysql_native_password` digest), empty for a passwordless account.
+            // `allowed_catalogs` is a comma-separated allow-list; superusers and
+            // the literal `*` mean every catalog. When the table is empty,
+            // authentication is disabled (open access) for backward compatibility.
+            r#"
+            CREATE TABLE IF NOT EXISTS system.app_user (
+                username VARCHAR(255) PRIMARY KEY,
+                auth_digest VARCHAR(64) NOT NULL DEFAULT '',
+                is_superuser BOOLEAN NOT NULL DEFAULT FALSE,
+                allowed_catalogs TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            "#,
         ];
 
         for sql in sql_statements {
@@ -477,6 +529,68 @@ impl PostgreSQLMetaCatalogProviderList {
         }
 
         Ok(catalogs)
+    }
+
+    /// Number of application accounts. Zero means authentication is disabled
+    /// (open access) for backward compatibility.
+    pub async fn count_app_users(&self) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) AS n FROM system.app_user")
+            .fetch_one(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(row.get::<i64, _>("n"))
+    }
+
+    /// Looks up an application account by username, returning `None` if absent.
+    pub async fn get_app_user(&self, username: &str) -> Result<Option<AppUser>> {
+        let row = sqlx::query(
+            "SELECT username, auth_digest, is_superuser, allowed_catalogs \
+             FROM system.app_user WHERE username = $1",
+        )
+        .bind(username)
+        .fetch_optional(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+
+        Ok(row.map(|r| {
+            let is_superuser: bool = r.get("is_superuser");
+            let allowed_raw: String = r.try_get("allowed_catalogs").unwrap_or_default();
+            AppUser {
+                username: r.get("username"),
+                auth_digest: r.try_get("auth_digest").unwrap_or_default(),
+                is_superuser,
+                allowed_catalogs: parse_allowed_catalogs(&allowed_raw, is_superuser),
+            }
+        }))
+    }
+
+    /// Creates or updates an application account (used for env-seeded admins and
+    /// programmatic user management).
+    pub async fn upsert_app_user(
+        &self,
+        username: &str,
+        auth_digest: &str,
+        is_superuser: bool,
+        allowed_catalogs: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO system.app_user \
+                (username, auth_digest, is_superuser, allowed_catalogs, updated_at) \
+             VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP) \
+             ON CONFLICT (username) DO UPDATE SET \
+                auth_digest = EXCLUDED.auth_digest, \
+                is_superuser = EXCLUDED.is_superuser, \
+                allowed_catalogs = EXCLUDED.allowed_catalogs, \
+                updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(username)
+        .bind(auth_digest)
+        .bind(is_superuser)
+        .bind(allowed_catalogs)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
     }
 
     pub async fn get_catalog(&self, name: &str) -> Result<CatalogInfo> {

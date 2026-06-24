@@ -96,7 +96,7 @@ async fn pg_wire_create_catalog_and_query() {
 
     let result_cache = ResultCache::local(64, 64).await.unwrap();
     let shared = init_shared_services(result_cache).await.unwrap();
-    let handlers = KokedbHandlers::new(shared);
+    let handlers = KokedbHandlers::new(shared, false);
 
     // Start the wire server on an ephemeral port.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -184,7 +184,7 @@ async fn pg_wire_extended_prepared_query() {
 
     let result_cache = ResultCache::local(64, 64).await.unwrap();
     let shared = init_shared_services(result_cache).await.unwrap();
-    let handlers = KokedbHandlers::new(shared);
+    let handlers = KokedbHandlers::new(shared, false);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -270,4 +270,130 @@ async fn pg_wire_extended_prepared_query() {
 
     clean_meta(&meta, catalog).await;
     let _ = sqlx::query("DROP TABLE IF EXISTS pgw_ext").execute(&source).await;
+}
+
+/// Exercises authentication (cleartext password against `system.app_user`) and
+/// catalog-scoped multi-tenancy: a superuser creates two catalogs, a restricted
+/// tenant can query its own catalog but is denied the other, and a wrong
+/// password is rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (source + meta)"]
+async fn pg_wire_auth_and_multitenancy() {
+    let cat_a = "mt_cat_a";
+    let cat_b = "mt_cat_b";
+    std::env::set_var("PG_META_DSN", meta_dsn());
+    std::env::set_var("KOKEDB_REEVALUATE_INTERVAL_MIN", "60");
+
+    let source = PgPool::connect(&source_dsn()).await.unwrap();
+    for stmt in [
+        "DROP TABLE IF EXISTS mt_a",
+        "DROP TABLE IF EXISTS mt_b",
+        "CREATE TABLE mt_a (id int PRIMARY KEY)",
+        "CREATE TABLE mt_b (id int PRIMARY KEY)",
+        "INSERT INTO mt_a SELECT generate_series(1, 5)",
+        "INSERT INTO mt_b SELECT generate_series(1, 9)",
+    ] {
+        sqlx::query(stmt).execute(&source).await.unwrap();
+    }
+    let meta = PgPool::connect(&meta_dsn()).await.unwrap();
+    clean_meta(&meta, cat_a).await;
+    clean_meta(&meta, cat_b).await;
+
+    let result_cache = ResultCache::local(64, 64).await.unwrap();
+    let shared = init_shared_services(result_cache).await.unwrap();
+
+    // Seed accounts: a superuser and a tenant scoped to cat_a only.
+    let m = shared.meta();
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('mt_admin','mt_tenant')")
+        .execute(&meta)
+        .await;
+    m.upsert_app_user("mt_admin", &kokedb_common::auth::password_digest("adminpw"), true, "*")
+        .await
+        .unwrap();
+    m.upsert_app_user(
+        "mt_tenant",
+        &kokedb_common::auth::password_digest("tenantpw"),
+        false,
+        cat_a,
+    )
+    .await
+    .unwrap();
+
+    // Auth-enabled server.
+    let handlers = KokedbHandlers::new(shared, true);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let h = handlers.clone();
+            tokio::spawn(async move {
+                let _ = process_socket(sock, None, h).await;
+            });
+        }
+    });
+    let port = addr.port();
+
+    // Wrong password is rejected.
+    let bad = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=mt_admin password=wrong dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await;
+    assert!(bad.is_err(), "wrong password should be rejected");
+
+    // Superuser connects and creates both catalogs.
+    let (admin, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=mt_admin password=adminpw dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("admin auth");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    for (cat, tbl) in [(cat_a, "mt_a"), (cat_b, "mt_b")] {
+        admin
+            .simple_query(&format!(
+                "CREATE CATALOG {cat} USING '{}' WITH properties(cache_policy=\"select\", \
+                 table_set=\"public.{tbl}\")",
+                source_dsn()
+            ))
+            .await
+            .expect("admin CREATE CATALOG");
+    }
+    assert!(wait_until_cached(&meta, cat_a, "mt_a", Duration::from_secs(60)).await);
+    assert!(wait_until_cached(&meta, cat_b, "mt_b", Duration::from_secs(60)).await);
+
+    // Tenant scoped to cat_a: allowed on cat_a, denied on cat_b.
+    let (tenant, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=mt_tenant password=tenantpw dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("tenant auth");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let allowed = tenant
+        .simple_query(&format!("SELECT count(*) AS c FROM {cat_a}.public.mt_a"))
+        .await
+        .expect("tenant query on own catalog");
+    assert_eq!(first_value(&allowed, "c").as_deref(), Some("5"), "tenant sees its catalog");
+
+    let denied = tenant
+        .simple_query(&format!("SELECT count(*) AS c FROM {cat_b}.public.mt_b"))
+        .await;
+    assert!(denied.is_err(), "tenant must be denied access to other catalog");
+
+    // Cleanup: remove users so other suites (and serve()'s auth gate) see an
+    // empty app_user table again.
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('mt_admin','mt_tenant')")
+        .execute(&meta)
+        .await;
+    clean_meta(&meta, cat_a).await;
+    clean_meta(&meta, cat_b).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS mt_a").execute(&source).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS mt_b").execute(&source).await;
 }

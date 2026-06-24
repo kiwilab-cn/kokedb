@@ -50,9 +50,13 @@ services:
       PG_META_DSN: postgresql://postgres:123456@postgres:5432/kokedb
       RESULT_CACHE_DIR: /data/cache
       RUST_LOG: ${RUST_LOG:-info}
-      # MySQL auth — set KOKEDB_MYSQL_PASSWORD to enable (empty = open access).
-      KOKEDB_MYSQL_USER: ${KOKEDB_MYSQL_USER:-root}
-      KOKEDB_MYSQL_PASSWORD: ${KOKEDB_MYSQL_PASSWORD:-}
+      # Authentication & multi-tenancy: accounts live in `system.app_user` and
+      # apply to BOTH the MySQL and PostgreSQL front-ends. Setting both vars below
+      # seeds a superuser on startup; once any user exists, auth is enforced.
+      # Leave them empty for open access (no auth). Scope other users to specific
+      # catalogs via the `allowed_catalogs` column.
+      KOKEDB_ADMIN_USER: ${KOKEDB_ADMIN_USER:-}
+      KOKEDB_ADMIN_PASSWORD: ${KOKEDB_ADMIN_PASSWORD:-}
       # Prometheus metrics endpoint (in-container address).
       KOKEDB_METRICS_ADDR: 0.0.0.0:9090
     ports:
