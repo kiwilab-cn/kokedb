@@ -3227,10 +3227,12 @@ dependencies = [
  "arrow",
  "arrow-buffer",
  "arrow-schema",
+ "bytes",
  "chrono",
  "env_logger",
  "fastrace",
  "figment",
+ "futures",
  "glob",
  "half",
  "hex",
@@ -3238,6 +3240,7 @@ dependencies = [
  "log",
  "num-traits",
  "num_enum",
+ "object_store",
  "opentelemetry",
  "rust_decimal",
  "serde",
@@ -3246,6 +3249,7 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.16",
  "tokio",
+ "url",
  "xxhash-rust",
 ]
 

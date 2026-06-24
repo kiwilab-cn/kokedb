@@ -64,6 +64,14 @@ pub async fn init_shared_services(
 ) -> Result<SharedServices, Box<dyn std::error::Error>> {
     let runtime = Arc::new(RuntimeEnv::default());
 
+    // When snapshots live in a shared object store, register it so the read path
+    // can resolve `s3://…` snapshot URIs. No-op for the local-filesystem default.
+    if let Some(store) = kokedb_common::snapshot_store::SnapshotStore::from_env()? {
+        let (url, object_store) = store.for_registration();
+        runtime.register_object_store(&url, object_store);
+        log::info!("Registered shared snapshot object store: {}", url);
+    }
+
     let catalog_list = Arc::new(PostgreSQLMetaCatalogProviderList::new().await?);
     catalog_list.init_db().await?;
 
