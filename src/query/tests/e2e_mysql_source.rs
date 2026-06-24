@@ -171,6 +171,31 @@ async fn mysql_source_sync_and_query() {
     .await;
     assert_eq!(scalar_count(&done), 100, "varchar decode + predicate");
 
+    // Adaptive signals: reeval computed a data-driven policy (row estimate) and
+    // inferred a trusted `upsert` strategy from the ON UPDATE watermark + PK.
+    let mut adaptive_ok = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        if let Ok((est, mode, tier)) = sqlx::query_as::<_, (Option<i64>, String, String)>(
+            "SELECT est_row_count, inc_mode, inc_tier FROM system.table_sync_policy \
+             WHERE catalog = $1 AND table_name = 'm_orders'",
+        )
+        .bind(catalog)
+        .fetch_one(&meta)
+        .await
+        {
+            if est.unwrap_or(0) > 0 && mode == "upsert" && tier == "trusted" {
+                adaptive_ok = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        adaptive_ok,
+        "adaptive signals + upsert inference were not persisted for the MySQL table"
+    );
+
     // Incremental sync: the `ON UPDATE` watermark + primary key qualify the
     // table for incremental. Update one row and insert another (both bump the
     // microsecond watermark), refresh, and confirm the snapshot merges the delta

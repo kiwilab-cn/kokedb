@@ -133,6 +133,44 @@ pub async fn has_changes_since(
     Ok(e != 0)
 }
 
+/// Reads adaptive signals (row count, on-disk size) for a MySQL table from
+/// information_schema. MySQL has no per-period write counters like PostgreSQL's
+/// pg_stat, so `churn_per_hour` is left at 0 and cadence is driven by size and
+/// access heat. `access_per_day` is supplied by the caller (from the meta store).
+pub async fn collect_signals(
+    pool: &MySqlPool,
+    source_table: &str,
+    access_per_day: f64,
+) -> Result<crate::table_signals::TableSignals, TaskError> {
+    let db = database_of(pool, source_table).await?;
+    let (_, table) = split_db_table(source_table);
+    let row = sqlx::query(
+        "SELECT CAST(COALESCE(table_rows, 0) AS SIGNED) AS rows_est, \
+                CAST(COALESCE(data_length, 0) + COALESCE(index_length, 0) AS SIGNED) AS size_bytes \
+         FROM information_schema.tables \
+         WHERE table_schema = ? AND table_name = ?",
+    )
+    .bind(&db)
+    .bind(table)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| TaskError::DatabaseError(e.to_string()))?;
+
+    let (est_rows, est_size_bytes) = match row {
+        Some(r) => (
+            r.try_get::<i64, _>("rows_est").unwrap_or(0).max(0) as f64,
+            r.try_get::<i64, _>("size_bytes").unwrap_or(0).max(0) as f64,
+        ),
+        None => (0.0, 0.0),
+    };
+    Ok(crate::table_signals::TableSignals {
+        est_rows,
+        est_size_bytes,
+        churn_per_hour: 0.0,
+        access_per_day,
+    })
+}
+
 /// The delta predicate `\`col\` > 'last'` for an incremental fetch.
 pub fn incremental_where(watermark_column: &str, last_watermark: &str) -> String {
     let escaped = last_watermark.replace('\\', "\\\\").replace('\'', "''");
