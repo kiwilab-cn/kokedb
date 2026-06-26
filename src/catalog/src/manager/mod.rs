@@ -39,6 +39,10 @@ pub(super) struct CatalogManagerState {
     pub(super) default_catalog: Arc<str>,
     pub(super) default_database: Namespace,
     pub(super) global_temporary_database: Namespace,
+    /// Per-session catalog allow-list. `None` means unrestricted (superuser or
+    /// authentication disabled); `Some(set)` scopes the session to those
+    /// dynamic catalogs only. The static default catalog is always visible.
+    pub(super) allowed_catalogs: Option<Arc<std::collections::HashSet<String>>>,
 }
 
 pub struct CatalogManagerOptions {
@@ -79,6 +83,7 @@ impl CatalogManager {
             catalog_task_manager: options.catalog_task_manager.clone(),
             dynamic_catalog_list: options.dynamic_catalog_list,
             catalog_task_scheduler: options.catalog_task_scheduler.clone(),
+            allowed_catalogs: None,
         };
         Ok(CatalogManager {
             state: Arc::new(Mutex::new(state)),
@@ -86,6 +91,23 @@ impl CatalogManager {
             result_cache: options.result_cache.clone(),
             scheduler_jobs: options.scheduler_jobs,
         })
+    }
+
+    /// Scopes this session to a catalog allow-list (set after authentication).
+    /// `None` leaves the session unrestricted (superuser / auth disabled).
+    pub fn set_acl(&self, allowed_catalogs: Option<Arc<std::collections::HashSet<String>>>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.allowed_catalogs = allowed_catalogs;
+        }
+    }
+
+    /// Whether this session has a catalog allow-list applied. Restricted
+    /// sessions must bypass the shared, user-agnostic result cache.
+    pub fn is_restricted(&self) -> bool {
+        self.state
+            .lock()
+            .map(|s| s.allowed_catalogs.is_some())
+            .unwrap_or(false)
     }
 
     pub async fn init_catalog_job(&self) -> CatalogResult<()> {
@@ -231,6 +253,15 @@ impl CatalogManagerState {
         }
     }
 
+    /// Whether the session's ACL permits access to a dynamic catalog. Static
+    /// catalogs (e.g. the default catalog) are always allowed.
+    pub(super) fn acl_allows(&self, name: &str) -> bool {
+        match &self.allowed_catalogs {
+            None => true,
+            Some(set) => set.contains(name),
+        }
+    }
+
     pub fn _list_catalog(&self) -> HashMap<Arc<str>, Arc<dyn CatalogProvider>> {
         let mut catalogs: HashMap<String, Arc<dyn CatalogProvider>> = self
             .catalogs
@@ -240,6 +271,9 @@ impl CatalogManagerState {
 
         let catalog_list = self.dynamic_catalog_list.clone();
         for catalog_name in catalog_list.catalog_names() {
+            if !self.acl_allows(&catalog_name) {
+                continue;
+            }
             if let Some(catalog) = catalog_list.catalog(&catalog_name) {
                 let catalog_adapter = DataFusionCatalogAdapter::new(catalog, catalog_name.clone());
                 catalogs.insert(catalog_name.clone(), Arc::new(catalog_adapter));
@@ -259,7 +293,11 @@ impl CatalogManagerState {
             .map(|(k, _)| k.to_string())
             .collect::<Vec<String>>();
 
-        let dynamic_catalog_names = self.dynamic_catalog_list.catalog_names();
+        let dynamic_catalog_names = self
+            .dynamic_catalog_list
+            .catalog_names()
+            .into_iter()
+            .filter(|name| self.acl_allows(name));
 
         catalog_names.extend(dynamic_catalog_names);
         catalog_names
@@ -271,9 +309,12 @@ impl CatalogManagerState {
     pub fn get_catalog(&self, catalog_name: &str) -> CatalogResult<Arc<dyn CatalogProvider>> {
         let catalog_list = self.dynamic_catalog_list.clone();
 
-        if let Some(catalog) = catalog_list.catalog(catalog_name) {
-            let catalog_adapter = DataFusionCatalogAdapter::new(catalog, catalog_name.to_string());
-            return Ok(Arc::new(catalog_adapter));
+        if self.acl_allows(catalog_name) {
+            if let Some(catalog) = catalog_list.catalog(catalog_name) {
+                let catalog_adapter =
+                    DataFusionCatalogAdapter::new(catalog, catalog_name.to_string());
+                return Ok(Arc::new(catalog_adapter));
+            }
         }
 
         self.catalogs

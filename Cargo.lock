@@ -3346,6 +3346,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha1",
  "sqlx",
  "thiserror 2.0.16",
  "tokio",

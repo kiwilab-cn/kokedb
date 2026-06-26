@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod cache_policy;
 pub mod datetime;
 pub mod debug;
