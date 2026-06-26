@@ -24,6 +24,24 @@ members = [
   "src/cache"]
 default-members = ["src/server/kokedb"]
 
+# Disk/debuginfo tuning. The DataFusion + arrow dependency tree is huge; with the
+# default `debug = 2` every artifact (including all deps) carries full DWARF,
+# which is the dominant contributor to `target/` size. We keep lightweight line
+# tables for our own crates (backtraces still show file:line) and drop debuginfo
+# for third-party deps entirely (we never step into them). Override per-invocation
+# with `RUSTFLAGS`/`--profile` when you need full symbols for a dep.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+# Tests inherit from `dev`; keep the same lean settings for the test harnesses.
+[profile.test]
+debug = "line-tables-only"
+
+[profile.test.package."*"]
+debug = false
 
 [workspace.lints.rust]
 unused_extern_crates = "warn"
