@@ -350,15 +350,15 @@ impl PlanResolver<'_> {
             CommandNode::ListUsers { pattern } => {
                 self.resolve_catalog_command(CatalogCommand::ListUsers { pattern })
             }
-            CommandNode::GrantCatalog { catalog, username } => {
-                self.resolve_catalog_command(CatalogCommand::GrantCatalog {
-                    catalog: catalog.into(),
+            CommandNode::GrantScope { scope, username } => {
+                self.resolve_catalog_command(CatalogCommand::GrantScope {
+                    scope: scope.into(),
                     username: username.into(),
                 })
             }
-            CommandNode::RevokeCatalog { catalog, username } => {
-                self.resolve_catalog_command(CatalogCommand::RevokeCatalog {
-                    catalog: catalog.into(),
+            CommandNode::RevokeScope { scope, username } => {
+                self.resolve_catalog_command(CatalogCommand::RevokeScope {
+                    scope: scope.into(),
                     username: username.into(),
                 })
             }

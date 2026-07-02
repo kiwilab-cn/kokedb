@@ -40,10 +40,11 @@ pub(super) struct CatalogManagerState {
     pub(super) default_catalog: Arc<str>,
     pub(super) default_database: Namespace,
     pub(super) global_temporary_database: Namespace,
-    /// Per-session catalog allow-list. `None` means unrestricted (superuser or
-    /// authentication disabled); `Some(set)` scopes the session to those
-    /// dynamic catalogs only. The static default catalog is always visible.
-    pub(super) allowed_catalogs: Option<Arc<std::collections::HashSet<String>>>,
+    /// Per-session authorization scopes. `None` means unrestricted (superuser
+    /// or authentication disabled); `Some(acl)` scopes the session to the
+    /// granted catalogs/databases/tables. Static catalogs (e.g. the default
+    /// in-memory catalog for temp views) are always accessible.
+    pub(super) acl: Option<Arc<crate::acl::CatalogAcl>>,
 }
 
 pub struct CatalogManagerOptions {
@@ -84,7 +85,7 @@ impl CatalogManager {
             catalog_task_manager: options.catalog_task_manager.clone(),
             dynamic_catalog_list: options.dynamic_catalog_list,
             catalog_task_scheduler: options.catalog_task_scheduler.clone(),
-            allowed_catalogs: None,
+            acl: None,
         };
         Ok(CatalogManager {
             state: Arc::new(Mutex::new(state)),
@@ -94,20 +95,23 @@ impl CatalogManager {
         })
     }
 
-    /// Scopes this session to a catalog allow-list (set after authentication).
-    /// `None` leaves the session unrestricted (superuser / auth disabled).
-    pub fn set_acl(&self, allowed_catalogs: Option<Arc<std::collections::HashSet<String>>>) {
+    /// Scopes this session to a set of grant scopes (set after
+    /// authentication). Each scope is `catalog`, `catalog.schema`, or
+    /// `catalog.schema.table` — see [`crate::acl::CatalogAcl`]. `None` leaves
+    /// the session unrestricted (superuser / auth disabled).
+    pub fn set_acl(&self, scopes: Option<Arc<std::collections::HashSet<String>>>) {
+        let acl = scopes.map(|s| Arc::new(crate::acl::CatalogAcl::from_scopes(s.iter())));
         if let Ok(mut state) = self.state.lock() {
-            state.allowed_catalogs = allowed_catalogs;
+            state.acl = acl;
         }
     }
 
-    /// Whether this session has a catalog allow-list applied. Restricted
+    /// Whether this session has an authorization scope applied. Restricted
     /// sessions must bypass the shared, user-agnostic result cache.
     pub fn is_restricted(&self) -> bool {
         self.state
             .lock()
-            .map(|s| s.allowed_catalogs.is_some())
+            .map(|s| s.acl.is_some())
             .unwrap_or(false)
     }
 
@@ -160,6 +164,12 @@ impl CatalogManager {
     ) -> CatalogResult<(Arc<dyn CatalogProvider>, Namespace)> {
         let state = self.state()?;
         let (catalog, database) = state.resolve_database_reference(database)?;
+        if !state.acl_allows_database(&catalog, &database.head) {
+            return Err(CatalogError::PermissionDenied(format!(
+                "database {catalog}.{}",
+                database.head
+            )));
+        }
         Ok((state.get_catalog(&catalog)?, database))
     }
 
@@ -169,15 +179,32 @@ impl CatalogManager {
     ) -> CatalogResult<(Arc<dyn CatalogProvider>, Option<Namespace>)> {
         let state = self.state()?;
         let (catalog, database) = state.resolve_optional_database_reference(database)?;
+        if let Some(db) = &database {
+            if !state.acl_allows_database(&catalog, &db.head) {
+                return Err(CatalogError::PermissionDenied(format!(
+                    "database {catalog}.{}",
+                    db.head
+                )));
+            }
+        }
         Ok((state.get_catalog(&catalog)?, database))
     }
 
+    /// Resolves a table reference and enforces the session's authorization
+    /// scope — the single chokepoint every table access (queries, metadata,
+    /// DDL) funnels through.
     pub(super) fn resolve_object<T: AsRef<str>>(
         &self,
         object: &[T],
     ) -> CatalogResult<(Arc<dyn CatalogProvider>, Namespace, Arc<str>)> {
         let state = self.state()?;
         let (catalog, database, table) = state.resolve_object_reference(object)?;
+        if !state.acl_allows_table(&catalog, &database.head, &table) {
+            return Err(CatalogError::PermissionDenied(format!(
+                "table {catalog}.{}.{table}",
+                database.head
+            )));
+        }
         Ok((state.get_catalog(&catalog)?, database, table))
     }
 }
@@ -254,12 +281,38 @@ impl CatalogManagerState {
         }
     }
 
-    /// Whether the session's ACL permits access to a dynamic catalog. Static
-    /// catalogs (e.g. the default catalog) are always allowed.
+    /// Whether the session may resolve/list a dynamic catalog (any grant at
+    /// or below it). Static catalogs (e.g. the default catalog) are always
+    /// allowed and never reach these checks.
     pub(super) fn acl_allows(&self, name: &str) -> bool {
-        match &self.allowed_catalogs {
+        match &self.acl {
             None => true,
-            Some(set) => set.contains(name),
+            Some(acl) => acl.allows_catalog(name),
+        }
+    }
+
+    /// Whether the session may resolve/list a database inside a dynamic
+    /// catalog.
+    pub(super) fn acl_allows_database(&self, catalog: &str, schema: &str) -> bool {
+        // Static catalogs are exempt from ACL checks.
+        if self.catalogs.contains_key(catalog) {
+            return true;
+        }
+        match &self.acl {
+            None => true,
+            Some(acl) => acl.allows_database(catalog, schema),
+        }
+    }
+
+    /// Whether the session may read a table inside a dynamic catalog.
+    pub(super) fn acl_allows_table(&self, catalog: &str, schema: &str, table: &str) -> bool {
+        // Static catalogs (temp views, default in-memory catalog) are exempt.
+        if self.catalogs.contains_key(catalog) {
+            return true;
+        }
+        match &self.acl {
+            None => true,
+            Some(acl) => acl.allows_table(catalog, schema, table),
         }
     }
 

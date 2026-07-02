@@ -12,6 +12,8 @@ pub enum CatalogError {
     AlreadyExists(&'static str, String),
     #[error("not supported: {0}")]
     NotSupported(String),
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error("internal error: {0}")]
     Internal(String),
     #[error("external error: {0}")]

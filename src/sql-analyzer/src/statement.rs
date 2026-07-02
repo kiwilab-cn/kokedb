@@ -177,8 +177,8 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
                 Either::Left(x) => x.value,
                 Either::Right(x) => from_ast_string(x)?,
             };
-            let node = spec::CommandNode::GrantCatalog {
-                catalog: catalog.into(),
+            let node = spec::CommandNode::GrantScope {
+                scope: spec::ObjectName::bare(catalog),
                 username: username.into(),
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
@@ -198,8 +198,56 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
                 Either::Left(x) => x.value,
                 Either::Right(x) => from_ast_string(x)?,
             };
-            let node = spec::CommandNode::RevokeCatalog {
-                catalog: catalog.into(),
+            let node = spec::CommandNode::RevokeScope {
+                scope: spec::ObjectName::bare(catalog),
+                username: username.into(),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::GrantDatabase {
+            grant: _,
+            database: _,
+            name,
+            to: _,
+            user,
+        }
+        | Statement::GrantTable {
+            grant: _,
+            table: _,
+            name,
+            to: _,
+            user,
+        } => {
+            let username = match user {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let node = spec::CommandNode::GrantScope {
+                scope: from_ast_object_name(name)?,
+                username: username.into(),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::RevokeDatabase {
+            revoke: _,
+            database: _,
+            name,
+            from: _,
+            user,
+        }
+        | Statement::RevokeTable {
+            revoke: _,
+            table: _,
+            name,
+            from: _,
+            user,
+        } => {
+            let username = match user {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let node = spec::CommandNode::RevokeScope {
+                scope: from_ast_object_name(name)?,
                 username: username.into(),
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))

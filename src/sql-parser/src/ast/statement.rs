@@ -102,6 +102,36 @@ pub enum Statement {
         from: From,
         user: Either<Ident, StringLiteral>,
     },
+    /// `GRANT DATABASE cat.schema TO user` — grants one database.
+    GrantDatabase {
+        grant: Grant,
+        database: Database,
+        name: ObjectName,
+        to: To,
+        user: Either<Ident, StringLiteral>,
+    },
+    /// `GRANT TABLE cat.schema.table TO user` — grants a single table.
+    GrantTable {
+        grant: Grant,
+        table: Table,
+        name: ObjectName,
+        to: To,
+        user: Either<Ident, StringLiteral>,
+    },
+    RevokeDatabase {
+        revoke: Revoke,
+        database: Database,
+        name: ObjectName,
+        from: From,
+        user: Either<Ident, StringLiteral>,
+    },
+    RevokeTable {
+        revoke: Revoke,
+        table: Table,
+        name: ObjectName,
+        from: From,
+        user: Either<Ident, StringLiteral>,
+    },
     UseDatabase {
         r#use: Use,
         database: Either<Database, Schema>,
