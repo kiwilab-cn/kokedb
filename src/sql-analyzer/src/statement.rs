@@ -310,6 +310,66 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             let node = spec::CommandNode::ListRowPolicies;
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::CreateColumnPolicy {
+            create: _,
+            column: _,
+            policy: _,
+            on: _,
+            table,
+            r#for: _,
+            user,
+            using: _,
+            columns,
+        } => {
+            let username = match user {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let columns = from_ast_string(columns)?;
+            // Reject an empty or malformed column list at CREATE time.
+            if !columns
+                .split(',')
+                .map(str::trim)
+                .any(|c| !c.is_empty())
+            {
+                return Err(SqlError::invalid(
+                    "column policy needs at least one column name",
+                ));
+            }
+            let node = spec::CommandNode::CreateColumnPolicy {
+                table: from_ast_object_name(table)?,
+                username: username.into(),
+                columns,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::DropColumnPolicy {
+            drop: _,
+            column: _,
+            policy: _,
+            on: _,
+            table,
+            r#for: _,
+            user,
+        } => {
+            let username = match user {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let node = spec::CommandNode::DropColumnPolicy {
+                table: from_ast_object_name(table)?,
+                username: username.into(),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::ShowColumnPolicies {
+            show: _,
+            column: _,
+            policies: _,
+        } => {
+            let node = spec::CommandNode::ListColumnPolicies;
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::UseDatabase {
             r#use: _,
             database: _,

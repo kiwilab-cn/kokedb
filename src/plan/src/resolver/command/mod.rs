@@ -380,6 +380,24 @@ impl PlanResolver<'_> {
             CommandNode::ListRowPolicies => {
                 self.resolve_catalog_command(CatalogCommand::ListRowPolicies)
             }
+            CommandNode::CreateColumnPolicy {
+                table,
+                username,
+                columns,
+            } => self.resolve_catalog_command(CatalogCommand::CreateColumnPolicy {
+                table: table.into(),
+                username: username.into(),
+                columns,
+            }),
+            CommandNode::DropColumnPolicy { table, username } => {
+                self.resolve_catalog_command(CatalogCommand::DropColumnPolicy {
+                    table: table.into(),
+                    username: username.into(),
+                })
+            }
+            CommandNode::ListColumnPolicies => {
+                self.resolve_catalog_command(CatalogCommand::ListColumnPolicies)
+            }
         }
     }
 

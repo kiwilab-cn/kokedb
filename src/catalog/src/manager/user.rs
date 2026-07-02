@@ -8,7 +8,7 @@
 
 use kokedb_common::auth::password_digest;
 
-use crate::display::{RowPolicyDisplay, UserDisplay};
+use crate::display::{ColumnPolicyDisplay, RowPolicyDisplay, UserDisplay};
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::utils::match_pattern;
@@ -242,6 +242,76 @@ impl CatalogManager {
                 table: format!("{catalog}.{schema}.{table}"),
                 filter,
             })
+            .collect())
+    }
+
+    /// Backs `CREATE COLUMN POLICY ON c.s.t FOR user USING 'a,b'`. The listed
+    /// columns read as NULL for that user. Creating a policy for an existing
+    /// `(user, table)` replaces it.
+    pub async fn create_column_policy(
+        &self,
+        table: &[String],
+        username: &str,
+        columns: &str,
+    ) -> CatalogResult<()> {
+        self.require_admin()?;
+        let [catalog, schema, table_name] = table else {
+            return Err(CatalogError::InvalidArgument(
+                "column policies require a fully qualified catalog.schema.table".to_string(),
+            ));
+        };
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        meta.get_app_user(username)
+            .await
+            .map_err(|e| CatalogError::External(format!("Failed to look up user: {e}")))?
+            .ok_or_else(|| CatalogError::NotFound("user", username.to_string()))?;
+        meta.upsert_column_policy(username, catalog, schema, table_name, columns)
+            .await
+            .map_err(|e| {
+                CatalogError::External(format!("Failed to create column policy: {e}"))
+            })?;
+        Ok(())
+    }
+
+    /// Backs `DROP COLUMN POLICY ON c.s.t FOR user`.
+    pub async fn drop_column_policy(&self, table: &[String], username: &str) -> CatalogResult<()> {
+        self.require_admin()?;
+        let [catalog, schema, table_name] = table else {
+            return Err(CatalogError::InvalidArgument(
+                "column policies require a fully qualified catalog.schema.table".to_string(),
+            ));
+        };
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let deleted = meta
+            .delete_column_policy(username, catalog, schema, table_name)
+            .await
+            .map_err(|e| CatalogError::External(format!("Failed to drop column policy: {e}")))?;
+        if !deleted {
+            return Err(CatalogError::NotFound(
+                "column policy",
+                format!("{catalog}.{schema}.{table_name} for {username}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Backs `SHOW COLUMN POLICIES`.
+    pub async fn list_column_policies(&self) -> CatalogResult<Vec<ColumnPolicyDisplay>> {
+        self.require_admin()?;
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let rows = meta
+            .list_all_column_policies()
+            .await
+            .map_err(|e| CatalogError::External(format!("Failed to list column policies: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(username, catalog, schema, table, masked_columns)| ColumnPolicyDisplay {
+                    username,
+                    table: format!("{catalog}.{schema}.{table}"),
+                    masked_columns,
+                },
+            )
             .collect())
     }
 

@@ -428,6 +428,20 @@ impl PostgreSQLMetaCatalogProviderList {
                 PRIMARY KEY (username, catalog, schema_name, table_name)
             );
             "#,
+            // Column-level security: a per-(user, table) comma-separated list
+            // of masked columns. Reads by that user see NULL in those columns,
+            // and their predicates can never probe the real values.
+            r#"
+            CREATE TABLE IF NOT EXISTS system.column_policy (
+                username VARCHAR(255) NOT NULL,
+                catalog VARCHAR(255) NOT NULL,
+                schema_name VARCHAR(255) NOT NULL,
+                table_name VARCHAR(255) NOT NULL,
+                masked_columns TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (username, catalog, schema_name, table_name)
+            );
+            "#,
         ];
 
         for sql in sql_statements {
@@ -763,14 +777,121 @@ impl PostgreSQLMetaCatalogProviderList {
             .collect())
     }
 
-    /// Drops all of a user's row policies (called when the user is dropped).
+    /// Drops all of a user's row and column policies (called when the user is
+    /// dropped).
     pub async fn delete_row_policies_for_user(&self, username: &str) -> Result<()> {
-        sqlx::query("DELETE FROM system.row_policy WHERE username = $1")
-            .bind(username)
-            .execute(&self.local_pool)
-            .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        for sql in [
+            "DELETE FROM system.row_policy WHERE username = $1",
+            "DELETE FROM system.column_policy WHERE username = $1",
+        ] {
+            sqlx::query(sql)
+                .bind(username)
+                .execute(&self.local_pool)
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        }
         Ok(())
+    }
+
+    /// Creates or replaces a column (masking) policy for `(username, table)`.
+    pub async fn upsert_column_policy(
+        &self,
+        username: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        masked_columns: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO system.column_policy \
+                (username, catalog, schema_name, table_name, masked_columns, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) \
+             ON CONFLICT (username, catalog, schema_name, table_name) DO UPDATE SET \
+                masked_columns = EXCLUDED.masked_columns, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(username)
+        .bind(catalog)
+        .bind(schema)
+        .bind(table)
+        .bind(masked_columns)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
+    /// Removes a column policy. Returns whether one existed.
+    pub async fn delete_column_policy(
+        &self,
+        username: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<bool> {
+        let ret = sqlx::query(
+            "DELETE FROM system.column_policy WHERE username = $1 AND catalog = $2 \
+             AND schema_name = $3 AND table_name = $4",
+        )
+        .bind(username)
+        .bind(catalog)
+        .bind(schema)
+        .bind(table)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(ret.rows_affected() > 0)
+    }
+
+    /// All column policies for one user: `(catalog, schema, table,
+    /// masked_columns)`. Loaded at authentication time.
+    pub async fn list_column_policies(
+        &self,
+        username: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let rows = sqlx::query(
+            "SELECT catalog, schema_name, table_name, masked_columns \
+             FROM system.column_policy WHERE username = $1",
+        )
+        .bind(username)
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get("catalog"),
+                    r.get("schema_name"),
+                    r.get("table_name"),
+                    r.get("masked_columns"),
+                )
+            })
+            .collect())
+    }
+
+    /// Every column policy, ordered for stable `SHOW COLUMN POLICIES` output.
+    pub async fn list_all_column_policies(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, String)>> {
+        let rows = sqlx::query(
+            "SELECT username, catalog, schema_name, table_name, masked_columns \
+             FROM system.column_policy ORDER BY username, catalog, schema_name, table_name",
+        )
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get("username"),
+                    r.get("catalog"),
+                    r.get("schema_name"),
+                    r.get("table_name"),
+                    r.get("masked_columns"),
+                )
+            })
+            .collect())
     }
 
     /// Replaces a user's catalog allow-list. Returns whether the user exists.

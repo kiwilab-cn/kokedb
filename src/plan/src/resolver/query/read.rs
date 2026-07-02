@@ -173,7 +173,18 @@ impl PlanResolver<'_> {
                     }
                 };
 
+                // Original column names + types, paired below with the
+                // internal names the scan is renamed to; the column-masking
+                // policy is expressed in original names.
+                let original_fields: Vec<(String, datafusion::arrow::datatypes::DataType)> =
+                    table_provider
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| (f.name().clone(), f.data_type().clone()))
+                        .collect();
                 let names = state.register_fields(table_provider.schema().fields());
+                let internal_names = names.clone();
                 let table_provider = RenameTableProvider::try_new(table_provider, names)?;
                 let scan = LogicalPlan::TableScan(TableScan::try_new(
                     table_reference,
@@ -193,7 +204,7 @@ impl PlanResolver<'_> {
                     .ctx
                     .extension::<CatalogManager>()?
                     .row_policy_expr(&catalog, schema_for_policy, &table_name_for_policy);
-                match policy {
+                let plan = match policy {
                     None => scan,
                     Some(Some(filter_expr)) => {
                         let schema = scan.schema().clone();
@@ -211,6 +222,48 @@ impl PlanResolver<'_> {
                              {table_name_for_policy} could not be applied (invalid predicate; \
                              access is denied fail-closed)"
                         )))
+                    }
+                };
+
+                // Column-level security: project masked columns to typed NULLs
+                // ABOVE the row-policy filter (the admin-defined filter may
+                // reference masked columns and must see real values) and BELOW
+                // everything the user wrote — so user predicates, joins and
+                // aggregates only ever observe the masked NULLs.
+                let masked = self
+                    .ctx
+                    .extension::<CatalogManager>()?
+                    .masked_columns(&catalog, schema_for_policy, &table_name_for_policy);
+                match masked {
+                    None => plan,
+                    Some(masked) => {
+                        let masked: std::collections::HashSet<&str> =
+                            masked.iter().map(String::as_str).collect();
+                        let exprs = original_fields
+                            .iter()
+                            .zip(internal_names.iter())
+                            .map(|((orig, data_type), internal)| {
+                                if masked.contains(orig.as_str()) {
+                                    // Typed NULL keeps the column's schema
+                                    // (name + type) intact for downstream.
+                                    let null = datafusion_common::ScalarValue::try_from(data_type)
+                                        .map_err(|e| {
+                                            PlanError::AnalysisError(format!(
+                                                "column policy: cannot mask {orig}: {e}"
+                                            ))
+                                        })?;
+                                    Ok(datafusion_expr::lit(null)
+                                        .alias(internal.clone()))
+                                } else {
+                                    Ok(datafusion_expr::Expr::Column(
+                                        datafusion_common::Column::new_unqualified(internal),
+                                    ))
+                                }
+                            })
+                            .collect::<PlanResult<Vec<_>>>()?;
+                        datafusion_expr::LogicalPlanBuilder::from(plan)
+                            .project(exprs)?
+                            .build()?
                     }
                 }
             }

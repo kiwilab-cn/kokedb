@@ -314,7 +314,8 @@ impl KokedbQueryHandler {
                 }
             }
         };
-        set_session_acl(&ctx, acl.scopes.clone(), acl.policies.clone()).map_err(pg_err)?;
+        set_session_acl(&ctx, acl.scopes.clone(), acl.policies.clone(), acl.column_policies.clone())
+            .map_err(pg_err)?;
         Ok(ctx)
     }
 

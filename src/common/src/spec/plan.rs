@@ -587,6 +587,18 @@ pub enum CommandNode {
         username: Identifier,
     },
     ListRowPolicies,
+    /// Column-level security: mask the listed columns (comma-separated,
+    /// validated at analysis time) for `(username, table)` reads.
+    CreateColumnPolicy {
+        table: ObjectName,
+        username: Identifier,
+        columns: String,
+    },
+    DropColumnPolicy {
+        table: ObjectName,
+        username: Identifier,
+    },
+    ListColumnPolicies,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

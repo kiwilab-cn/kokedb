@@ -247,12 +247,33 @@ pub fn set_session_acl(
     ctx: &SessionContext,
     allowed_catalogs: Option<Arc<std::collections::HashSet<String>>>,
     policies: Vec<kokedb_catalog::acl::RowPolicy>,
+    column_policies: Vec<kokedb_catalog::acl::ColumnPolicy>,
 ) -> Result<(), String> {
     let manager = ctx
         .extension::<CatalogManager>()
         .map_err(|e| format!("catalog manager unavailable: {e}"))?;
-    manager.set_acl(allowed_catalogs, policies);
+    manager.set_acl(allowed_catalogs, policies, column_policies);
     Ok(())
+}
+
+/// Converts raw column-policy rows loaded at authentication time —
+/// `(catalog, schema, table, masked_columns_csv)` — into session policies.
+pub fn parse_column_policies(
+    rows: Vec<(String, String, String, String)>,
+) -> Vec<kokedb_catalog::acl::ColumnPolicy> {
+    rows.into_iter()
+        .map(|(catalog, schema, table, masked)| kokedb_catalog::acl::ColumnPolicy {
+            catalog,
+            schema,
+            table,
+            masked: masked
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect(),
+        })
+        .collect()
 }
 
 /// Parses the raw row-policy rows loaded at authentication time —

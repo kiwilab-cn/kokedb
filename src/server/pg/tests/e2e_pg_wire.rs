@@ -940,3 +940,210 @@ async fn pg_wire_row_level_security() {
     clean_meta(&meta, catalog).await;
     let _ = sqlx::query("DROP TABLE IF EXISTS rls_orders").execute(&source).await;
 }
+
+/// Column-level security: masked columns read as NULL for the policy user
+/// (including through predicates, so real values can't be probed), other
+/// users are unaffected, SHOW COLUMN POLICIES lists it, and DROP restores
+/// full reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (source + meta)"]
+async fn pg_wire_column_level_security() {
+    let catalog = "cls_cat";
+    std::env::set_var("PG_META_DSN", meta_dsn());
+    std::env::set_var("KOKEDB_REEVALUATE_INTERVAL_MIN", "60");
+
+    let source = PgPool::connect(&source_dsn()).await.unwrap();
+    for stmt in [
+        "DROP TABLE IF EXISTS cls_people",
+        "CREATE TABLE cls_people (id int PRIMARY KEY, name text, ssn text)",
+        "INSERT INTO cls_people VALUES (1,'ann','111-11'),(2,'bob','222-22'),(3,'cyd','333-33')",
+    ] {
+        sqlx::query(stmt).execute(&source).await.unwrap();
+    }
+    let meta = PgPool::connect(&meta_dsn()).await.unwrap();
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('cls_admin','cls_user')")
+        .execute(&meta)
+        .await;
+    let _ = sqlx::query(
+        "DELETE FROM system.column_policy WHERE username IN ('cls_admin','cls_user')",
+    )
+    .execute(&meta)
+    .await;
+
+    let result_cache = ResultCache::local(64, 64).await.unwrap();
+    let shared = init_shared_services(result_cache).await.unwrap();
+    let handlers = KokedbHandlers::new(shared);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let h = handlers.clone();
+            tokio::spawn(async move {
+                let _ = process_socket(sock, None, h).await;
+            });
+        }
+    });
+    let port = addr.port();
+
+    let (boot, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=postgres dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("bootstrap connection");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    boot.simple_query(&format!(
+        "CREATE CATALOG {catalog} USING '{}' WITH properties(cache_policy=\"select\", \
+         table_set=\"public.cls_people\")",
+        source_dsn()
+    ))
+    .await
+    .expect("CREATE CATALOG");
+    assert!(wait_until_cached(&meta, catalog, "cls_people", Duration::from_secs(60)).await);
+
+    boot.simple_query(
+        "CREATE USER cls_admin WITH properties(password=\"adm\", superuser=\"true\")",
+    )
+    .await
+    .expect("create admin");
+    boot.simple_query(&format!(
+        "CREATE USER cls_user WITH properties(password=\"pw\", catalogs=\"{catalog}\")"
+    ))
+    .await
+    .expect("create cls user");
+
+    // An empty column list is rejected at CREATE.
+    assert!(
+        boot.simple_query(&format!(
+            "CREATE COLUMN POLICY ON {catalog}.public.cls_people FOR cls_user USING \" , \""
+        ))
+        .await
+        .is_err(),
+        "empty column list must be rejected"
+    );
+
+    boot.simple_query(&format!(
+        "CREATE COLUMN POLICY ON {catalog}.public.cls_people FOR cls_user USING \"ssn\""
+    ))
+    .await
+    .expect("CREATE COLUMN POLICY");
+
+    let policies = boot
+        .simple_query("SHOW COLUMN POLICIES")
+        .await
+        .expect("SHOW COLUMN POLICIES");
+    assert_eq!(first_value(&policies, "username").as_deref(), Some("cls_user"));
+    assert_eq!(first_value(&policies, "masked_columns").as_deref(), Some("ssn"));
+
+    // Policy user: ssn reads as NULL; unmasked columns unaffected.
+    let (user, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=cls_user password=pw dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("cls user authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let masked = user
+        .simple_query(&format!(
+            "SELECT count(*) AS total, count(ssn) AS ssn_count FROM {catalog}.public.cls_people"
+        ))
+        .await
+        .expect("masked aggregate");
+    assert_eq!(first_value(&masked, "total").as_deref(), Some("3"), "rows still visible");
+    assert_eq!(
+        first_value(&masked, "ssn_count").as_deref(),
+        Some("0"),
+        "masked column must read as NULL"
+    );
+    let name = user
+        .simple_query(&format!(
+            "SELECT name AS n FROM {catalog}.public.cls_people WHERE id = 2"
+        ))
+        .await
+        .expect("unmasked column readable");
+    assert_eq!(first_value(&name, "n").as_deref(), Some("bob"));
+
+    // Predicates cannot probe the real value.
+    let probe = user
+        .simple_query(&format!(
+            "SELECT count(*) AS c FROM {catalog}.public.cls_people WHERE ssn = '222-22'"
+        ))
+        .await
+        .expect("probe runs");
+    assert_eq!(
+        first_value(&probe, "c").as_deref(),
+        Some("0"),
+        "predicates must observe only the masked NULLs"
+    );
+
+    // Other users see the real values.
+    let (admin, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=cls_admin password=adm dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("admin authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let real = admin
+        .simple_query(&format!(
+            "SELECT count(ssn) AS c FROM {catalog}.public.cls_people"
+        ))
+        .await
+        .expect("admin unmasked");
+    assert_eq!(first_value(&real, "c").as_deref(), Some("3"), "admin sees real values");
+
+    // Restricted users cannot manage column policies.
+    assert!(
+        user.simple_query(&format!(
+            "CREATE COLUMN POLICY ON {catalog}.public.cls_people FOR cls_admin USING \"name\""
+        ))
+        .await
+        .is_err(),
+        "restricted users must not manage column policies"
+    );
+
+    // Drop restores full reads on the next connection.
+    admin
+        .simple_query(&format!(
+            "DROP COLUMN POLICY ON {catalog}.public.cls_people FOR cls_user"
+        ))
+        .await
+        .expect("DROP COLUMN POLICY");
+    let (user2, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=cls_user password=pw dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("cls user reconnects");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let restored = user2
+        .simple_query(&format!(
+            "SELECT count(ssn) AS c FROM {catalog}.public.cls_people"
+        ))
+        .await
+        .expect("unmasked after drop");
+    assert_eq!(first_value(&restored, "c").as_deref(), Some("3"), "policy removed");
+
+    // Cleanup.
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('cls_admin','cls_user')")
+        .execute(&meta)
+        .await;
+    let _ = sqlx::query(
+        "DELETE FROM system.column_policy WHERE username IN ('cls_admin','cls_user')",
+    )
+    .execute(&meta)
+    .await;
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS cls_people").execute(&source).await;
+}
