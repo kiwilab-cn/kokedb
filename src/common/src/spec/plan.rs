@@ -565,12 +565,14 @@ pub enum CommandNode {
     ListUsers {
         pattern: Option<String>,
     },
-    GrantCatalog {
-        catalog: Identifier,
+    /// Grants an authorization scope to a user. `scope` has 1–3 parts:
+    /// `catalog`, `catalog.schema`, or `catalog.schema.table`.
+    GrantScope {
+        scope: ObjectName,
         username: Identifier,
     },
-    RevokeCatalog {
-        catalog: Identifier,
+    RevokeScope {
+        scope: ObjectName,
         username: Identifier,
     },
 }

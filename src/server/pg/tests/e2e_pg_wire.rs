@@ -563,3 +563,190 @@ async fn pg_wire_user_management_sql() {
         .execute(&meta)
         .await;
 }
+
+/// Database/table-level authorization: a user granted a single TABLE can read
+/// exactly that table (the catalog and database stay resolvable), a DATABASE
+/// grant covers all tables in the schema, and SHOW TABLES only lists granted
+/// tables.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (source + meta)"]
+async fn pg_wire_table_level_authorization() {
+    let catalog = "authz_cat";
+    std::env::set_var("PG_META_DSN", meta_dsn());
+    std::env::set_var("KOKEDB_REEVALUATE_INTERVAL_MIN", "60");
+
+    let source = PgPool::connect(&source_dsn()).await.unwrap();
+    for stmt in [
+        "DROP TABLE IF EXISTS az_ok",
+        "DROP TABLE IF EXISTS az_no",
+        "CREATE TABLE az_ok (id int PRIMARY KEY)",
+        "CREATE TABLE az_no (id int PRIMARY KEY)",
+        "INSERT INTO az_ok SELECT generate_series(1, 4)",
+        "INSERT INTO az_no SELECT generate_series(1, 7)",
+    ] {
+        sqlx::query(stmt).execute(&source).await.unwrap();
+    }
+    let meta = PgPool::connect(&meta_dsn()).await.unwrap();
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query(
+        "DELETE FROM system.app_user WHERE username IN ('az_admin','az_table_user','az_db_user')",
+    )
+    .execute(&meta)
+    .await;
+
+    let result_cache = ResultCache::local(64, 64).await.unwrap();
+    let shared = init_shared_services(result_cache).await.unwrap();
+    let handlers = KokedbHandlers::new(shared);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let h = handlers.clone();
+            tokio::spawn(async move {
+                let _ = process_socket(sock, None, h).await;
+            });
+        }
+    });
+    let port = addr.port();
+
+    // Bootstrap (open access): create the catalog and the users.
+    let (boot, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=postgres dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("bootstrap connection");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    boot.simple_query(&format!(
+        "CREATE CATALOG {catalog} USING '{}' WITH properties(cache_policy=\"select\", \
+         table_set=\"public.az_ok,public.az_no\")",
+        source_dsn()
+    ))
+    .await
+    .expect("CREATE CATALOG");
+    assert!(wait_until_cached(&meta, catalog, "az_ok", Duration::from_secs(60)).await);
+    assert!(wait_until_cached(&meta, catalog, "az_no", Duration::from_secs(60)).await);
+
+    boot.simple_query(
+        "CREATE USER az_admin WITH properties(password=\"adm\", superuser=\"true\")",
+    )
+    .await
+    .expect("create admin");
+    boot.simple_query("CREATE USER az_table_user WITH properties(password=\"pw1\")")
+        .await
+        .expect("create table-scoped user");
+    boot.simple_query("CREATE USER az_db_user WITH properties(password=\"pw2\")")
+        .await
+        .expect("create db-scoped user");
+    boot.simple_query(&format!("GRANT TABLE {catalog}.public.az_ok TO az_table_user"))
+        .await
+        .expect("GRANT TABLE");
+    boot.simple_query(&format!("GRANT DATABASE {catalog}.public TO az_db_user"))
+        .await
+        .expect("GRANT DATABASE");
+
+    // Table-scoped user: granted table readable, sibling denied, catalog visible.
+    let (t_user, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=az_table_user password=pw1 dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("table-scoped user authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let ok = t_user
+        .simple_query(&format!("SELECT count(*) AS c FROM {catalog}.public.az_ok"))
+        .await
+        .expect("granted table readable");
+    assert_eq!(first_value(&ok, "c").as_deref(), Some("4"));
+    let denied = t_user
+        .simple_query(&format!("SELECT count(*) AS c FROM {catalog}.public.az_no"))
+        .await;
+    let denied_msg = format!("{denied:?}");
+    assert!(denied.is_err(), "sibling table must be denied");
+    assert!(
+        denied_msg.contains("permission denied"),
+        "denial should be explicit, got: {denied_msg}"
+    );
+    // SHOW TABLES only lists granted tables.
+    let listed = t_user
+        .simple_query(&format!("SHOW TABLES IN {catalog}.public"))
+        .await
+        .expect("SHOW TABLES for table-scoped user");
+    let table_names: Vec<String> = listed
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => {
+                r.try_get("name").ok().flatten().map(|s| s.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        table_names.contains(&"az_ok".to_string())
+            && !table_names.contains(&"az_no".to_string()),
+        "SHOW TABLES must list only granted tables, got {table_names:?}"
+    );
+
+    // Database-scoped user: every table in the schema readable.
+    let (d_user, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=az_db_user password=pw2 dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("db-scoped user authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let ok = d_user
+        .simple_query(&format!("SELECT count(*) AS c FROM {catalog}.public.az_no"))
+        .await
+        .expect("db grant covers all tables in the schema");
+    assert_eq!(first_value(&ok, "c").as_deref(), Some("7"));
+
+    // Revoke the table grant; a fresh connection no longer reads it.
+    let (admin, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=az_admin password=adm dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("admin authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    admin
+        .simple_query(&format!("REVOKE TABLE {catalog}.public.az_ok FROM az_table_user"))
+        .await
+        .expect("REVOKE TABLE");
+    let (t_user2, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=az_table_user password=pw1 dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("reconnect after revoke");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    assert!(
+        t_user2
+            .simple_query(&format!("SELECT count(*) AS c FROM {catalog}.public.az_ok"))
+            .await
+            .is_err(),
+        "revoked table must be denied on a fresh connection"
+    );
+
+    // Cleanup.
+    let _ = sqlx::query(
+        "DELETE FROM system.app_user WHERE username IN ('az_admin','az_table_user','az_db_user')",
+    )
+    .execute(&meta)
+    .await;
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS az_ok").execute(&source).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS az_no").execute(&source).await;
+}

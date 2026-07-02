@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod command;
 pub mod datafusion_catalog_adapter;
 pub mod display;

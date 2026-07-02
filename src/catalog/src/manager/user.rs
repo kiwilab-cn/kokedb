@@ -47,7 +47,19 @@ impl CatalogManager {
             match key.to_ascii_lowercase().as_str() {
                 "password" => password = Some(value),
                 "superuser" => superuser = value.eq_ignore_ascii_case("true"),
-                "catalogs" => catalogs = value,
+                "catalogs" => {
+                    // Comma-separated grant scopes; each is validated the same
+                    // way as GRANT (catalog[.schema[.table]] or `*`).
+                    for entry in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                        if entry == "*" {
+                            continue;
+                        }
+                        let parts: Vec<String> =
+                            entry.split('.').map(|s| s.to_string()).collect();
+                        Self::scope_string(&parts)?;
+                    }
+                    catalogs = value;
+                }
                 other => {
                     return Err(CatalogError::InvalidArgument(format!(
                         "unknown user property '{other}' (expected password, superuser, catalogs)"
@@ -111,10 +123,31 @@ impl CatalogManager {
             .collect())
     }
 
-    /// Backs `GRANT CATALOG cat TO user`: adds the catalog to the user's
-    /// allow-list. A no-op for superusers / `*` users (already unrestricted).
-    pub async fn grant_catalog(&self, catalog: &str, username: &str) -> CatalogResult<()> {
+    /// Validates a grant scope reference and renders it as the stored dotted
+    /// form: `catalog`, `catalog.schema`, or `catalog.schema.table`. Scopes
+    /// are stored fully qualified — they are global user attributes, never
+    /// relative to the granting session's defaults.
+    fn scope_string(scope: &[String]) -> CatalogResult<String> {
+        if scope.is_empty() || scope.len() > 3 {
+            return Err(CatalogError::InvalidArgument(format!(
+                "a grant scope has 1-3 parts (catalog[.schema[.table]]), got {}",
+                scope.len()
+            )));
+        }
+        if scope.iter().any(|part| part.is_empty() || part.contains(['.', ','])) {
+            return Err(CatalogError::InvalidArgument(
+                "grant scope parts must be non-empty and free of '.'/','".to_string(),
+            ));
+        }
+        Ok(scope.join("."))
+    }
+
+    /// Backs `GRANT CATALOG c | DATABASE c.s | TABLE c.s.t TO user`: adds the
+    /// scope to the user's allow-list. A no-op for superusers / `*` users
+    /// (already unrestricted).
+    pub async fn grant_scope(&self, scope: &[String], username: &str) -> CatalogResult<()> {
         self.require_admin()?;
+        let scope = Self::scope_string(scope)?;
         let meta = self.state()?.dynamic_catalog_list.clone();
         let user = meta
             .get_app_user(username)
@@ -126,7 +159,7 @@ impl CatalogManager {
             // Superuser or explicit `*`: already has access to everything.
             None => Ok(()),
             Some(mut set) => {
-                set.insert(catalog.to_string());
+                set.insert(scope);
                 let mut list: Vec<String> = set.into_iter().collect();
                 list.sort_unstable();
                 meta.set_app_user_catalogs(username, &list.join(","))
@@ -137,10 +170,13 @@ impl CatalogManager {
         }
     }
 
-    /// Backs `REVOKE CATALOG cat FROM user`: removes the catalog from the
-    /// user's allow-list (idempotent).
-    pub async fn revoke_catalog(&self, catalog: &str, username: &str) -> CatalogResult<()> {
+    /// Backs `REVOKE CATALOG c | DATABASE c.s | TABLE c.s.t FROM user`:
+    /// removes the *exact* scope from the user's allow-list (idempotent).
+    /// Revoking `c.s.t` does not carve a hole out of a broader `c` grant —
+    /// scopes are additive; replace the broad grant with narrower ones instead.
+    pub async fn revoke_scope(&self, scope: &[String], username: &str) -> CatalogResult<()> {
         self.require_admin()?;
+        let scope = Self::scope_string(scope)?;
         let meta = self.state()?.dynamic_catalog_list.clone();
         let user = meta
             .get_app_user(username)
@@ -151,10 +187,10 @@ impl CatalogManager {
         match user.allowed_catalogs {
             None => Err(CatalogError::NotSupported(format!(
                 "user '{username}' has unrestricted access (superuser or '*'); \
-                 set an explicit catalog list instead of revoking"
+                 set an explicit scope list instead of revoking"
             ))),
             Some(mut set) => {
-                set.remove(catalog);
+                set.remove(&scope);
                 let mut list: Vec<String> = set.into_iter().collect();
                 list.sort_unstable();
                 meta.set_app_user_catalogs(username, &list.join(","))

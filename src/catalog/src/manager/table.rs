@@ -28,10 +28,14 @@ impl CatalogManager {
         } else {
             self.resolve_database(database)?
         };
-        Ok(provider
-            .list_tables(&database)
-            .await?
+        let tables = provider.list_tables(&database).await?;
+        // Scoped sessions only see tables their grants cover (a table-level
+        // grant makes the database listable, but not its sibling tables).
+        let state = self.state()?;
+        let catalog = provider.get_name();
+        Ok(tables
             .into_iter()
+            .filter(|x| state.acl_allows_table(&catalog, &database.head, &x.name))
             .filter(|x| match_pattern(&x.name, pattern))
             .collect())
     }

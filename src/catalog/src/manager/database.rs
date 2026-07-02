@@ -57,10 +57,17 @@ impl CatalogManager {
         pattern: Option<&str>,
     ) -> CatalogResult<Vec<DatabaseStatus>> {
         let (provider, prefix) = self.resolve_optional_database(qualifier)?;
-        Ok(provider
-            .list_databases(prefix.as_ref())
-            .await?
+        let databases = provider.list_databases(prefix.as_ref()).await?;
+        // Scoped sessions only see databases their grants make visible.
+        let state = self.state()?;
+        Ok(databases
             .into_iter()
+            .filter(|x| {
+                x.database
+                    .first()
+                    .map(|schema| state.acl_allows_database(&x.catalog, schema))
+                    .unwrap_or(false)
+            })
             .filter(|x| match_pattern(quote_names_if_needed(&x.database).as_str(), pattern))
             .collect())
     }
