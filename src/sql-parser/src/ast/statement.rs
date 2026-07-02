@@ -24,6 +24,7 @@ use crate::ast::keywords::{
     Verbose, View, Views, When, With, Zone,
 };
 use crate::ast::keywords::{Diagnose, Pause, Resume, Schedule};
+use crate::ast::keywords::{Grant, Revoke, User, Users};
 use crate::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
 use crate::ast::operator::{
     Asterisk, Colon, Comma, Equals, ExclamationMark, LeftParenthesis, Minus, Plus, RightParenthesis,
@@ -65,6 +66,41 @@ pub enum Statement {
         catalog: Catalog,
         if_exists: Option<(If, Exists)>,
         name: Either<Ident, StringLiteral>,
+    },
+    /// `CREATE USER name WITH properties(password="...", superuser="true",
+    /// catalogs="a,b")` — house-style properties clause, like CREATE CATALOG.
+    CreateUser {
+        create: Create,
+        user: User,
+        name: Either<Ident, StringLiteral>,
+        clauses: Vec<CreateCatalogClause>,
+    },
+    DropUser {
+        drop: Drop,
+        user: User,
+        if_exists: Option<(If, Exists)>,
+        name: Either<Ident, StringLiteral>,
+    },
+    ShowUsers {
+        show: Show,
+        users: Users,
+        like: Option<(Option<Like>, StringLiteral)>,
+    },
+    /// `GRANT CATALOG cat TO user` — adds a catalog to the user's allow-list.
+    GrantCatalog {
+        grant: Grant,
+        catalog: Catalog,
+        name: Either<Ident, StringLiteral>,
+        to: To,
+        user: Either<Ident, StringLiteral>,
+    },
+    /// `REVOKE CATALOG cat FROM user` — removes a catalog from the allow-list.
+    RevokeCatalog {
+        revoke: Revoke,
+        catalog: Catalog,
+        name: Either<Ident, StringLiteral>,
+        from: From,
+        user: Either<Ident, StringLiteral>,
     },
     UseDatabase {
         r#use: Use,

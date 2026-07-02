@@ -11,7 +11,7 @@ use serde_arrow::to_arrow;
 
 use crate::display::{
     CacheJobDisplay, CachePolicyDisplay, CacheScheduleDisplay, CatalogDisplay, DiagnoseDisplay,
-    EmptyDisplay, RefreshCacheDisplay, SingleValueDisplay, TableMetadataDisplay,
+    EmptyDisplay, RefreshCacheDisplay, SingleValueDisplay, TableMetadataDisplay, UserDisplay,
 };
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
@@ -75,6 +75,25 @@ pub enum CatalogCommand {
     AlterDatabaseCachePolicy {
         database: Vec<String>,
         options: Vec<(String, String)>,
+    },
+    CreateUser {
+        username: String,
+        options: Vec<(String, String)>,
+    },
+    DropUser {
+        username: String,
+        if_exists: bool,
+    },
+    ListUsers {
+        pattern: Option<String>,
+    },
+    GrantCatalog {
+        catalog: String,
+        username: String,
+    },
+    RevokeCatalog {
+        catalog: String,
+        username: String,
     },
     CurrentDatabase,
     SetCurrentDatabase {
@@ -192,6 +211,11 @@ impl CatalogCommand {
             CatalogCommand::ShowCacheJobs { .. } => "ShowCacheJobs",
             CatalogCommand::AlterCatalogCachePolicy { .. } => "AlterCatalogCachePolicy",
             CatalogCommand::AlterDatabaseCachePolicy { .. } => "AlterDatabaseCachePolicy",
+            CatalogCommand::CreateUser { .. } => "CreateUser",
+            CatalogCommand::DropUser { .. } => "DropUser",
+            CatalogCommand::ListUsers { .. } => "ListUsers",
+            CatalogCommand::GrantCatalog { .. } => "GrantCatalog",
+            CatalogCommand::RevokeCatalog { .. } => "RevokeCatalog",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
@@ -283,8 +307,15 @@ impl CatalogCommand {
             | CatalogCommand::AlterCatalogCachePolicy { .. }
             | CatalogCommand::AlterDatabaseCachePolicy { .. }
             | CatalogCommand::SetTablePaused { .. }
+            | CatalogCommand::CreateUser { .. }
+            | CatalogCommand::DropUser { .. }
+            | CatalogCommand::GrantCatalog { .. }
+            | CatalogCommand::RevokeCatalog { .. }
             | CatalogCommand::DropCatalog { .. } => {
                 Vec::<FieldRef>::from_type::<SingleValueDisplay<bool>>(TracingOptions::default())
+            }
+            CatalogCommand::ListUsers { .. } => {
+                Vec::<FieldRef>::from_type::<UserDisplay>(TracingOptions::default())
             }
         }
         .map_err(|e| {
@@ -376,6 +407,33 @@ impl CatalogCommand {
             }
             CatalogCommand::DropCatalog { catalog, if_exists } => {
                 manager.drop_catalog(&catalog, if_exists).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::CreateUser { username, options } => {
+                manager.create_user(&username, options).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::DropUser {
+                username,
+                if_exists,
+            } => {
+                manager.drop_user(&username, if_exists).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::ListUsers { pattern } => {
+                let rows = manager.list_users(pattern.as_deref()).await?;
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::GrantCatalog { catalog, username } => {
+                manager.grant_catalog(&catalog, &username).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::RevokeCatalog { catalog, username } => {
+                manager.revoke_catalog(&catalog, &username).await?;
                 let rows = vec![SingleValueDisplay { value: true }];
                 build_record_batch(schema, &rows)
             }

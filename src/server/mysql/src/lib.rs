@@ -35,9 +35,6 @@ struct PreparedStatement {
 struct CoreContex {
     ctx: Arc<SessionContext>,
     cache: ResultCache,
-    /// Whether authentication is enforced (true when `system.app_user` is
-    /// non-empty). When false, all clients are accepted with full access.
-    auth_enabled: bool,
     /// Process-wide single-flight registry for cache-miss de-duplication.
     sf: Arc<singleflight::Singleflight>,
     /// Shared meta-store handle (reuses the process-wide pool) for recording
@@ -58,7 +55,6 @@ impl CoreContex {
     fn new(
         ctx: Arc<SessionContext>,
         cache: ResultCache,
-        auth_enabled: bool,
         sf: Arc<singleflight::Singleflight>,
         meta: Arc<PostgreSQLMetaCatalogProviderList>,
         plan_cache: PlanCache,
@@ -66,7 +62,6 @@ impl CoreContex {
         Self {
             ctx,
             cache,
-            auth_enabled,
             sf,
             meta,
             plan_cache,
@@ -89,8 +84,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
 
     /// Validates the client's credentials with `mysql_native_password` against
     /// the `system.app_user` table, and scopes the connection to the user's
-    /// allowed catalogs. When authentication is disabled (no users defined), all
-    /// clients are accepted with full access.
+    /// allowed catalogs. The check is fully dynamic — `CREATE USER` takes
+    /// effect on the next connection, no restart needed: while the table is
+    /// empty every client is accepted (open access); once any account exists,
+    /// only known users get in.
     async fn authenticate(
         &self,
         _auth_plugin: &str,
@@ -98,9 +95,6 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         salt: &[u8],
         auth_data: &[u8],
     ) -> bool {
-        if !self.auth_enabled {
-            return true;
-        }
         let Ok(username) = std::str::from_utf8(username) else {
             warn!("Auth failed: non-UTF8 username");
             return false;
@@ -108,8 +102,19 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         let user = match self.meta.get_app_user(username).await {
             Ok(Some(user)) => user,
             Ok(None) => {
-                warn!("Auth failed: unknown user '{username}'");
-                return false;
+                // Unknown user: allowed only while authentication is disabled
+                // (no accounts defined at all).
+                return match self.meta.count_app_users().await {
+                    Ok(0) => true,
+                    Ok(_) => {
+                        warn!("Auth failed: unknown user '{username}'");
+                        false
+                    }
+                    Err(e) => {
+                        error!("Auth failed: meta lookup error: {e}");
+                        false
+                    }
+                };
             }
             Err(e) => {
                 error!("Auth failed: meta lookup error: {e}");
@@ -999,12 +1004,15 @@ pub async fn serve(shared: SharedServices, bind_addr: String) -> Result<(), Mysq
     let listener = TcpListener::bind(&bind_addr).await?;
     info!("kokedb MySQL server listening on {}", bind_addr);
 
-    // Auth is enforced when any application user exists in the meta store.
-    let auth_enabled = shared.meta().count_app_users().await.unwrap_or(0) > 0;
-    if auth_enabled {
+    // Auth is dynamic: enforced whenever `system.app_user` is non-empty,
+    // re-checked per connection so CREATE USER takes effect without a restart.
+    if shared.meta().count_app_users().await.unwrap_or(0) > 0 {
         info!("MySQL authentication enabled (system.app_user)");
     } else {
-        warn!("MySQL authentication disabled (no rows in system.app_user; seed via KOKEDB_ADMIN_USER/PASSWORD)");
+        warn!(
+            "MySQL authentication disabled (no rows in system.app_user; \
+             seed via KOKEDB_ADMIN_USER/PASSWORD or CREATE USER)"
+        );
     }
 
     let result_cache = shared.result_cache();
@@ -1029,7 +1037,7 @@ pub async fn serve(shared: SharedServices, bind_addr: String) -> Result<(), Mysq
                 .active_connections
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = AsyncMysqlIntermediary::run_on(
-                CoreContex::new(ctx, cache, auth_enabled, sf, meta, plan_cache),
+                CoreContex::new(ctx, cache, sf, meta, plan_cache),
                 r,
                 w,
             )

@@ -117,6 +117,40 @@ pub struct PostgreSQLSchemaProvider {
     /// Cached listing tables, versioned by snapshot `local_path` so a re-synced
     /// table is rebuilt only when its snapshot actually changes.
     table_cache: DashMap<String, (String, Arc<dyn TableProvider>)>,
+    /// Short-TTL cache of `(schema, local_path)` per table, so hot queries
+    /// don't pay one meta-store roundtrip + Arrow IPC schema decode per table
+    /// reference. Safe because syncs write each snapshot into a NEW directory
+    /// and keep `CACHE_KEEP_NUM` old versions: a path that is at most TTL
+    /// stale still exists on disk, it just serves data one sync older — well
+    /// inside the freshness tolerances kokedb already works with.
+    meta_cache: DashMap<String, (std::time::Instant, Arc<datafusion::arrow::datatypes::Schema>, String)>,
+    /// Buffered per-table query counters, flushed to
+    /// `system.query_table_daily_stats` at most once per flush interval —
+    /// instead of one spawned UPSERT per table reference per query.
+    stats_buf: DashMap<String, TableStatsCell>,
+}
+
+/// Pending daily-stats increments for one table.
+#[derive(Debug)]
+struct TableStatsCell {
+    pending: std::sync::atomic::AtomicU64,
+    last_flush: std::sync::Mutex<std::time::Instant>,
+}
+
+/// TTL for the per-table `(schema, local_path)` cache; 0 disables caching.
+fn table_meta_ttl() -> std::time::Duration {
+    std::time::Duration::from_millis(kokedb_common::env::get_env_as(
+        "KOKEDB_TABLE_META_TTL_MS",
+        1000u64,
+    ))
+}
+
+/// How often buffered daily-stats counters are flushed to the meta store.
+fn stats_flush_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(kokedb_common::env::get_env_as(
+        "KOKEDB_STATS_FLUSH_SECS",
+        10u64,
+    ))
 }
 
 impl PostgreSQLSchemaProvider {
@@ -132,6 +166,55 @@ impl PostgreSQLSchemaProvider {
             remote_pool,
             meta_pool,
             table_cache: DashMap::new(),
+            meta_cache: DashMap::new(),
+            stats_buf: DashMap::new(),
+        }
+    }
+
+    /// Counts one query against `table` and flushes the buffered total to the
+    /// meta store when the flush interval has elapsed. One UPSERT per table
+    /// per interval instead of per query.
+    fn record_table_query(&self, table: &str) {
+        use std::sync::atomic::Ordering;
+        let cell = self.stats_buf.entry(table.to_string()).or_insert_with(|| TableStatsCell {
+            pending: std::sync::atomic::AtomicU64::new(0),
+            last_flush: std::sync::Mutex::new(std::time::Instant::now()),
+        });
+        cell.pending.fetch_add(1, Ordering::Relaxed);
+
+        let due = {
+            // try_lock: if another caller is flushing, skip — the counter keeps
+            // accumulating and the next call picks it up.
+            let Ok(mut last) = cell.last_flush.try_lock() else {
+                return;
+            };
+            if last.elapsed() < stats_flush_interval() {
+                return;
+            }
+            *last = std::time::Instant::now();
+            true
+        };
+        if due {
+            let delta = cell.pending.swap(0, Ordering::Relaxed);
+            if delta == 0 {
+                return;
+            }
+            let meta_pool = self.meta_pool.clone();
+            let (c, s, n) = (
+                self.catalog_info.name.clone(),
+                self.schema_name.clone(),
+                table.to_string(),
+            );
+            tokio::spawn(async move {
+                let today = chrono::Local::now().naive_local().date();
+                let client = PostgreSQLMetaCatalogProviderList::from_pool(meta_pool);
+                if let Err(e) = client
+                    .save_table_daily_stats_n(&c, &s, &n, today, delta as i64)
+                    .await
+                {
+                    error!("Failed to store table daily stats: {:?}", e);
+                }
+            });
         }
     }
 
@@ -215,23 +298,34 @@ impl SchemaProvider for PostgreSQLSchemaProvider {
         // Reuse the shared meta pool instead of opening a new connection.
         let meta_client = PostgreSQLMetaCatalogProviderList::from_pool(self.meta_pool.clone());
 
-        // Record daily query stats off the hot path (fire-and-forget).
-        {
-            let meta_pool = self.meta_pool.clone();
-            let (c, s, n) = (catalog.clone(), schema.clone(), name.to_string());
-            tokio::spawn(async move {
-                let today = chrono::Local::now().naive_local().date();
-                let client = PostgreSQLMetaCatalogProviderList::from_pool(meta_pool);
-                if let Err(e) = client.save_table_daily_stats(&c, &s, &n, today).await {
-                    error!("Failed to store table daily stats: {:?}", e);
-                }
-            });
-        }
+        // Record daily query stats (buffered; flushed periodically).
+        self.record_table_query(name);
 
         // One meta lookup yields both "is this table cached?" and the current
         // snapshot path. An empty path means it is not cached -> read remote.
-        let (arrow_schema, local_path) =
-            meta_client.get_table_schema(&catalog, &schema, name).await?;
+        // Served from the short-TTL cache when fresh (see `meta_cache`).
+        let ttl = table_meta_ttl();
+        let cached = if ttl.is_zero() {
+            None
+        } else {
+            self.meta_cache.get(name).and_then(|e| {
+                let (at, schema, path) = e.value();
+                (at.elapsed() < ttl).then(|| (schema.clone(), path.clone()))
+            })
+        };
+        let (arrow_schema, local_path) = match cached {
+            Some(hit) => hit,
+            None => {
+                let fresh = meta_client.get_table_schema(&catalog, &schema, name).await?;
+                if !ttl.is_zero() {
+                    self.meta_cache.insert(
+                        name.to_string(),
+                        (std::time::Instant::now(), fresh.0.clone(), fresh.1.clone()),
+                    );
+                }
+                fresh
+            }
+        };
 
         if local_path.is_empty() {
             let config = PostgreSQLConfig {

@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 
-use dashmap::DashMap;
 use kokedb_common::spec::Plan;
+use lru::LruCache;
 
 /// Process-wide cache of parsed-and-hashed query plans, keyed by the raw SQL
 /// text.
@@ -12,61 +13,55 @@ use kokedb_common::spec::Plan;
 /// connection. The only management concern is memory: prepared-statement
 /// parameter substitution bakes literals into the SQL text, so distinct
 /// parameter values yield distinct keys and the key space is effectively
-/// unbounded. The cache is therefore size-capped with best-effort eviction.
+/// unbounded. The cache is therefore a true LRU: hot statement texts stay
+/// resident while one-off parameterized variants age out (the previous
+/// arbitrary-victim eviction could drop a hot plan instead).
+///
+/// A single mutex around the LRU is deliberate: every operation is a few
+/// pointer moves (values are `Arc`s), so the critical section is nanoseconds —
+/// far cheaper than the parse + hash it saves.
 ///
 /// This sits in front of, not in place of, the result cache: it shortens the
 /// pre-execution path (parse + JSON-serialize-and-hash) that runs on *every*
 /// query, including result-cache hits.
 #[derive(Clone)]
 pub struct PlanCache {
-    entries: Arc<DashMap<String, Arc<(Plan, u128)>>>,
-    capacity: usize,
+    entries: Arc<Mutex<LruCache<String, Arc<(Plan, u128)>>>>,
 }
 
 impl PlanCache {
     pub fn new(capacity: usize) -> Self {
+        let capacity = NonZeroUsize::new(capacity.max(1)).unwrap_or(NonZeroUsize::MIN);
         Self {
-            entries: Arc::new(DashMap::new()),
-            capacity: capacity.max(1),
+            entries: Arc::new(Mutex::new(LruCache::new(capacity))),
         }
     }
 
+    fn lock(&self) -> std::sync::MutexGuard<'_, LruCache<String, Arc<(Plan, u128)>>> {
+        // Recover from a poisoned lock instead of panicking: the cache is
+        // advisory bookkeeping and remains structurally valid.
+        self.entries.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Looks up a plan by SQL text, marking it most-recently-used.
     pub fn get(&self, sql: &str) -> Option<Arc<(Plan, u128)>> {
-        self.entries.get(sql).map(|e| e.value().clone())
+        self.lock().get(sql).cloned()
     }
 
     pub fn insert(&self, sql: &str, value: Arc<(Plan, u128)>) {
-        // Best-effort bound: drop one arbitrary entry before inserting into a
-        // full cache. Exact LRU isn't worth the bookkeeping for a hint cache —
-        // a wrongly-evicted entry just costs one re-parse.
-        if self.entries.len() >= self.capacity && !self.entries.contains_key(sql) {
-            // Materialize the victim key in its own statement so the DashMap
-            // shard guard from `iter()` is dropped BEFORE `remove()` — holding
-            // it across remove() would deadlock on the same shard.
-            let victim = self.entries.iter().next().map(|e| e.key().clone());
-            if let Some(victim) = victim {
-                self.entries.remove(&victim);
-            }
-        }
-        self.entries.insert(sql.to_string(), value);
+        self.lock().put(sql.to_string(), value);
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.lock().len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kokedb_common::spec::Plan;
 
-    // A trivially-constructed Plan stand-in: Plan must be Clone for the cache to
-    // hand out owned copies. We use the real parser path in integration, but
-    // here we only need *a* Plan value, so build one via serde from the empty
-    // variant is overkill — instead assert the bound/eviction behavior with a
-    // shared dummy.
     fn dummy() -> Arc<(Plan, u128)> {
         // Parse a minimal statement to obtain a real Plan without depending on
         // any catalog/session state.
@@ -90,5 +85,18 @@ mod tests {
             cache.insert(&format!("SELECT {i}"), dummy());
         }
         assert!(cache.len() <= 4, "cache exceeded capacity: {}", cache.len());
+    }
+
+    #[test]
+    fn evicts_least_recently_used_not_hot_entries() {
+        let cache = PlanCache::new(2);
+        cache.insert("hot", dummy());
+        cache.insert("cold", dummy());
+        // Touch "hot" so "cold" is the LRU victim when a third entry arrives.
+        assert!(cache.get("hot").is_some());
+        cache.insert("new", dummy());
+        assert!(cache.get("hot").is_some(), "hot entry must survive eviction");
+        assert!(cache.get("cold").is_none(), "cold entry should be evicted");
+        assert!(cache.get("new").is_some());
     }
 }

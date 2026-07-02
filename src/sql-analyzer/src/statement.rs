@@ -113,6 +113,97 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::CreateUser {
+            create: _,
+            user: _,
+            name,
+            clauses,
+        } => {
+            let name = match name {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let CreateCatalogClauses {
+                comment: _,
+                properties,
+            } = clauses.try_into()?;
+            let node = spec::CommandNode::CreateUser {
+                username: name.into(),
+                options: properties
+                    .map(from_ast_property_list)
+                    .transpose()?
+                    .unwrap_or_default(),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::DropUser {
+            drop: _,
+            user: _,
+            if_exists,
+            name,
+        } => {
+            let name = match name {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let node = spec::CommandNode::DropUser {
+                username: name.into(),
+                if_exists: if_exists.is_some(),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::ShowUsers {
+            show: _,
+            users: _,
+            like,
+        } => {
+            let node = spec::CommandNode::ListUsers {
+                pattern: like.map(|(_, x)| from_ast_string(x)).transpose()?,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::GrantCatalog {
+            grant: _,
+            catalog: _,
+            name,
+            to: _,
+            user,
+        } => {
+            let catalog = match name {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let username = match user {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let node = spec::CommandNode::GrantCatalog {
+                catalog: catalog.into(),
+                username: username.into(),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::RevokeCatalog {
+            revoke: _,
+            catalog: _,
+            name,
+            from: _,
+            user,
+        } => {
+            let catalog = match name {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let username = match user {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let node = spec::CommandNode::RevokeCatalog {
+                catalog: catalog.into(),
+                username: username.into(),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::UseDatabase {
             r#use: _,
             database: _,

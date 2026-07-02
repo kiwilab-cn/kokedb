@@ -554,6 +554,25 @@ pub enum CommandNode {
         database: ObjectName,
         options: Vec<(String, String)>,
     },
+    CreateUser {
+        username: Identifier,
+        options: Vec<(String, String)>,
+    },
+    DropUser {
+        username: Identifier,
+        if_exists: bool,
+    },
+    ListUsers {
+        pattern: Option<String>,
+    },
+    GrantCatalog {
+        catalog: Identifier,
+        username: Identifier,
+    },
+    RevokeCatalog {
+        catalog: Identifier,
+        username: Identifier,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

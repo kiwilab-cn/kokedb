@@ -334,6 +334,34 @@ impl PlanResolver<'_> {
             CommandNode::AlterDatabaseCachePolicy { database, options } => {
                 self.resolve_alter_database_cache_policy(database, options)
             }
+            CommandNode::CreateUser { username, options } => {
+                self.resolve_catalog_command(CatalogCommand::CreateUser {
+                    username: username.into(),
+                    options,
+                })
+            }
+            CommandNode::DropUser {
+                username,
+                if_exists,
+            } => self.resolve_catalog_command(CatalogCommand::DropUser {
+                username: username.into(),
+                if_exists,
+            }),
+            CommandNode::ListUsers { pattern } => {
+                self.resolve_catalog_command(CatalogCommand::ListUsers { pattern })
+            }
+            CommandNode::GrantCatalog { catalog, username } => {
+                self.resolve_catalog_command(CatalogCommand::GrantCatalog {
+                    catalog: catalog.into(),
+                    username: username.into(),
+                })
+            }
+            CommandNode::RevokeCatalog { catalog, username } => {
+                self.resolve_catalog_command(CatalogCommand::RevokeCatalog {
+                    catalog: catalog.into(),
+                    username: username.into(),
+                })
+            }
         }
     }
 
