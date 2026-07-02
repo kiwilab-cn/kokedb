@@ -262,48 +262,27 @@ impl CatalogManagerState {
         }
     }
 
-    pub fn _list_catalog(&self) -> HashMap<Arc<str>, Arc<dyn CatalogProvider>> {
-        let mut catalogs: HashMap<String, Arc<dyn CatalogProvider>> = self
-            .catalogs
-            .iter()
-            .map(|(k, v)| (k.to_string(), Arc::clone(v)))
-            .collect();
-
-        let catalog_list = self.dynamic_catalog_list.clone();
-        for catalog_name in catalog_list.catalog_names() {
-            if !self.acl_allows(&catalog_name) {
-                continue;
-            }
-            if let Some(catalog) = catalog_list.catalog(&catalog_name) {
-                let catalog_adapter = DataFusionCatalogAdapter::new(catalog, catalog_name.clone());
-                catalogs.insert(catalog_name.clone(), Arc::new(catalog_adapter));
+    pub fn catalog_names(&self) -> Vec<Arc<str>> {
+        // Static catalogs first, then ACL-filtered dynamic ones, deduplicated
+        // (a name registered both ways must not appear twice) and without the
+        // Arc<str> -> String -> Arc<str> round-trip this used to do.
+        let mut seen: std::collections::HashSet<Arc<str>> = std::collections::HashSet::new();
+        let mut names: Vec<Arc<str>> = Vec::new();
+        for name in self.catalogs.keys() {
+            if seen.insert(Arc::clone(name)) {
+                names.push(Arc::clone(name));
             }
         }
-
-        catalogs
-            .into_iter()
-            .map(|(k, v)| (Arc::from(k), v))
-            .collect()
-    }
-
-    pub fn catalog_names(&self) -> Vec<Arc<str>> {
-        let mut catalog_names = self
-            .catalogs
-            .iter()
-            .map(|(k, _)| k.to_string())
-            .collect::<Vec<String>>();
-
-        let dynamic_catalog_names = self
-            .dynamic_catalog_list
-            .catalog_names()
-            .into_iter()
-            .filter(|name| self.acl_allows(name));
-
-        catalog_names.extend(dynamic_catalog_names);
-        catalog_names
-            .iter()
-            .map(|x| Arc::from(x.as_str()))
-            .collect::<Vec<Arc<str>>>()
+        for name in self.dynamic_catalog_list.catalog_names() {
+            if !self.acl_allows(&name) {
+                continue;
+            }
+            let name: Arc<str> = Arc::from(name.as_str());
+            if seen.insert(Arc::clone(&name)) {
+                names.push(name);
+            }
+        }
+        names
     }
 
     pub fn get_catalog(&self, catalog_name: &str) -> CatalogResult<Arc<dyn CatalogProvider>> {
@@ -311,8 +290,11 @@ impl CatalogManagerState {
 
         if self.acl_allows(catalog_name) {
             if let Some(catalog) = catalog_list.catalog(catalog_name) {
-                let catalog_adapter =
-                    DataFusionCatalogAdapter::new(catalog, catalog_name.to_string());
+                let catalog_adapter = DataFusionCatalogAdapter::new(
+                    catalog,
+                    catalog_name.to_string(),
+                    self.dynamic_catalog_list.clone(),
+                );
                 return Ok(Arc::new(catalog_adapter));
             }
         }

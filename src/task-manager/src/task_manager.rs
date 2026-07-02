@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use kokedb_cache::result_cache::ResultCache;
 use kokedb_common::env::get_env_as;
-use log::info;
+use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{mpsc, Mutex, Notify},
@@ -187,15 +187,28 @@ impl TaskQueue {
         }
     }
 
-    /// Enqueue a task and wake the scheduler.
+    /// Enqueue a task and wake the scheduler. The queue is bounded as a
+    /// backstop against runaway enqueues (many catalogs × many tables): a
+    /// dropped task is only deferred, since the periodic per-catalog sync jobs
+    /// re-enqueue outstanding tables on their next tick.
     async fn push(&self, id: String, config: CacheTableTaskConfig, priority: TaskPriority) {
+        const MAX_QUEUED_TASKS: usize = 4096;
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        self.heap.lock().await.push(TaskWrapper {
+        let mut heap = self.heap.lock().await;
+        if heap.len() >= MAX_QUEUED_TASKS {
+            warn!(
+                "Task queue is full ({MAX_QUEUED_TASKS}); dropping enqueue of '{id}' \
+                 (it will be retried on the next scheduler tick)"
+            );
+            return;
+        }
+        heap.push(TaskWrapper {
             id,
             config,
             priority,
             seq,
         });
+        drop(heap);
         self.notify.notify_one();
     }
 
@@ -412,7 +425,11 @@ impl TaskManager {
     /// the cache so stale results are not served after un-caching).
     pub async fn invalidate_cache_keys(&self, keys: &[u128]) {
         for key in keys {
-            let _ = self.result_cache.delete(*key).await;
+            // A failed delete means a stale result may keep being served —
+            // that must be visible in the logs, not silently dropped.
+            if let Err(e) = self.result_cache.delete(*key).await {
+                warn!("Failed to invalidate cached result {key}: {e}");
+            }
         }
     }
 

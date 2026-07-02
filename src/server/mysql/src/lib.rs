@@ -2,7 +2,7 @@ pub mod column;
 pub mod error;
 pub mod metrics;
 pub mod row;
-pub mod singleflight;
+pub use kokedb_cache::singleflight;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -293,13 +293,14 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
         .or(session_max_staleness)
         .filter(|&s| s > 0);
 
-    // Step 1: Parse SQL and generate plan
-    let (plan, cache_key) = match parse_sql_and_get_plan(&plan_cache, sql) {
+    // Step 1: Parse SQL and generate plan (shared Arc from the plan cache).
+    let plan_entry = match parse_sql_and_get_plan(&plan_cache, sql) {
         Ok(result) => result,
         Err((error_kind, error_msg)) => {
             return send_error_to_client(results, error_kind, error_msg).await;
         }
     };
+    let (plan, cache_key) = (&plan_entry.0, plan_entry.1);
 
     // Steps 2+3: produce the stream and pull its first batch, bounded by the
     // optional query timeout. Both happen before we start writing to the client
@@ -308,7 +309,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     let restricted = kokedb_query::context::session_is_restricted(&ctx);
     let produce_first = async {
         let mut stream =
-            get_batch_stream(&cache, &sf, ctx, &plan, cache_key, max_staleness, restricted).await?;
+            get_batch_stream(&cache, &sf, ctx, plan, cache_key, max_staleness, restricted).await?;
         let first = stream.next().await;
         Ok::<_, String>((stream, first))
     };
@@ -335,7 +336,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
         }
         None => {
             // Empty result set
-            return handle_empty_result(results, &meta, sql, &plan, instant).await;
+            return handle_empty_result(results, meta, sql, plan_entry.clone(), instant).await;
         }
     };
 
@@ -360,7 +361,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     write_batches_to_client(&mut writer, &first_batch, &mut batch_stream).await?;
 
     // Step 7: Finalize query execution
-    finalize_query(writer, &meta, sql, &plan, instant).await?;
+    finalize_query(writer, meta, sql, plan_entry.clone(), instant).await?;
 
     Ok(())
 }
@@ -523,26 +524,19 @@ fn quote_sql_string(s: &str) -> String {
     out
 }
 
-// Try to retrieve result from cache
+// Try to retrieve result from cache. Single lookup: `contains()` + `get()`
+// would cost two round-trips on the Redis backend and race with eviction.
 async fn try_get_from_cache(cache: &Cache, cache_key: CacheKey) -> Option<BatchStream> {
-    if !cache.contains(cache_key).await {
-        info!("Cache miss for key: {}, querying from kokedb.", cache_key);
-        return None;
-    }
-
-    match cache.get(cache_key).await {
-        Ok(stream) => {
+    match cache.try_get(cache_key).await {
+        Some(stream) => {
             info!(
                 "Cache hit with key: {}, retrieving result from cache.",
                 cache_key
             );
             Some(stream)
         }
-        Err(e) => {
-            warn!(
-                "Cache retrieval failed for key: {}, error: {}, falling back to query.",
-                cache_key, e
-            );
+        None => {
+            info!("Cache miss for key: {}, querying from kokedb.", cache_key);
             None
         }
     }
@@ -555,9 +549,11 @@ async fn try_get_from_cache(cache: &Cache, cache_key: CacheKey) -> Option<BatchS
 fn parse_sql_and_get_plan(
     plan_cache: &PlanCache,
     sql: &str,
-) -> Result<(Plan, CacheKey), (ErrorKind, String)> {
+) -> Result<Arc<(Plan, CacheKey)>, (ErrorKind, String)> {
     if let Some(hit) = plan_cache.get(sql) {
-        return Ok((hit.0.clone(), hit.1));
+        // Hand the Arc straight out: cloning the Plan here would deep-copy the
+        // whole expression tree on every cache hit.
+        return Ok(hit);
     }
 
     let plan = parser(sql).map_err(|e| {
@@ -574,8 +570,9 @@ fn parse_sql_and_get_plan(
         )
     })?;
 
-    plan_cache.insert(sql, Arc::new((plan.clone(), cache_key)));
-    Ok((plan, cache_key))
+    let entry = Arc::new((plan, cache_key));
+    plan_cache.insert(sql, entry.clone());
+    Ok(entry)
 }
 
 fn should_cache_plan(plan: &Plan) -> bool {
@@ -789,9 +786,9 @@ async fn get_batch_stream(
 // Handle empty result set
 async fn handle_empty_result<W: AsyncWrite + Unpin>(
     results: QueryResultWriter<'_, W>,
-    meta: &PostgreSQLMetaCatalogProviderList,
+    meta: Arc<PostgreSQLMetaCatalogProviderList>,
     sql: &str,
-    plan: &Plan,
+    plan_entry: Arc<(Plan, CacheKey)>,
     instant: std::time::Instant,
 ) -> Result<(), MysqlServerError> {
     let writer = results.start(&[]).await.map_err(|e| {
@@ -807,12 +804,25 @@ async fn handle_empty_result<W: AsyncWrite + Unpin>(
             MysqlServerError::WriteMysqlResultError(e.to_string())
         })?;
 
-    let cost = instant.elapsed().as_millis() as u64;
-    if let Err(e) = save_sql_history(meta, sql, plan, cost).await {
-        error!("Failed to store sql execute info: {:?}", e);
-    }
-
+    spawn_save_sql_history(meta, sql.to_string(), plan_entry, instant);
     Ok(())
+}
+
+/// Records SQL execution history off the hot path. The client already has its
+/// full result by the time this runs, so a slow meta store must not delay the
+/// connection becoming ready for its next query.
+fn spawn_save_sql_history(
+    meta: Arc<PostgreSQLMetaCatalogProviderList>,
+    sql: String,
+    plan_entry: Arc<(Plan, CacheKey)>,
+    instant: std::time::Instant,
+) {
+    let cost = instant.elapsed().as_millis() as u64;
+    tokio::spawn(async move {
+        if let Err(e) = save_sql_history(&meta, &sql, &plan_entry.0, cost).await {
+            error!("Failed to store sql execute info: {:?}", e);
+        }
+    });
 }
 
 // Prepare columns from first batch schema
@@ -857,9 +867,9 @@ async fn write_batches_to_client<W: AsyncWrite + Unpin>(
 // Finalize query execution
 async fn finalize_query<W: AsyncWrite + Unpin>(
     writer: RowWriter<'_, W>,
-    meta: &PostgreSQLMetaCatalogProviderList,
+    meta: Arc<PostgreSQLMetaCatalogProviderList>,
     sql: &str,
-    plan: &Plan,
+    plan_entry: Arc<(Plan, CacheKey)>,
     instant: std::time::Instant,
 ) -> Result<(), MysqlServerError> {
     writer
@@ -871,11 +881,7 @@ async fn finalize_query<W: AsyncWrite + Unpin>(
             MysqlServerError::WriteMysqlResultError(error_msg)
         })?;
 
-    let cost = instant.elapsed().as_millis() as u64;
-    if let Err(e) = save_sql_history(meta, sql, plan, cost).await {
-        error!("Failed to store sql execute info: {:?}", e);
-    }
-
+    spawn_save_sql_history(meta, sql.to_string(), plan_entry, instant);
     Ok(())
 }
 

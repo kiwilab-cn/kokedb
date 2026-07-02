@@ -147,7 +147,11 @@ struct CacheRefresher {
 #[async_trait::async_trait]
 impl ResultRefresher for CacheRefresher {
     async fn refresh(&self, cache_keys: Vec<u128>) {
-        // A fresh context picks up the just-synced snapshots.
+        // A fresh context picks up the just-synced snapshots. It is
+        // deliberately unrestricted (no catalog ACL): cached entries are only
+        // ever *read* by unrestricted sessions — ACL-scoped sessions bypass
+        // the shared result cache entirely — so refreshing them with full
+        // visibility cannot leak data to a restricted user.
         let ctx = match create_session_context(&self.shared) {
             Ok(ctx) => Arc::new(ctx),
             Err(e) => {

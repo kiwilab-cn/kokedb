@@ -76,6 +76,21 @@ impl ResultCache {
         }
     }
 
+    /// Single-lookup cache read: `None` on a miss *or* on a backend/decode
+    /// error (logged), `Some(stream)` on a hit. Callers should prefer this over
+    /// `contains()` + `get()`, which costs two round-trips on the Redis backend
+    /// and races with eviction in between.
+    pub async fn try_get(&self, key: u128) -> Option<SendableRecordBatchStream> {
+        match self.get(key).await {
+            Ok(stream) => Some(stream),
+            Err(CacheError::NotFound(_, _)) => None,
+            Err(e) => {
+                log::warn!("Result cache read failed for key {key}: {e}; treating as miss");
+                None
+            }
+        }
+    }
+
     pub async fn delete(&self, key: u128) -> Result<(), CacheError> {
         match self {
             Self::Local(c) => c.delete(key).await,

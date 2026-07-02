@@ -11,6 +11,7 @@ kokedb-cache.workspace = true
 pgwire.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
+async-stream.workspace = true
 futures.workspace = true
 datafusion.workspace = true
 log.workspace = true

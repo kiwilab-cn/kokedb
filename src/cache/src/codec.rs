@@ -6,7 +6,7 @@ use arrow::{
 };
 use datafusion::{error::DataFusionError, execution::SendableRecordBatchStream};
 use futures::{stream, StreamExt};
-use zstd::{decode_all, encode_all};
+use zstd::decode_all;
 
 use crate::error::CacheError;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -20,14 +20,21 @@ impl RecordBatchCodec {
             None => return Ok(vec![]),
         };
 
-        let mut buffer = Vec::new();
-        let mut writer = FileWriter::try_new(&mut buffer, &schema).map_err(|x| {
+        // Write the Arrow IPC file straight through a streaming zstd encoder,
+        // so only the compressed bytes are ever held in full. (The previous
+        // buffer-then-compress version kept the uncompressed IPC file AND the
+        // compressed copy in memory simultaneously.) The output is the same
+        // zstd frame either way, so this stays format-compatible.
+        let encoder = zstd::stream::Encoder::new(Vec::new(), compression_level).map_err(|x| {
+            CacheError::Internal(format!("Failed to create zstd encoder with error: {x}"))
+        })?;
+        let mut writer = FileWriter::try_new(encoder, &schema).map_err(|x| {
             CacheError::Internal(format!("Failed to new FileWriter with error: {x}"))
         })?;
 
         for batch in batches {
             writer.write(batch).map_err(|x| {
-                CacheError::Internal(format!("Failed to new FileWriter with error: {x}"))
+                CacheError::Internal(format!("Failed to write batch with error: {x}"))
             })?;
         }
 
@@ -35,10 +42,11 @@ impl RecordBatchCodec {
             CacheError::Internal(format!("Failed to finish FileWriter with error: {x}"))
         })?;
 
-        drop(writer);
-
-        let compressed = encode_all(buffer.as_slice(), compression_level).map_err(|x| {
-            CacheError::Internal(format!("Failed to compress buffer with error: {x}"))
+        let encoder = writer.into_inner().map_err(|x| {
+            CacheError::Internal(format!("Failed to unwrap FileWriter with error: {x}"))
+        })?;
+        let compressed = encoder.finish().map_err(|x| {
+            CacheError::Internal(format!("Failed to finish compression with error: {x}"))
         })?;
 
         Ok(compressed)
