@@ -29,6 +29,20 @@ pub struct RowPolicyDisplay {
     pub filter: String,
 }
 
+/// One row of `SHOW AUDIT LOG` output (newest first).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditLogDisplay {
+    pub event_time: String,
+    pub username: String,
+    pub client_addr: String,
+    pub protocol: String,
+    pub event_type: String,
+    pub statement: String,
+    pub success: bool,
+    pub error: Option<String>,
+    pub duration_ms: Option<i64>,
+}
+
 /// One row of `SHOW COLUMN POLICIES` output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnPolicyDisplay {

@@ -28,6 +28,8 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 /// The authenticated session's authorization state.
 #[derive(Debug, Clone, Default)]
 pub struct SessionAuth {
+    /// The authenticated username (empty while auth is disabled).
+    pub username: String,
     /// Grant scopes; `None` = unrestricted (superuser / auth disabled).
     pub scopes: Option<Arc<std::collections::HashSet<String>>>,
     /// Parsed row-level security policies (empty for unrestricted sessions).
@@ -63,6 +65,26 @@ impl KokedbStartupHandler {
         if let Ok(mut slot) = self.slot.lock() {
             *slot = Some(auth);
         }
+    }
+
+    fn audit_auth<C: ClientInfo>(
+        &self,
+        client: &C,
+        username: &str,
+        success: bool,
+        error: Option<String>,
+    ) {
+        self.shared.audit().log(kokedb_meta::catalog_list::AuditEvent {
+            event_time: chrono::Utc::now(),
+            username: username.to_string(),
+            client_addr: client.socket_addr().to_string(),
+            protocol: "postgresql",
+            event_type: "auth",
+            statement: String::new(),
+            success,
+            error,
+            duration_ms: None,
+        });
     }
 }
 
@@ -115,9 +137,11 @@ impl StartupHandler for KokedbStartupHandler {
                     .map_err(|e| PgWireError::ApiError(Box::new(std::io::Error::other(e.to_string()))))?;
 
                 let Some(app_user) = app_user else {
+                    self.audit_auth(client, &user, false, Some("unknown user".to_string()));
                     return Err(auth_err(&user));
                 };
                 if !kokedb_common::auth::verify_cleartext(&app_user.auth_digest, &pwd.password) {
+                    self.audit_auth(client, &user, false, Some("bad password".to_string()));
                     return Err(auth_err(&user));
                 }
 
@@ -142,10 +166,12 @@ impl StartupHandler for KokedbStartupHandler {
                     (Vec::new(), Vec::new())
                 };
                 self.publish(SessionAuth {
+                    username: user.clone(),
                     scopes,
                     policies,
                     column_policies,
                 });
+                self.audit_auth(client, &user, true, None);
 
                 let (pid, secret_key) = RandomPidSecretKeyGenerator::default().generate(client);
                 client.set_pid_and_secret_key(pid, secret_key);

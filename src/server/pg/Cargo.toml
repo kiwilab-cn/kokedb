@@ -8,6 +8,8 @@ kokedb-common.workspace = true
 kokedb-query.workspace = true
 kokedb-cache.workspace = true
 kokedb-catalog.workspace = true
+kokedb-meta.workspace = true
+chrono.workspace = true
 
 pgwire.workspace = true
 tokio-rustls.workspace = true

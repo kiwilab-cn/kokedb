@@ -370,6 +370,14 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             let node = spec::CommandNode::ListColumnPolicies;
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::ShowAuditLog {
+            show: _,
+            audit: _,
+            log: _,
+        } => {
+            let node = spec::CommandNode::ListAuditLog;
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::UseDatabase {
             r#use: _,
             database: _,

@@ -132,6 +132,36 @@ impl KokedbQueryHandler {
             .and_then(|slot| slot.clone())
             .unwrap_or_default()
     }
+
+    /// Records one statement outcome in the audit trail. For streamed query
+    /// responses the outcome reflects acceptance (parse, authorization,
+    /// planning) — the security-relevant part — since rows flow lazily after
+    /// this returns. Commands are drained eagerly, so their outcome is final.
+    fn audit_statement<C: ClientInfo>(
+        &self,
+        client: &C,
+        sql: &str,
+        outcome: &PgWireResult<Response>,
+        started: std::time::Instant,
+    ) {
+        // Redact command text (it can carry secrets); parse failures are
+        // treated as commands so raw text is never recorded.
+        let is_command = match self.prepare(sql) {
+            Ok(entry) => !matches!(entry.0, Plan::Query(_)),
+            Err(_) => true,
+        };
+        self.shared.audit().log(kokedb_meta::catalog_list::AuditEvent {
+            event_time: chrono::Utc::now(),
+            username: self.current_acl().username,
+            client_addr: client.socket_addr().to_string(),
+            protocol: "postgresql",
+            event_type: if is_command { "command" } else { "query" },
+            statement: kokedb_query::audit::AuditLogger::statement_for(sql, is_command),
+            success: outcome.is_ok(),
+            error: outcome.as_ref().err().map(|e| e.to_string()),
+            duration_ms: Some(started.elapsed().as_millis() as i64),
+        });
+    }
 }
 
 fn pg_err(msg: impl std::fmt::Display) -> PgWireError {
@@ -493,7 +523,7 @@ fn split_statements(sql: &str) -> Vec<&str> {
 
 #[async_trait]
 impl SimpleQueryHandler for KokedbQueryHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
@@ -510,10 +540,12 @@ impl SimpleQueryHandler for KokedbQueryHandler {
         }
         let mut responses = Vec::with_capacity(statements.len());
         for stmt in statements {
-            responses.push(
-                self.execute_to_response(stmt, &acl, &Format::UnifiedText)
-                    .await?,
-            );
+            let started = std::time::Instant::now();
+            let response = self
+                .execute_to_response(stmt, &acl, &Format::UnifiedText)
+                .await;
+            self.audit_statement(client, stmt, &response, started);
+            responses.push(response?);
         }
         Ok(responses)
     }
@@ -530,7 +562,7 @@ impl ExtendedQueryHandler for KokedbQueryHandler {
 
     async fn do_query<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
@@ -544,8 +576,12 @@ impl ExtendedQueryHandler for KokedbQueryHandler {
         let sql = substitute_placeholders(&portal.statement.statement, |idx| {
             param_literal(portal, idx)
         })?;
-        self.execute_to_response(&sql, &acl, &portal.result_column_format)
-            .await
+        let started = std::time::Instant::now();
+        let response = self
+            .execute_to_response(&sql, &acl, &portal.result_column_format)
+            .await;
+        self.audit_statement(client, &sql, &response, started);
+        response
     }
 
     async fn do_describe_statement<C>(

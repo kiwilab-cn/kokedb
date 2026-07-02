@@ -1147,3 +1147,198 @@ async fn pg_wire_column_level_security() {
     clean_meta(&meta, catalog).await;
     let _ = sqlx::query("DROP TABLE IF EXISTS cls_people").execute(&source).await;
 }
+
+/// Audit log: auth successes/failures and statements land in
+/// `system.audit_log`; command text is redacted (no secrets); SHOW AUDIT LOG
+/// is admin-only and returns entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (source + meta)"]
+async fn pg_wire_audit_log() {
+    let catalog = "adt_cat";
+    std::env::set_var("PG_META_DSN", meta_dsn());
+    std::env::set_var("KOKEDB_REEVALUATE_INTERVAL_MIN", "60");
+
+    let source = PgPool::connect(&source_dsn()).await.unwrap();
+    for stmt in [
+        "DROP TABLE IF EXISTS adt_t",
+        "CREATE TABLE adt_t (id int PRIMARY KEY)",
+        "INSERT INTO adt_t SELECT generate_series(1, 3)",
+    ] {
+        sqlx::query(stmt).execute(&source).await.unwrap();
+    }
+    let meta = PgPool::connect(&meta_dsn()).await.unwrap();
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('adt_admin','adt_user')")
+        .execute(&meta)
+        .await;
+    let _ = sqlx::query("DELETE FROM system.audit_log").execute(&meta).await;
+
+    let result_cache = ResultCache::local(64, 64).await.unwrap();
+    let shared = init_shared_services(result_cache).await.unwrap();
+    let handlers = KokedbHandlers::new(shared);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let h = handlers.clone();
+            tokio::spawn(async move {
+                let _ = process_socket(sock, None, h).await;
+            });
+        }
+    });
+    let port = addr.port();
+
+    let (boot, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=postgres dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("bootstrap connection");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    boot.simple_query(&format!(
+        "CREATE CATALOG {catalog} USING '{}' WITH properties(cache_policy=\"select\", \
+         table_set=\"public.adt_t\")",
+        source_dsn()
+    ))
+    .await
+    .expect("CREATE CATALOG");
+    assert!(wait_until_cached(&meta, catalog, "adt_t", Duration::from_secs(60)).await);
+
+    boot.simple_query(
+        "CREATE USER adt_admin WITH properties(password=\"s3cret_admin\", superuser=\"true\")",
+    )
+    .await
+    .expect("create admin");
+    boot.simple_query(&format!(
+        "CREATE USER adt_user WITH properties(password=\"pw\", catalogs=\"{catalog}\")"
+    ))
+    .await
+    .expect("create user");
+
+    // A failed login, then a successful one, then a query + a denied query.
+    let _ = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=adt_user password=wrong dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await;
+    let (user, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=adt_user password=pw dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("user authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let ok = user
+        .simple_query(&format!("SELECT count(*) AS c FROM {catalog}.public.adt_t"))
+        .await
+        .expect("query ok");
+    assert_eq!(first_value(&ok, "c").as_deref(), Some("3"));
+    let _denied = user
+        .simple_query("SELECT count(*) FROM nosuch.public.t")
+        .await;
+
+    // The audit flusher batches on a 1s tick; wait for persistence.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM system.audit_log")
+            .fetch_one(&meta)
+            .await
+            .unwrap_or(0);
+        if n > 0 || std::time::Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // Auth failure + success recorded.
+    let auth_fail: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM system.audit_log \
+         WHERE username = 'adt_user' AND event_type = 'auth' AND success = false",
+    )
+    .fetch_one(&meta)
+    .await
+    .unwrap_or(0);
+    assert!(auth_fail >= 1, "failed login must be audited");
+    let auth_ok: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM system.audit_log \
+         WHERE username = 'adt_user' AND event_type = 'auth' AND success = true",
+    )
+    .fetch_one(&meta)
+    .await
+    .unwrap_or(0);
+    assert!(auth_ok >= 1, "successful login must be audited");
+
+    // The successful query recorded with its SQL and the user attached.
+    let queries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM system.audit_log WHERE username = 'adt_user' \
+         AND event_type = 'query' AND success = true AND statement LIKE '%adt_t%'",
+    )
+    .fetch_one(&meta)
+    .await
+    .unwrap_or(0);
+    assert!(queries >= 1, "successful query must be audited with its SQL");
+    // The denied query recorded as a failure.
+    let denied: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM system.audit_log WHERE username = 'adt_user' \
+         AND event_type = 'query' AND success = false",
+    )
+    .fetch_one(&meta)
+    .await
+    .unwrap_or(0);
+    assert!(denied >= 1, "denied query must be audited as a failure");
+
+    // Secrets never land in the audit trail: CREATE USER is stored as a
+    // redacted prefix.
+    let leaked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM system.audit_log WHERE statement LIKE '%s3cret_admin%'",
+    )
+    .fetch_one(&meta)
+    .await
+    .unwrap_or(0);
+    assert_eq!(leaked, 0, "command secrets must never appear in the audit trail");
+    let redacted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM system.audit_log \
+         WHERE event_type = 'command' AND statement LIKE 'CREATE USER adt_admin%'",
+    )
+    .fetch_one(&meta)
+    .await
+    .unwrap_or(0);
+    assert!(redacted >= 1, "commands audited as redacted prefixes");
+
+    // SHOW AUDIT LOG: admin sees entries; restricted user is denied.
+    let (admin, conn) = tokio_postgres::connect(
+        &format!(
+            "host=127.0.0.1 port={port} user=adt_admin password=s3cret_admin dbname=kokedb"
+        ),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("admin authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let shown = admin.simple_query("SHOW AUDIT LOG").await.expect("SHOW AUDIT LOG");
+    let rows = shown
+        .iter()
+        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
+        .count();
+    assert!(rows >= 3, "SHOW AUDIT LOG should return entries, got {rows}");
+    assert!(
+        user.simple_query("SHOW AUDIT LOG").await.is_err(),
+        "restricted users must not read the audit log"
+    );
+
+    // Cleanup.
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('adt_admin','adt_user')")
+        .execute(&meta)
+        .await;
+    let _ = sqlx::query("DELETE FROM system.audit_log").execute(&meta).await;
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS adt_t").execute(&source).await;
+}

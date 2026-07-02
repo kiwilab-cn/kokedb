@@ -11,7 +11,8 @@ use serde_arrow::to_arrow;
 
 use crate::display::{
     CacheJobDisplay, CachePolicyDisplay, CacheScheduleDisplay, CatalogDisplay, DiagnoseDisplay,
-    ColumnPolicyDisplay, EmptyDisplay, RefreshCacheDisplay, RowPolicyDisplay, SingleValueDisplay,
+    AuditLogDisplay, ColumnPolicyDisplay, EmptyDisplay, RefreshCacheDisplay, RowPolicyDisplay,
+    SingleValueDisplay,
     TableMetadataDisplay, UserDisplay,
 };
 use crate::error::{CatalogError, CatalogResult};
@@ -116,6 +117,7 @@ pub enum CatalogCommand {
         username: String,
     },
     ListColumnPolicies,
+    ListAuditLog,
     CurrentDatabase,
     SetCurrentDatabase {
         database: Vec<String>,
@@ -243,6 +245,7 @@ impl CatalogCommand {
             CatalogCommand::CreateColumnPolicy { .. } => "CreateColumnPolicy",
             CatalogCommand::DropColumnPolicy { .. } => "DropColumnPolicy",
             CatalogCommand::ListColumnPolicies => "ListColumnPolicies",
+            CatalogCommand::ListAuditLog => "ListAuditLog",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
@@ -353,6 +356,9 @@ impl CatalogCommand {
             }
             CatalogCommand::ListColumnPolicies => {
                 Vec::<FieldRef>::from_type::<ColumnPolicyDisplay>(TracingOptions::default())
+            }
+            CatalogCommand::ListAuditLog => {
+                Vec::<FieldRef>::from_type::<AuditLogDisplay>(TracingOptions::default())
             }
         }
         .map_err(|e| {
@@ -508,6 +514,10 @@ impl CatalogCommand {
             }
             CatalogCommand::ListColumnPolicies => {
                 let rows = manager.list_column_policies().await?;
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::ListAuditLog => {
+                let rows = manager.list_audit_log().await?;
                 build_record_batch(schema, &rows)
             }
             CatalogCommand::CurrentDatabase => {

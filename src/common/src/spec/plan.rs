@@ -599,6 +599,7 @@ pub enum CommandNode {
         username: Identifier,
     },
     ListColumnPolicies,
+    ListAuditLog,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

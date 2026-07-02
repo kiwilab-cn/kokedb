@@ -24,7 +24,7 @@ use crate::ast::keywords::{
     Verbose, View, Views, When, With, Zone,
 };
 use crate::ast::keywords::{Diagnose, Pause, Resume, Schedule};
-use crate::ast::keywords::{Grant, Revoke, User, Users};
+use crate::ast::keywords::{Audit, Grant, Log, Revoke, User, Users};
 use crate::ast::literal::{IntegerLiteral, NumberLiteral, StringLiteral};
 use crate::ast::operator::{
     Asterisk, Colon, Comma, Equals, ExclamationMark, LeftParenthesis, Minus, Plus, RightParenthesis,
@@ -185,6 +185,12 @@ pub enum Statement {
         show: Show,
         column: Column,
         policies: Policies,
+    },
+    /// `SHOW AUDIT LOG` — the most recent audit-trail entries (admin only).
+    ShowAuditLog {
+        show: Show,
+        audit: Audit,
+        log: Log,
     },
     UseDatabase {
         r#use: Use,
