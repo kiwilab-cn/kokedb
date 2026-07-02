@@ -20,6 +20,15 @@ pub struct CachePolicyDisplay {
     pub cache_policy: String,
 }
 
+/// One row of `SHOW ROW POLICIES` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RowPolicyDisplay {
+    pub username: String,
+    /// Fully-qualified `catalog.schema.table`.
+    pub table: String,
+    pub filter: String,
+}
+
 /// One row of `SHOW USERS` output. The password digest is deliberately not
 /// exposed.
 #[derive(Debug, Clone, Serialize, Deserialize)]

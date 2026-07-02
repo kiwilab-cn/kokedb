@@ -132,6 +132,33 @@ pub enum Statement {
         from: From,
         user: Either<Ident, StringLiteral>,
     },
+    /// `CREATE ROW POLICY ON cat.schema.table FOR user USING 'predicate'` —
+    /// row-level security: the predicate is AND-ed into that user's reads.
+    CreateRowPolicy {
+        create: Create,
+        row: Row,
+        policy: Policy,
+        on: On,
+        table: ObjectName,
+        r#for: For,
+        user: Either<Ident, StringLiteral>,
+        using: Using,
+        filter: StringLiteral,
+    },
+    DropRowPolicy {
+        drop: Drop,
+        row: Row,
+        policy: Policy,
+        on: On,
+        table: ObjectName,
+        r#for: For,
+        user: Either<Ident, StringLiteral>,
+    },
+    ShowRowPolicies {
+        show: Show,
+        row: Row,
+        policies: Policies,
+    },
     UseDatabase {
         r#use: Use,
         database: Either<Database, Schema>,

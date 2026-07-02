@@ -414,6 +414,20 @@ impl PostgreSQLMetaCatalogProviderList {
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             "#,
+            // Row-level security: a per-(user, table) filter predicate — a SQL
+            // boolean expression over the table's columns — AND-ed into every
+            // read that user performs on that table.
+            r#"
+            CREATE TABLE IF NOT EXISTS system.row_policy (
+                username VARCHAR(255) NOT NULL,
+                catalog VARCHAR(255) NOT NULL,
+                schema_name VARCHAR(255) NOT NULL,
+                table_name VARCHAR(255) NOT NULL,
+                filter_sql TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (username, catalog, schema_name, table_name)
+            );
+            "#,
         ];
 
         for sql in sql_statements {
@@ -645,6 +659,118 @@ impl PostgreSQLMetaCatalogProviderList {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         Ok(ret.rows_affected() > 0)
+    }
+
+    /// Creates or replaces a row policy for `(username, table)`.
+    pub async fn upsert_row_policy(
+        &self,
+        username: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+        filter_sql: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO system.row_policy \
+                (username, catalog, schema_name, table_name, filter_sql, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP) \
+             ON CONFLICT (username, catalog, schema_name, table_name) DO UPDATE SET \
+                filter_sql = EXCLUDED.filter_sql, updated_at = CURRENT_TIMESTAMP",
+        )
+        .bind(username)
+        .bind(catalog)
+        .bind(schema)
+        .bind(table)
+        .bind(filter_sql)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
+    /// Removes a row policy. Returns whether one existed.
+    pub async fn delete_row_policy(
+        &self,
+        username: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<bool> {
+        let ret = sqlx::query(
+            "DELETE FROM system.row_policy WHERE username = $1 AND catalog = $2 \
+             AND schema_name = $3 AND table_name = $4",
+        )
+        .bind(username)
+        .bind(catalog)
+        .bind(schema)
+        .bind(table)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(ret.rows_affected() > 0)
+    }
+
+    /// All row policies for one user: `(catalog, schema, table, filter_sql)`.
+    /// Loaded at authentication time to build the session's ACL.
+    pub async fn list_row_policies(
+        &self,
+        username: &str,
+    ) -> Result<Vec<(String, String, String, String)>> {
+        let rows = sqlx::query(
+            "SELECT catalog, schema_name, table_name, filter_sql \
+             FROM system.row_policy WHERE username = $1",
+        )
+        .bind(username)
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get("catalog"),
+                    r.get("schema_name"),
+                    r.get("table_name"),
+                    r.get("filter_sql"),
+                )
+            })
+            .collect())
+    }
+
+    /// Every row policy: `(username, catalog, schema, table, filter_sql)`,
+    /// ordered for stable `SHOW ROW POLICIES` output.
+    pub async fn list_all_row_policies(
+        &self,
+    ) -> Result<Vec<(String, String, String, String, String)>> {
+        let rows = sqlx::query(
+            "SELECT username, catalog, schema_name, table_name, filter_sql \
+             FROM system.row_policy ORDER BY username, catalog, schema_name, table_name",
+        )
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get("username"),
+                    r.get("catalog"),
+                    r.get("schema_name"),
+                    r.get("table_name"),
+                    r.get("filter_sql"),
+                )
+            })
+            .collect())
+    }
+
+    /// Drops all of a user's row policies (called when the user is dropped).
+    pub async fn delete_row_policies_for_user(&self, username: &str) -> Result<()> {
+        sqlx::query("DELETE FROM system.row_policy WHERE username = $1")
+            .bind(username)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
     }
 
     /// Replaces a user's catalog allow-list. Returns whether the user exists.

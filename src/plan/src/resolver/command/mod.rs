@@ -362,6 +362,24 @@ impl PlanResolver<'_> {
                     username: username.into(),
                 })
             }
+            CommandNode::CreateRowPolicy {
+                table,
+                username,
+                filter,
+            } => self.resolve_catalog_command(CatalogCommand::CreateRowPolicy {
+                table: table.into(),
+                username: username.into(),
+                filter,
+            }),
+            CommandNode::DropRowPolicy { table, username } => {
+                self.resolve_catalog_command(CatalogCommand::DropRowPolicy {
+                    table: table.into(),
+                    username: username.into(),
+                })
+            }
+            CommandNode::ListRowPolicies => {
+                self.resolve_catalog_command(CatalogCommand::ListRowPolicies)
+            }
         }
     }
 

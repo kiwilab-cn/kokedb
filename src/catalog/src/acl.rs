@@ -12,7 +12,21 @@
 //! readable). Malformed scopes (empty parts, >3 segments) are ignored rather
 //! than granting anything.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use kokedb_common::spec;
+
+/// A row-level security policy attached to the session: reads of `table` are
+/// AND-ed with `filter`. `filter: None` means the stored policy failed to
+/// parse — the table is then denied entirely (fail-closed), never served
+/// unfiltered.
+#[derive(Debug, Clone)]
+pub struct RowPolicy {
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+    pub filter: Option<spec::Expr>,
+}
 
 /// Parsed grant scopes for one session. Construct via [`CatalogAcl::from_scopes`].
 #[derive(Debug, Default)]
@@ -28,6 +42,8 @@ pub struct CatalogAcl {
     /// Databases visible for resolution/listing (full grants + parents of
     /// table grants).
     visible_databases: HashSet<(String, String)>,
+    /// Row-level security filters, keyed by `(catalog, schema, table)`.
+    policies: HashMap<(String, String, String), Option<spec::Expr>>,
 }
 
 impl CatalogAcl {
@@ -88,6 +104,23 @@ impl CatalogAcl {
                 schema.to_string(),
                 table.to_string(),
             ))
+    }
+
+    /// Attaches the session's row-level security policies.
+    pub fn with_policies(mut self, policies: Vec<RowPolicy>) -> Self {
+        for p in policies {
+            self.policies
+                .insert((p.catalog, p.schema, p.table), p.filter);
+        }
+        self
+    }
+
+    /// The row filter for a table, if any. `Some(None)` marks a policy whose
+    /// stored predicate failed to parse — the caller must deny the read
+    /// (fail-closed), never serve the table unfiltered.
+    pub fn row_policy(&self, catalog: &str, schema: &str, table: &str) -> Option<&Option<spec::Expr>> {
+        self.policies
+            .get(&(catalog.to_string(), schema.to_string(), table.to_string()))
     }
 }
 

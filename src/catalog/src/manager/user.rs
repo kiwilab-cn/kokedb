@@ -8,7 +8,7 @@
 
 use kokedb_common::auth::password_digest;
 
-use crate::display::UserDisplay;
+use crate::display::{RowPolicyDisplay, UserDisplay};
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::utils::match_pattern;
@@ -86,7 +86,8 @@ impl CatalogManager {
         Ok(())
     }
 
-    /// Backs `DROP USER [IF EXISTS] name`.
+    /// Backs `DROP USER [IF EXISTS] name`. Also removes the user's row
+    /// policies so a re-created user of the same name starts clean.
     pub async fn drop_user(&self, username: &str, if_exists: bool) -> CatalogResult<()> {
         self.require_admin()?;
         let meta = self.state()?.dynamic_catalog_list.clone();
@@ -96,6 +97,13 @@ impl CatalogManager {
             .map_err(|e| CatalogError::External(format!("Failed to drop user: {e}")))?;
         if !deleted && !if_exists {
             return Err(CatalogError::NotFound("user", username.to_string()));
+        }
+        if deleted {
+            meta.delete_row_policies_for_user(username)
+                .await
+                .map_err(|e| {
+                    CatalogError::External(format!("Failed to drop user's row policies: {e}"))
+                })?;
         }
         Ok(())
     }
@@ -168,6 +176,73 @@ impl CatalogManager {
                 Ok(())
             }
         }
+    }
+
+    /// Backs `CREATE ROW POLICY ON c.s.t FOR user USING 'predicate'`. The
+    /// table must be fully qualified; the predicate was validated by the
+    /// analyzer. Creating a policy for an existing `(user, table)` replaces it.
+    pub async fn create_row_policy(
+        &self,
+        table: &[String],
+        username: &str,
+        filter: &str,
+    ) -> CatalogResult<()> {
+        self.require_admin()?;
+        let [catalog, schema, table_name] = table else {
+            return Err(CatalogError::InvalidArgument(
+                "row policies require a fully qualified catalog.schema.table".to_string(),
+            ));
+        };
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        // Policies are per-user; the user must exist.
+        meta.get_app_user(username)
+            .await
+            .map_err(|e| CatalogError::External(format!("Failed to look up user: {e}")))?
+            .ok_or_else(|| CatalogError::NotFound("user", username.to_string()))?;
+        meta.upsert_row_policy(username, catalog, schema, table_name, filter)
+            .await
+            .map_err(|e| CatalogError::External(format!("Failed to create row policy: {e}")))?;
+        Ok(())
+    }
+
+    /// Backs `DROP ROW POLICY ON c.s.t FOR user`.
+    pub async fn drop_row_policy(&self, table: &[String], username: &str) -> CatalogResult<()> {
+        self.require_admin()?;
+        let [catalog, schema, table_name] = table else {
+            return Err(CatalogError::InvalidArgument(
+                "row policies require a fully qualified catalog.schema.table".to_string(),
+            ));
+        };
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let deleted = meta
+            .delete_row_policy(username, catalog, schema, table_name)
+            .await
+            .map_err(|e| CatalogError::External(format!("Failed to drop row policy: {e}")))?;
+        if !deleted {
+            return Err(CatalogError::NotFound(
+                "row policy",
+                format!("{catalog}.{schema}.{table_name} for {username}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Backs `SHOW ROW POLICIES`.
+    pub async fn list_row_policies(&self) -> CatalogResult<Vec<RowPolicyDisplay>> {
+        self.require_admin()?;
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let rows = meta
+            .list_all_row_policies()
+            .await
+            .map_err(|e| CatalogError::External(format!("Failed to list row policies: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(|(username, catalog, schema, table, filter)| RowPolicyDisplay {
+                username,
+                table: format!("{catalog}.{schema}.{table}"),
+                filter,
+            })
+            .collect())
     }
 
     /// Backs `REVOKE CATALOG c | DATABASE c.s | TABLE c.s.t FROM user`:

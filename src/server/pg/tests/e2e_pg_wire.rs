@@ -750,3 +750,193 @@ async fn pg_wire_table_level_authorization() {
     let _ = sqlx::query("DROP TABLE IF EXISTS az_ok").execute(&source).await;
     let _ = sqlx::query("DROP TABLE IF EXISTS az_no").execute(&source).await;
 }
+
+/// Row-level security: a `CREATE ROW POLICY` predicate is AND-ed into every
+/// read the target user performs on the table; other users are unaffected;
+/// invalid predicates are rejected at CREATE; dropping the policy restores
+/// full reads; restricted users cannot manage policies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (source + meta)"]
+async fn pg_wire_row_level_security() {
+    let catalog = "rls_cat";
+    std::env::set_var("PG_META_DSN", meta_dsn());
+    std::env::set_var("KOKEDB_REEVALUATE_INTERVAL_MIN", "60");
+
+    let source = PgPool::connect(&source_dsn()).await.unwrap();
+    for stmt in [
+        "DROP TABLE IF EXISTS rls_orders",
+        "CREATE TABLE rls_orders (id int PRIMARY KEY, region text)",
+        "INSERT INTO rls_orders VALUES (1,'cn'),(2,'cn'),(3,'cn'),(4,'us'),(5,'us')",
+    ] {
+        sqlx::query(stmt).execute(&source).await.unwrap();
+    }
+    let meta = PgPool::connect(&meta_dsn()).await.unwrap();
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('rls_admin','rls_user')")
+        .execute(&meta)
+        .await;
+    let _ = sqlx::query("DELETE FROM system.row_policy WHERE username IN ('rls_admin','rls_user')")
+        .execute(&meta)
+        .await;
+
+    let result_cache = ResultCache::local(64, 64).await.unwrap();
+    let shared = init_shared_services(result_cache).await.unwrap();
+    let handlers = KokedbHandlers::new(shared);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let h = handlers.clone();
+            tokio::spawn(async move {
+                let _ = process_socket(sock, None, h).await;
+            });
+        }
+    });
+    let port = addr.port();
+
+    // Bootstrap: catalog + users + policy.
+    let (boot, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=postgres dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("bootstrap connection");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    boot.simple_query(&format!(
+        "CREATE CATALOG {catalog} USING '{}' WITH properties(cache_policy=\"select\", \
+         table_set=\"public.rls_orders\")",
+        source_dsn()
+    ))
+    .await
+    .expect("CREATE CATALOG");
+    assert!(wait_until_cached(&meta, catalog, "rls_orders", Duration::from_secs(60)).await);
+
+    boot.simple_query(
+        "CREATE USER rls_admin WITH properties(password=\"adm\", superuser=\"true\")",
+    )
+    .await
+    .expect("create admin");
+    boot.simple_query(&format!(
+        "CREATE USER rls_user WITH properties(password=\"pw\", catalogs=\"{catalog}\")"
+    ))
+    .await
+    .expect("create rls user");
+
+    // An invalid predicate is rejected at CREATE time.
+    assert!(
+        boot.simple_query(&format!(
+            "CREATE ROW POLICY ON {catalog}.public.rls_orders FOR rls_user USING \"((not valid\""
+        ))
+        .await
+        .is_err(),
+        "invalid predicate must be rejected at CREATE"
+    );
+
+    boot.simple_query(&format!(
+        "CREATE ROW POLICY ON {catalog}.public.rls_orders FOR rls_user USING \"region = 'cn'\""
+    ))
+    .await
+    .expect("CREATE ROW POLICY");
+
+    // SHOW ROW POLICIES lists it.
+    let policies = boot.simple_query("SHOW ROW POLICIES").await.expect("SHOW ROW POLICIES");
+    assert_eq!(
+        first_value(&policies, "username").as_deref(),
+        Some("rls_user"),
+        "policy listed"
+    );
+    assert_eq!(
+        first_value(&policies, "filter").as_deref(),
+        Some("region = 'cn'"),
+        "filter text listed"
+    );
+
+    // The filtered user sees only its rows — in every shape of query.
+    let (user, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=rls_user password=pw dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("rls user authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let count = user
+        .simple_query(&format!("SELECT count(*) AS c FROM {catalog}.public.rls_orders"))
+        .await
+        .expect("filtered count");
+    assert_eq!(first_value(&count, "c").as_deref(), Some("3"), "policy filters rows");
+    let us = user
+        .simple_query(&format!(
+            "SELECT count(*) AS c FROM {catalog}.public.rls_orders WHERE region = 'us'"
+        ))
+        .await
+        .expect("user predicate ANDs with policy");
+    assert_eq!(
+        first_value(&us, "c").as_deref(),
+        Some("0"),
+        "policy must AND with the user's own WHERE clause"
+    );
+
+    // A restricted user cannot manage row policies.
+    assert!(
+        user.simple_query(&format!(
+            "CREATE ROW POLICY ON {catalog}.public.rls_orders FOR rls_admin USING \"1 = 1\""
+        ))
+        .await
+        .is_err(),
+        "restricted users must not manage row policies"
+    );
+
+    // The admin (unrestricted) sees everything.
+    let (admin, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=rls_admin password=adm dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("admin authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let all = admin
+        .simple_query(&format!("SELECT count(*) AS c FROM {catalog}.public.rls_orders"))
+        .await
+        .expect("admin reads unfiltered");
+    assert_eq!(first_value(&all, "c").as_deref(), Some("5"), "admin unaffected by policy");
+
+    // Dropping the policy restores full reads on the next connection.
+    admin
+        .simple_query(&format!(
+            "DROP ROW POLICY ON {catalog}.public.rls_orders FOR rls_user"
+        ))
+        .await
+        .expect("DROP ROW POLICY");
+    let (user2, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=rls_user password=pw dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("rls user reconnects");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let full = user2
+        .simple_query(&format!("SELECT count(*) AS c FROM {catalog}.public.rls_orders"))
+        .await
+        .expect("unfiltered after drop");
+    assert_eq!(first_value(&full, "c").as_deref(), Some("5"), "policy removed");
+
+    // Cleanup.
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('rls_admin','rls_user')")
+        .execute(&meta)
+        .await;
+    let _ = sqlx::query("DELETE FROM system.row_policy WHERE username IN ('rls_admin','rls_user')")
+        .execute(&meta)
+        .await;
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS rls_orders").execute(&source).await;
+}
