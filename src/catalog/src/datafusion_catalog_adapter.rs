@@ -16,13 +16,21 @@ use crate::{
 pub struct DataFusionCatalogAdapter {
     inner: Arc<dyn CatalogProvider>,
     catalog_name: String,
+    /// Shared meta-store handle (process-wide pool). Table-status lookups run
+    /// once per table, so they must not open their own connections.
+    meta: Arc<PostgreSQLMetaCatalogProviderList>,
 }
 
 impl DataFusionCatalogAdapter {
-    pub fn new(inner: Arc<dyn CatalogProvider>, catalog_name: String) -> Self {
+    pub fn new(
+        inner: Arc<dyn CatalogProvider>,
+        catalog_name: String,
+        meta: Arc<PostgreSQLMetaCatalogProviderList>,
+    ) -> Self {
         Self {
             inner,
             catalog_name,
+            meta,
         }
     }
 
@@ -62,11 +70,7 @@ impl DataFusionCatalogAdapter {
                 is_cluster: false,
             })
             .collect();
-        let meta_client = PostgreSQLMetaCatalogProviderList::new()
-            .await
-            .map_err(|x| {
-                CatalogError::External(format!("Failed to get meta client with error: {}", x))
-            })?;
+        let meta_client = &self.meta;
         let catalog_info: CatalogInfo =
             meta_client
                 .get_catalog(&self.catalog_name)

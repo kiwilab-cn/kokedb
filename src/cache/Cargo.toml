@@ -14,9 +14,6 @@ thiserror.workspace = true
 serde.workspace = true
 datafusion.workspace = true
 log.workspace = true
-
-
-[dev-dependencies]
 tokio.workspace = true
 
 [lints]

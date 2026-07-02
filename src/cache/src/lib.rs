@@ -4,3 +4,4 @@ pub mod error;
 pub mod foyer_hybrid;
 pub mod redis_cache;
 pub mod result_cache;
+pub mod singleflight;

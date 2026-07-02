@@ -3444,6 +3444,7 @@ dependencies = [
 name = "kokedb-pg-svc"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "datafusion",
  "futures",

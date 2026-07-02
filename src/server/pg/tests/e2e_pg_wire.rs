@@ -68,10 +68,12 @@ async fn wait_until_cached(meta: &PgPool, catalog: &str, table: &str, timeout: D
     false
 }
 
-/// Extracts a single-column value from the first row of a simple-query result.
+/// Extracts a single-column value from the first row carrying `col` in a
+/// simple-query result. Rows from other statements (multi-statement queries)
+/// that lack the column are skipped rather than panicking.
 fn first_value(msgs: &[SimpleQueryMessage], col: &str) -> Option<String> {
     msgs.iter().find_map(|m| match m {
-        SimpleQueryMessage::Row(r) => r.get(col).map(|s| s.to_string()),
+        SimpleQueryMessage::Row(r) => r.try_get(col).ok().flatten().map(|s| s.to_string()),
         _ => None,
     })
 }
@@ -156,6 +158,17 @@ async fn pg_wire_create_catalog_and_query() {
         .await
         .unwrap();
     assert_eq!(first_value(&named, "n").as_deref(), Some("n7"), "text column over pg wire");
+
+    // Multi-statement simple query: both statements answered, in order.
+    let multi = client
+        .simple_query(&format!(
+            "SELECT count(*) AS c FROM {catalog}.public.pgw_items WHERE id <= 5; \
+             SELECT name AS n FROM {catalog}.public.pgw_items WHERE id = 9;"
+        ))
+        .await
+        .expect("multi-statement simple query");
+    assert_eq!(first_value(&multi, "c").as_deref(), Some("5"), "first statement result");
+    assert_eq!(first_value(&multi, "n").as_deref(), Some("n9"), "second statement result");
 
     clean_meta(&meta, catalog).await;
     let _ = sqlx::query("DROP TABLE IF EXISTS pgw_items").execute(&source).await;

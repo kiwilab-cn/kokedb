@@ -65,21 +65,31 @@ impl MysqlToParquetConverter {
         let batch = mysql_rows_to_record_batch(rows, &arrow_schema)
             .map_err(|x| TaskError::RecordBatchError(format!("MySQL row -> batch failed: {x}")))?;
 
-        let file = File::create(&file_name)?;
-        let mut writer = ArrowWriter::try_new(file, arrow_schema.clone(), Some(props.clone()))
-            .context("Failed to create Parquet writer")
-            .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
-        writer
-            .write(&batch)
-            .context(format!("Failed to write batch to: {}", &file_name))
-            .map_err(|e| {
-                error!("Failed to write MySQL batch to parquet: {e:?}");
-                TaskError::WriteParquetError(e.to_string())
-            })?;
-        writer
-            .close()
-            .context(format!("Failed to close writer for: {}", &file_name))
-            .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
+        // Parquet encoding + file IO are synchronous and CPU/disk heavy; run
+        // them on the blocking pool so they don't stall a tokio worker thread.
+        let props = props.clone();
+        let arrow_schema = arrow_schema.clone();
+        let write_file_name = file_name.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), TaskError> {
+            let file = File::create(&write_file_name)?;
+            let mut writer = ArrowWriter::try_new(file, arrow_schema, Some(props))
+                .context("Failed to create Parquet writer")
+                .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
+            writer
+                .write(&batch)
+                .context(format!("Failed to write batch to: {}", &write_file_name))
+                .map_err(|e| {
+                    error!("Failed to write MySQL batch to parquet: {e:?}");
+                    TaskError::WriteParquetError(e.to_string())
+                })?;
+            writer
+                .close()
+                .context(format!("Failed to close writer for: {}", &write_file_name))
+                .map_err(|x| TaskError::WriteParquetError(x.to_string()))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| TaskError::WriteParquetError(format!("parquet writer task panicked: {e}")))??;
         info!("Successfully wrote parquet file: {}", &file_name);
         Ok(())
     }

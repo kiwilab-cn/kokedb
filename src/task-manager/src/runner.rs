@@ -119,7 +119,11 @@ impl TaskExecutor for DataSyncExecutor {
                 Ok(_) => ("success", None),
                 Err(e) => ("failed", Some(e.to_string())),
             };
-            let _ = m.complete_cache_job(id, status, err).await;
+            // Don't swallow this: a failed completion leaves the job row stuck
+            // in 'running', which reads as a live sync in SHOW CACHE JOBS.
+            if let Err(e) = m.complete_cache_job(id, status, err).await {
+                error!("Failed to mark cache_job {id} as {status}: {e}");
+            }
         }
         result
     }

@@ -162,10 +162,21 @@ pub struct TableMetadata {
 pub struct PostgreSQLMetaCatalogProviderList {
     local_pool: PgPool,
     catalog_cache: DashMap<String, Arc<dyn CatalogProvider>>,
+    /// TTL cache for the registered catalog names, refreshed from the meta
+    /// store at most once per TTL and invalidated on local create/drop. Name
+    /// resolution consults this on every query, so it must not hit the DB
+    /// each time.
+    catalog_names_cache: std::sync::RwLock<Option<(std::time::Instant, Arc<Vec<String>>)>>,
 }
 
 // TODO: maybe support sqlite/tikv, so read/write data must change to interface.
 impl PostgreSQLMetaCatalogProviderList {
+    /// Opens a fresh meta connection pool. NOTE: this is for process startup
+    /// and background tasks only — query-path code must reuse the shared
+    /// instance (`SharedServices::meta()` / `from_pool`) instead of paying a
+    /// TCP + auth handshake per call. (A process-wide `static` pool was tried
+    /// and reverted: it breaks multi-runtime test binaries, because a pool
+    /// outliving the tokio runtime that created it loses its connections.)
     pub async fn new() -> Result<Self> {
         let local_dsn = std::env::var("PG_META_DSN")
             .unwrap_or("postgresql://postgres:123456@127.0.0.1:25432/kokedb".to_string());
@@ -178,10 +189,7 @@ impl PostgreSQLMetaCatalogProviderList {
             .connect(&local_dsn)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(Self {
-            local_pool,
-            catalog_cache: DashMap::new(),
-        })
+        Ok(Self::from_pool(local_pool))
     }
 
     /// Wraps an existing meta connection pool without opening a new one. Used on
@@ -191,6 +199,15 @@ impl PostgreSQLMetaCatalogProviderList {
         Self {
             local_pool,
             catalog_cache: DashMap::new(),
+            catalog_names_cache: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Drops the cached catalog-name list so the next lookup reloads it. Called
+    /// after any local create/drop; cross-node changes surface after the TTL.
+    fn invalidate_catalog_names(&self) {
+        if let Ok(mut guard) = self.catalog_names_cache.write() {
+            *guard = None;
         }
     }
 
@@ -1644,6 +1661,8 @@ impl PostgreSQLMetaCatalogProviderList {
         })
         .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
+        // Make the new catalog resolvable immediately on this node.
+        self.invalidate_catalog_names();
         Ok(ret.rows_affected().is_eq(1))
     }
 
@@ -1656,6 +1675,7 @@ impl PostgreSQLMetaCatalogProviderList {
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
         self.catalog_cache.remove(name);
+        self.invalidate_catalog_names();
         Ok(ret.rows_affected() > 0)
     }
 
@@ -1910,18 +1930,43 @@ impl CatalogProviderList for PostgreSQLMetaCatalogProviderList {
     }
 
     fn catalog_names(&self) -> Vec<String> {
-        tokio::task::block_in_place(|| {
+        // Name resolution calls this on every query; serve from the TTL cache
+        // and only fall through to the meta store on expiry (or after a local
+        // create/drop invalidated it).
+        let ttl =
+            std::time::Duration::from_secs(get_env_as("KOKEDB_CATALOG_NAMES_TTL_SECS", 5u64));
+        if let Ok(guard) = self.catalog_names_cache.read() {
+            if let Some((at, names)) = guard.as_ref() {
+                if at.elapsed() < ttl {
+                    return names.as_ref().clone();
+                }
+            }
+        }
+        let names: Vec<String> = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 if let Ok(catalogs) = self.load_catalog_info().await {
-                    catalogs.into_iter().map(|c| c.name.clone()).collect()
+                    catalogs.into_iter().map(|c| c.name).collect()
                 } else {
                     Vec::new()
                 }
             })
-        })
+        });
+        if let Ok(mut guard) = self.catalog_names_cache.write() {
+            *guard = Some((std::time::Instant::now(), Arc::new(names.clone())));
+        }
+        names
     }
 
     fn catalog(&self, name: &str) -> Option<Arc<dyn CatalogProvider>> {
+        // Serve the cached provider when present. Providers are safe to reuse
+        // across queries: `table()` re-validates the snapshot path against the
+        // meta store on every call, so a cached provider never pins stale data.
+        // Building one is expensive (meta lookup + a fresh source connection
+        // pool), so this read is what keeps resolution off the network.
+        // Invalidation: sync completion and DROP CATALOG remove entries.
+        if let Some(provider) = self.catalog_cache.get(name) {
+            return Some(Arc::clone(provider.value()));
+        }
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 if let Ok(catalog_info) = self.get_catalog(name).await {

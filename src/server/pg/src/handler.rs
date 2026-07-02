@@ -8,12 +8,17 @@
 //! collecting any rows) and reading the output schema.
 
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
-use futures::{stream, Sink, TryStreamExt};
+use datafusion::execution::SendableRecordBatchStream;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::prelude::SessionContext;
+use futures::{stream, Sink, StreamExt};
+use kokedb_cache::result_cache::ResultCache;
+use kokedb_cache::singleflight::{Claim, OwnerGuard, Singleflight};
 use kokedb_common::hash::get_plan_hash;
 use kokedb_common::spec::Plan;
 use kokedb_query::binder::{parser, query};
@@ -36,12 +41,34 @@ use crate::encode::{encode_batch, fields_for_schema, fields_with_format};
 /// Catalog allow-list for a session (`None` = unrestricted).
 type Acl = Option<Arc<std::collections::HashSet<String>>>;
 
-/// Bundles the handlers for one server. Cloned per connection (cheap: it just
-/// holds shared service handles).
-#[derive(Clone)]
+/// How long a singleflight waiter sleeps before re-checking the cache, as a
+/// safety net against a lost wakeup (mirrors the MySQL server).
+const SINGLEFLIGHT_WAIT_SECS: u64 = 10;
+
+/// Bundles the handlers for one server.
+///
+/// IMPORTANT: `clone()` is a *per-connection* operation, not a shallow copy —
+/// it shares the process-wide services (meta, caches, singleflight, startup
+/// handler) but gives the connection a fresh query handler with its own lazy
+/// [`SessionContext`], so per-session state (catalog ACL, default catalog)
+/// never leaks between connections. Hand every `process_socket` its own clone.
 pub struct KokedbHandlers {
     handler: Arc<KokedbQueryHandler>,
     startup: Arc<KokedbStartupHandler>,
+}
+
+impl Clone for KokedbHandlers {
+    fn clone(&self) -> Self {
+        Self {
+            handler: Arc::new(KokedbQueryHandler {
+                shared: self.handler.shared.clone(),
+                parser: self.handler.parser.clone(),
+                sf: self.handler.sf.clone(),
+                session: Mutex::new(None),
+            }),
+            startup: self.startup.clone(),
+        }
+    }
 }
 
 impl KokedbHandlers {
@@ -50,6 +77,8 @@ impl KokedbHandlers {
             handler: Arc::new(KokedbQueryHandler {
                 shared: shared.clone(),
                 parser: Arc::new(NoopQueryParser::new()),
+                sf: Singleflight::new(),
+                session: Mutex::new(None),
             }),
             startup: Arc::new(KokedbStartupHandler::new(shared, auth_enabled)),
         }
@@ -73,6 +102,14 @@ impl PgWireServerHandlers for KokedbHandlers {
 pub struct KokedbQueryHandler {
     shared: SharedServices,
     parser: Arc<NoopQueryParser>,
+    /// Process-wide cache-miss de-duplication (shared across connections via
+    /// `KokedbHandlers::clone`).
+    sf: Arc<Singleflight>,
+    /// This connection's session context, built lazily on the first statement
+    /// and reused for the rest of the connection. Building one is expensive
+    /// (`SessionStateBuilder::with_default_features` registers every UDF), so
+    /// it must not happen per query.
+    session: Mutex<Option<Arc<SessionContext>>>,
 }
 
 fn pg_err(msg: impl std::fmt::Display) -> PgWireError {
@@ -225,84 +262,210 @@ fn null_literal_for_type(ty: &Type) -> String {
 }
 
 impl KokedbQueryHandler {
-    /// Parses + hashes the SQL, going through the shared plan cache.
-    fn prepare(&self, sql: &str) -> PgWireResult<(Plan, u128)> {
+    /// Parses + hashes the SQL, going through the shared plan cache. The Arc is
+    /// handed out as-is: cloning the inner `Plan` would deep-copy the whole
+    /// expression tree on every hit.
+    fn prepare(&self, sql: &str) -> PgWireResult<Arc<(Plan, u128)>> {
         let plan_cache = self.shared.plan_cache();
         if let Some(hit) = plan_cache.get(sql) {
-            return Ok((hit.0.clone(), hit.1));
+            return Ok(hit);
         }
         let plan = parser(sql).map_err(pg_err)?;
         let key = get_plan_hash(&plan).map_err(pg_err)?;
-        plan_cache.insert(sql, Arc::new((plan.clone(), key)));
-        Ok((plan, key))
+        let entry = Arc::new((plan, key));
+        plan_cache.insert(sql, entry.clone());
+        Ok(entry)
     }
 
-    /// Runs one statement through the kokedb query path and returns the result
-    /// batches plus the output schema. `acl` scopes catalog visibility.
-    async fn execute(&self, sql: &str, acl: &Acl) -> PgWireResult<(Vec<RecordBatch>, SchemaRef)> {
-        let max_staleness = parse_staleness_hint(sql).filter(|&s| s > 0);
-        let (plan, cache_key) = self.prepare(sql)?;
+    /// This connection's session context, built on first use and reused across
+    /// statements. The ACL is (cheaply) re-applied per statement because auth
+    /// completes after the handler is constructed.
+    fn session_ctx(&self, acl: &Acl) -> PgWireResult<Arc<SessionContext>> {
+        let ctx = {
+            let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(ctx) => ctx.clone(),
+                None => {
+                    let ctx = Arc::new(create_session_context(&self.shared).map_err(pg_err)?);
+                    *guard = Some(ctx.clone());
+                    ctx
+                }
+            }
+        };
+        set_session_acl(&ctx, acl.clone()).map_err(pg_err)?;
+        Ok(ctx)
+    }
 
-        let cacheable = matches!(plan, Plan::Query(_)) && max_staleness.is_none();
+    /// Runs one statement through the kokedb query path and returns its result
+    /// stream. Query results flow through the shared result cache with
+    /// singleflight de-duplication, mirroring the MySQL server:
+    ///
+    /// * cache hit  -> decoded stream straight from the cache;
+    /// * cache miss -> the first caller ("owner") executes and tees batches
+    ///   into the cache as they stream out; concurrent callers wait for the
+    ///   owner instead of re-executing against the source;
+    /// * restricted (ACL-scoped) sessions bypass the shared cache entirely —
+    ///   a hit would skip catalog-ACL enforcement, which happens at planning.
+    async fn execute(&self, sql: &str, acl: &Acl) -> PgWireResult<SendableRecordBatchStream> {
+        let max_staleness = parse_staleness_hint(sql).filter(|&s| s > 0);
+        let entry = self.prepare(sql)?;
+        let (plan, cache_key) = (&entry.0, entry.1);
+
+        let cacheable =
+            matches!(plan, Plan::Query(_)) && max_staleness.is_none() && acl.is_none();
         let cache = self.shared.result_cache();
 
-        // Restricted sessions must not read from the shared, user-agnostic
-        // result cache (it would bypass the catalog ACL); they always plan,
-        // which enforces the ACL at resolution. Writes stay safe: a denied
-        // catalog errors before producing any cacheable rows.
-        if cacheable && acl.is_none() && cache.contains(cache_key).await {
-            if let Ok(stream) = cache.get(cache_key).await {
-                let schema = stream.schema();
-                let batches = stream.try_collect::<Vec<_>>().await.map_err(pg_err)?;
-                return Ok((batches, schema));
+        if !cacheable {
+            let ctx = self.session_ctx(acl)?;
+            let stream = query(ctx, plan, cache_key, max_staleness)
+                .await
+                .map_err(pg_err)?;
+            return Ok(stream);
+        }
+
+        loop {
+            if let Some(stream) = cache.try_get(cache_key).await {
+                return Ok(stream);
+            }
+            match self.sf.claim(cache_key) {
+                Claim::Owner(guard) => {
+                    let ctx = self.session_ctx(acl)?;
+                    let stream = query(ctx, plan, cache_key, max_staleness)
+                        .await
+                        .map_err(pg_err)?;
+                    return Ok(tee_into_cache(stream, cache, cache_key, guard));
+                }
+                Claim::Waiter(notify) => {
+                    // Register the wakeup before re-checking the cache to avoid
+                    // a lost notification, then await it (bounded by a safety
+                    // timeout); the loop re-checks the cache either way.
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if let Some(stream) = cache.try_get(cache_key).await {
+                        return Ok(stream);
+                    }
+                    tokio::select! {
+                        _ = notified => {}
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(
+                            SINGLEFLIGHT_WAIT_SECS,
+                        )) => {}
+                    }
+                }
             }
         }
-
-        let ctx = Arc::new(create_session_context(&self.shared).map_err(pg_err)?);
-        set_session_acl(&ctx, acl.clone()).map_err(pg_err)?;
-        let stream = query(ctx, &plan, cache_key, max_staleness)
-            .await
-            .map_err(pg_err)?;
-        let schema = stream.schema();
-        let batches = stream.try_collect::<Vec<_>>().await.map_err(pg_err)?;
-
-        if cacheable && !batches.is_empty() {
-            let _ = cache.insert(cache_key, &batches).await;
-        }
-        Ok((batches, schema))
     }
 
     /// Plans the statement and returns its output schema without executing it.
     /// Non-query statements have no row description, so an empty schema is
     /// returned for them.
     async fn output_schema(&self, sql: &str, acl: &Acl) -> PgWireResult<SchemaRef> {
-        let (plan, cache_key) = self.prepare(sql)?;
-        if !matches!(plan, Plan::Query(_)) {
+        let entry = self.prepare(sql)?;
+        if !matches!(entry.0, Plan::Query(_)) {
             return Ok(Arc::new(datafusion::arrow::datatypes::Schema::empty()));
         }
-        let ctx = Arc::new(create_session_context(&self.shared).map_err(pg_err)?);
-        set_session_acl(&ctx, acl.clone()).map_err(pg_err)?;
-        let stream = query(ctx, &plan, cache_key, None).await.map_err(pg_err)?;
+        let ctx = self.session_ctx(acl)?;
+        let stream = query(ctx, &entry.0, entry.1, None).await.map_err(pg_err)?;
         Ok(stream.schema())
     }
 
-    /// Builds a `Response::Query` or `Response::Execution` from result batches.
-    fn respond(
-        batches: Vec<RecordBatch>,
-        schema: SchemaRef,
+    /// Runs one statement and shapes the wire response. Rows are encoded
+    /// lazily, batch by batch, as the client drains the response — the result
+    /// set is never materialized in full.
+    async fn execute_to_response(
+        &self,
+        sql: &str,
+        acl: &Acl,
         format: &Format,
     ) -> PgWireResult<Response> {
+        let mut stream = self.execute(sql, acl).await?;
+        let schema = stream.schema();
+
+        // A schemaless result is a command (e.g. CREATE CATALOG): drive it to
+        // completion here so its side effects happen before the tag is sent
+        // (and before any following statement in a multi-statement query).
         if schema.fields().is_empty() {
+            while let Some(item) = stream.next().await {
+                item.map_err(pg_err)?;
+            }
             return Ok(Response::Execution(Tag::new("OK")));
         }
+
         let fields = fields_with_format(&schema, format);
-        let mut rows = Vec::new();
-        for batch in &batches {
-            rows.extend(encode_batch(batch, &fields)?);
-        }
-        let row_stream = stream::iter(rows.into_iter().map(Ok));
+        let encode_fields = fields.clone();
+        let row_stream = stream.flat_map(move |batch_res| {
+            let rows: Vec<PgWireResult<pgwire::messages::data::DataRow>> = match batch_res {
+                Ok(batch) => match encode_batch(&batch, &encode_fields) {
+                    Ok(rows) => rows.into_iter().map(Ok).collect(),
+                    Err(e) => vec![Err(e)],
+                },
+                Err(e) => vec![Err(pg_err(e))],
+            };
+            stream::iter(rows)
+        });
         Ok(Response::Query(QueryResponse::new(fields, row_stream)))
     }
+}
+
+/// Wraps a live result stream so that, on successful completion, the collected
+/// batches are inserted into the result cache and the singleflight owner guard
+/// is released. Collecting is cheap (`RecordBatch` clones are shallow — the
+/// column buffers are shared). If the client disconnects mid-stream or the
+/// query errors, the guard is dropped without caching, waking waiters so one
+/// of them can take over.
+fn tee_into_cache(
+    stream: SendableRecordBatchStream,
+    cache: ResultCache,
+    key: u128,
+    guard: OwnerGuard,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let teed = async_stream::try_stream! {
+        let mut inner = stream;
+        let mut collected: Vec<RecordBatch> = Vec::new();
+        while let Some(item) = inner.next().await {
+            let batch = item?;
+            collected.push(batch.clone());
+            yield batch;
+        }
+        if !collected.is_empty() {
+            if let Err(e) = cache.insert(key, &collected).await {
+                log::warn!("Failed to cache result for key {key}: {e}");
+            }
+        }
+        drop(guard);
+    };
+    Box::pin(RecordBatchStreamAdapter::new(schema, teed))
+}
+
+/// Splits a simple-query payload into individual statements at top-level `;`,
+/// honouring single-quoted strings and double-quoted identifiers. Empty
+/// fragments (e.g. a trailing `;`) are dropped.
+fn split_statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_squote = false;
+    let mut in_dquote = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b as char {
+            '\'' if !in_dquote => in_squote = !in_squote,
+            '"' if !in_squote => in_dquote = !in_dquote,
+            ';' if !in_squote && !in_dquote => {
+                let stmt = sql[start..i].trim();
+                if !stmt.is_empty() {
+                    out.push(stmt);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
 }
 
 #[async_trait]
@@ -315,8 +478,21 @@ impl SimpleQueryHandler for KokedbQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let acl = acl_from_client(client);
-        let (batches, schema) = self.execute(query, &acl).await?;
-        Ok(vec![Self::respond(batches, schema, &Format::UnifiedText)?])
+        // The simple protocol allows several `;`-separated statements in one
+        // message, each answered with its own response; an empty payload gets
+        // the dedicated EmptyQueryResponse.
+        let statements = split_statements(query);
+        if statements.is_empty() {
+            return Ok(vec![Response::EmptyQuery]);
+        }
+        let mut responses = Vec::with_capacity(statements.len());
+        for stmt in statements {
+            responses.push(
+                self.execute_to_response(stmt, &acl, &Format::UnifiedText)
+                    .await?,
+            );
+        }
+        Ok(responses)
     }
 }
 
@@ -345,8 +521,8 @@ impl ExtendedQueryHandler for KokedbQueryHandler {
         let sql = substitute_placeholders(&portal.statement.statement, |idx| {
             param_literal(portal, idx)
         })?;
-        let (batches, schema) = self.execute(&sql, &acl).await?;
-        Self::respond(batches, schema, &portal.result_column_format)
+        self.execute_to_response(&sql, &acl, &portal.result_column_format)
+            .await
     }
 
     async fn do_describe_statement<C>(
@@ -414,6 +590,21 @@ impl ExtendedQueryHandler for KokedbQueryHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_statements_at_top_level_semicolons() {
+        assert_eq!(split_statements("SELECT 1; SELECT 2"), vec!["SELECT 1", "SELECT 2"]);
+        // Trailing semicolon leaves no empty fragment.
+        assert_eq!(split_statements("SELECT 1;"), vec!["SELECT 1"]);
+        // Semicolons inside string literals / quoted identifiers don't split.
+        assert_eq!(
+            split_statements("SELECT 'a;b'; SELECT \"c;d\""),
+            vec!["SELECT 'a;b'", "SELECT \"c;d\""]
+        );
+        // Empty / whitespace-only payloads yield no statements.
+        assert!(split_statements("   ;  ; ").is_empty());
+        assert!(split_statements("").is_empty());
+    }
 
     #[test]
     fn substitutes_numbered_placeholders() {
