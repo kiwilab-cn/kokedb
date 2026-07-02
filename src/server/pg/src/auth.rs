@@ -28,13 +28,17 @@ pub const META_ALLOWED_CATALOGS: &str = "kokedb_allowed_catalogs";
 
 pub struct KokedbStartupHandler {
     shared: SharedServices,
-    /// When false, authentication is disabled (open access).
-    enabled: bool,
 }
 
 impl KokedbStartupHandler {
-    pub fn new(shared: SharedServices, enabled: bool) -> Self {
-        Self { shared, enabled }
+    pub fn new(shared: SharedServices) -> Self {
+        Self { shared }
+    }
+
+    /// Authentication is enforced whenever any account exists — checked per
+    /// connection, so `CREATE USER` takes effect without a restart.
+    async fn auth_enabled(&self) -> bool {
+        self.shared.meta().count_app_users().await.unwrap_or(0) > 0
     }
 }
 
@@ -58,7 +62,7 @@ impl StartupHandler for KokedbStartupHandler {
             PgWireFrontendMessage::Startup(ref startup) => {
                 protocol_negotiation(client, startup).await?;
                 save_startup_parameters_to_metadata(client, startup);
-                if self.enabled {
+                if self.auth_enabled().await {
                     client.set_state(PgWireConnectionState::AuthenticationInProgress);
                     client
                         .send(PgWireBackendMessage::Authentication(

@@ -9,6 +9,9 @@ kokedb-query.workspace = true
 kokedb-cache.workspace = true
 
 pgwire.workspace = true
+tokio-rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true

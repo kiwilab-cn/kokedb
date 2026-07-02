@@ -167,6 +167,10 @@ pub struct PostgreSQLMetaCatalogProviderList {
     /// resolution consults this on every query, so it must not hit the DB
     /// each time.
     catalog_names_cache: std::sync::RwLock<Option<(std::time::Instant, Arc<Vec<String>>)>>,
+    /// Short-TTL cache of per-table `last_sync_at`, keyed by
+    /// `catalog.schema.table` (see `get_table_last_sync_at` for why a stale
+    /// read is safe).
+    sync_at_cache: DashMap<String, (std::time::Instant, Option<chrono::DateTime<chrono::Utc>>)>,
 }
 
 // TODO: maybe support sqlite/tikv, so read/write data must change to interface.
@@ -200,6 +204,7 @@ impl PostgreSQLMetaCatalogProviderList {
             local_pool,
             catalog_cache: DashMap::new(),
             catalog_names_cache: std::sync::RwLock::new(None),
+            sync_at_cache: DashMap::new(),
         }
     }
 
@@ -610,6 +615,56 @@ impl PostgreSQLMetaCatalogProviderList {
         Ok(())
     }
 
+    /// All application accounts: `(username, is_superuser, allowed_catalogs)`,
+    /// ordered by name. The password digest is deliberately not returned.
+    pub async fn list_app_users(&self) -> Result<Vec<(String, bool, String)>> {
+        let rows = sqlx::query(
+            "SELECT username, is_superuser, allowed_catalogs \
+             FROM system.app_user ORDER BY username",
+        )
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get("username"),
+                    r.get("is_superuser"),
+                    r.try_get("allowed_catalogs").unwrap_or_default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Removes an application account. Returns whether a row was deleted.
+    pub async fn delete_app_user(&self, username: &str) -> Result<bool> {
+        let ret = sqlx::query("DELETE FROM system.app_user WHERE username = $1")
+            .bind(username)
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(ret.rows_affected() > 0)
+    }
+
+    /// Replaces a user's catalog allow-list. Returns whether the user exists.
+    pub async fn set_app_user_catalogs(
+        &self,
+        username: &str,
+        allowed_catalogs: &str,
+    ) -> Result<bool> {
+        let ret = sqlx::query(
+            "UPDATE system.app_user SET allowed_catalogs = $2, \
+             updated_at = CURRENT_TIMESTAMP WHERE username = $1",
+        )
+        .bind(username)
+        .bind(allowed_catalogs)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(ret.rows_affected() > 0)
+    }
+
     pub async fn get_catalog(&self, name: &str) -> Result<CatalogInfo> {
         let sql = "SELECT name, dsn FROM system.catalog where name = $1;";
 
@@ -879,6 +934,25 @@ impl PostgreSQLMetaCatalogProviderList {
         schema: &str,
         table: &str,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        // Short-TTL cache: the freshness guard consults this per table per
+        // hinted query. Serving a value up to TTL old is *conservative*:
+        // `last_sync_at` only moves forward, so a stale read can only
+        // overestimate staleness and route live when the cache would have
+        // sufficed — it can never serve data staler than the contract.
+        let ttl = std::time::Duration::from_millis(get_env_as(
+            "KOKEDB_TABLE_META_TTL_MS",
+            1000u64,
+        ));
+        let key = format!("{catalog}.{schema}.{table}");
+        if !ttl.is_zero() {
+            if let Some(hit) = self.sync_at_cache.get(&key) {
+                let (at, value) = hit.value();
+                if at.elapsed() < ttl {
+                    return Ok(*value);
+                }
+            }
+        }
+
         let sql = "SELECT last_sync_at FROM system.table_sync_state \
             WHERE catalog = $1 AND schema_name = $2 AND table_name = $3;";
         let row = sqlx::query(sql)
@@ -888,7 +962,12 @@ impl PostgreSQLMetaCatalogProviderList {
             .fetch_optional(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        Ok(row.and_then(|r| r.try_get("last_sync_at").ok()))
+        let value = row.and_then(|r| r.try_get("last_sync_at").ok());
+        if !ttl.is_zero() {
+            self.sync_at_cache
+                .insert(key, (std::time::Instant::now(), value));
+        }
+        Ok(value)
     }
 
     pub async fn get_table_sync_state(
@@ -1869,18 +1948,33 @@ impl PostgreSQLMetaCatalogProviderList {
         table_name: &str,
         stat_date: NaiveDate,
     ) -> Result<bool> {
+        self.save_table_daily_stats_n(catalog, schema_name, table_name, stat_date, 1)
+            .await
+    }
+
+    /// Adds `delta` queries to a table's daily counter in one UPSERT. Callers
+    /// buffer counts locally and flush periodically instead of writing per query.
+    pub async fn save_table_daily_stats_n(
+        &self,
+        catalog: &str,
+        schema_name: &str,
+        table_name: &str,
+        stat_date: NaiveDate,
+        delta: i64,
+    ) -> Result<bool> {
         let insert_sql =
             "INSERT INTO system.query_table_daily_stats (catalog, schema_name, table_name, stat_date, query_count)
-            VALUES ($1, $2, $3, $4, 1)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (catalog, schema_name, table_name, stat_date)
             DO UPDATE SET
-                query_count = query_table_daily_stats.query_count + 1;";
+                query_count = query_table_daily_stats.query_count + EXCLUDED.query_count;";
 
         let ret = sqlx::query(insert_sql)
             .bind(catalog)
             .bind(schema_name)
             .bind(table_name)
             .bind(stat_date)
+            .bind(delta)
             .execute(&self.local_pool)
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;

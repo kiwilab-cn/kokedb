@@ -52,11 +52,16 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       # Authentication & multi-tenancy: accounts live in `system.app_user` and
       # apply to BOTH the MySQL and PostgreSQL front-ends. Setting both vars below
-      # seeds a superuser on startup; once any user exists, auth is enforced.
-      # Leave them empty for open access (no auth). Scope other users to specific
-      # catalogs via the `allowed_catalogs` column.
+      # seeds a superuser on startup; once any user exists, auth is enforced
+      # (checked live — CREATE USER / DROP USER / GRANT CATALOG / REVOKE CATALOG /
+      # SHOW USERS over SQL take effect without a restart). Leave them empty for
+      # open access (no auth).
       KOKEDB_ADMIN_USER: ${KOKEDB_ADMIN_USER:-}
       KOKEDB_ADMIN_PASSWORD: ${KOKEDB_ADMIN_PASSWORD:-}
+      # PostgreSQL wire TLS (opt-in): point these at PEM files (mounted into the
+      # container) to serve `sslmode=require` clients. Empty = plaintext.
+      KOKEDB_PG_TLS_CERT: ${KOKEDB_PG_TLS_CERT:-}
+      KOKEDB_PG_TLS_KEY: ${KOKEDB_PG_TLS_KEY:-}
       # Prometheus metrics endpoint (in-container address).
       KOKEDB_METRICS_ADDR: 0.0.0.0:9090
     ports:

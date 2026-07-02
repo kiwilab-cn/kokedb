@@ -20,6 +20,16 @@ pub struct CachePolicyDisplay {
     pub cache_policy: String,
 }
 
+/// One row of `SHOW USERS` output. The password digest is deliberately not
+/// exposed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserDisplay {
+    pub username: String,
+    pub superuser: bool,
+    /// Comma-separated allow-list; `*` for unrestricted.
+    pub allowed_catalogs: String,
+}
+
 /// One row of `REFRESH CACHE FROM TABLE` output: the resolved table, the queued
 /// sync task id, and the resulting status.
 #[derive(Debug, Clone, Serialize, Deserialize)]

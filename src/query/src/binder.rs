@@ -71,6 +71,13 @@ pub async fn save_sql_history(
     plan: &Plan,
     cost: u64,
 ) -> Result<bool, QueryError> {
+    // Only queries are recorded: history exists to power proactive re-caching
+    // of query results, which never applies to commands — and command text can
+    // carry secrets (`CREATE USER ... password=...`, CREATE CATALOG DSNs) that
+    // must not be persisted into system.sql_stats.
+    if !matches!(plan, Plan::Query(_)) {
+        return Ok(false);
+    }
     let key = get_plan_hash(plan)?;
 
     let ret = meta.save_sql_stats(sql, key, cost).await.map_err(|x| {

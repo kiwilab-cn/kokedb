@@ -25,6 +25,7 @@ datafusion-physical-expr.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 dashmap.workspace = true
+lru.workspace = true
 tokio-cron-scheduler.workspace = true
 thiserror.workspace = true
 

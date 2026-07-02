@@ -212,6 +212,13 @@ impl TaskQueue {
         self.notify.notify_one();
     }
 
+    /// Puts a popped-but-deferred task back (fairness skip). Bypasses the
+    /// queue-full check: the task already held a queue slot.
+    async fn repush(&self, tw: TaskWrapper) {
+        self.heap.lock().await.push(tw);
+        self.notify.notify_one();
+    }
+
     async fn pop(&self) -> Option<TaskWrapper> {
         self.heap.lock().await.pop()
     }
@@ -287,6 +294,12 @@ impl TaskManager {
         let queue = self.queue.clone();
         let is_shutting_down = self.is_shutting_down.clone();
 
+        // Per-catalog fairness: one busy catalog must not occupy every global
+        // slot and starve the others. Track in-flight tasks per catalog and
+        // defer tasks whose catalog is at its share.
+        let per_catalog_cap = (max_concurrent / 4).max(1);
+        let catalog_active: Arc<DashMap<String, usize>> = Arc::new(DashMap::new());
+
         tokio::spawn(async move {
             loop {
                 if is_shutting_down.load(Ordering::Relaxed) {
@@ -300,9 +313,30 @@ impl TaskManager {
                     continue;
                 }
 
-                // Pop the highest-priority ready task, or wait until one arrives
-                // (or shutdown is signalled).
-                let task_wrapper = match queue.pop().await {
+                // Pop the highest-priority *runnable* task: skim over tasks
+                // whose catalog is at its fair share, re-enqueueing them (they
+                // keep their priority) once a runnable one is found.
+                let mut deferred = Vec::new();
+                let mut picked = None;
+                while let Some(tw) = queue.pop().await {
+                    let at_cap = catalog_active
+                        .get(&tw.config.catalog_name)
+                        .map(|c| *c >= per_catalog_cap)
+                        .unwrap_or(false);
+                    if at_cap {
+                        deferred.push(tw);
+                    } else {
+                        picked = Some(tw);
+                        break;
+                    }
+                }
+                for tw in deferred {
+                    queue.repush(tw).await;
+                }
+
+                // Nothing runnable: wait for new work (or shutdown), with a
+                // small sleep when tasks exist but every catalog is at cap.
+                let task_wrapper = match picked {
                     Some(tw) => tw,
                     None => {
                         tokio::select! {
@@ -312,6 +346,7 @@ impl TaskManager {
                                 break;
                             }
                             _ = queue.notify.notified() => continue,
+                            _ = tokio::time::sleep(tokio::time::Duration::from_millis(200)) => continue,
                         }
                     }
                 };
@@ -323,6 +358,10 @@ impl TaskManager {
                             }
 
                             active_tasks.fetch_add(1, Ordering::Relaxed);
+                            *catalog_active
+                                .entry(task_wrapper.config.catalog_name.clone())
+                                .or_insert(0) += 1;
+                            let catalog_active_clone = catalog_active.clone();
 
                             let task_id = task_wrapper.id.clone();
                             let task_config = task_wrapper.config.clone();
@@ -400,6 +439,14 @@ impl TaskManager {
 
                                 task_handles_clone.remove(&task_id);
                                 active_tasks_clone.fetch_sub(1, Ordering::Relaxed);
+                                // Release this catalog's fairness slot; drop
+                                // empty entries so the map doesn't grow with
+                                // every catalog ever synced.
+                                catalog_active_clone
+                                    .remove_if_mut(&task_config.catalog_name, |_, c| {
+                                        *c = c.saturating_sub(1);
+                                        *c == 0
+                                    });
                             });
 
                             task_handles.insert(task_wrapper.id, handle);

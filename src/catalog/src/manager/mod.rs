@@ -18,6 +18,7 @@ pub mod catalog;
 pub mod database;
 pub mod function;
 pub mod table;
+pub mod user;
 pub mod view;
 
 /// A manager for all catalogs registered with the session.

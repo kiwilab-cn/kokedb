@@ -98,7 +98,7 @@ async fn pg_wire_create_catalog_and_query() {
 
     let result_cache = ResultCache::local(64, 64).await.unwrap();
     let shared = init_shared_services(result_cache).await.unwrap();
-    let handlers = KokedbHandlers::new(shared, false);
+    let handlers = KokedbHandlers::new(shared);
 
     // Start the wire server on an ephemeral port.
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -197,7 +197,7 @@ async fn pg_wire_extended_prepared_query() {
 
     let result_cache = ResultCache::local(64, 64).await.unwrap();
     let shared = init_shared_services(result_cache).await.unwrap();
-    let handlers = KokedbHandlers::new(shared, false);
+    let handlers = KokedbHandlers::new(shared);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -333,7 +333,7 @@ async fn pg_wire_auth_and_multitenancy() {
     .unwrap();
 
     // Auth-enabled server.
-    let handlers = KokedbHandlers::new(shared, true);
+    let handlers = KokedbHandlers::new(shared);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -409,4 +409,157 @@ async fn pg_wire_auth_and_multitenancy() {
     clean_meta(&meta, cat_b).await;
     let _ = sqlx::query("DROP TABLE IF EXISTS mt_a").execute(&source).await;
     let _ = sqlx::query("DROP TABLE IF EXISTS mt_b").execute(&source).await;
+}
+
+/// Drives user management over SQL: CREATE USER / SHOW USERS / GRANT CATALOG /
+/// REVOKE CATALOG / DROP USER, and verifies authentication flips on *live*
+/// (dynamic auth: creating the first user enables auth for new connections,
+/// no restart) and that restricted users cannot manage users.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (source + meta)"]
+async fn pg_wire_user_management_sql() {
+    std::env::set_var("PG_META_DSN", meta_dsn());
+    std::env::set_var("KOKEDB_REEVALUATE_INTERVAL_MIN", "60");
+
+    let meta = PgPool::connect(&meta_dsn()).await.unwrap();
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('sql_admin','sql_tenant')")
+        .execute(&meta)
+        .await;
+
+    let result_cache = ResultCache::local(64, 64).await.unwrap();
+    let shared = init_shared_services(result_cache).await.unwrap();
+    let handlers = KokedbHandlers::new(shared);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let h = handlers.clone();
+            tokio::spawn(async move {
+                let _ = process_socket(sock, None, h).await;
+            });
+        }
+    });
+    let port = addr.port();
+
+    // No users yet -> open access; this bootstrap session is unrestricted and
+    // may manage users.
+    let (boot, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=postgres dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("open-access bootstrap connection");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    boot.simple_query(
+        "CREATE USER sql_admin WITH properties(password=\"adm1n\", superuser=\"true\")",
+    )
+    .await
+    .expect("CREATE USER superuser");
+    boot.simple_query(
+        "CREATE USER sql_tenant WITH properties(password=\"t3nant\", catalogs=\"shop\")",
+    )
+    .await
+    .expect("CREATE USER tenant");
+
+    // Duplicate create must fail.
+    assert!(
+        boot.simple_query("CREATE USER sql_admin WITH properties(password=\"x\")")
+            .await
+            .is_err(),
+        "duplicate CREATE USER should error"
+    );
+
+    // SHOW USERS lists both, without password digests.
+    let users = boot.simple_query("SHOW USERS LIKE 'sql_*'").await.expect("SHOW USERS");
+    let names: Vec<String> = users
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => {
+                r.try_get("username").ok().flatten().map(|s| s.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["sql_admin", "sql_tenant"], "SHOW USERS rows");
+
+    // GRANT/REVOKE mutate the allow-list.
+    boot.simple_query("GRANT CATALOG warehouse TO sql_tenant")
+        .await
+        .expect("GRANT CATALOG");
+    let users = boot.simple_query("SHOW USERS LIKE 'sql_tenant'").await.unwrap();
+    assert_eq!(
+        first_value(&users, "allowed_catalogs").as_deref(),
+        Some("shop,warehouse"),
+        "grant adds to allow-list"
+    );
+    boot.simple_query("REVOKE CATALOG shop FROM sql_tenant")
+        .await
+        .expect("REVOKE CATALOG");
+    let users = boot.simple_query("SHOW USERS LIKE 'sql_tenant'").await.unwrap();
+    assert_eq!(
+        first_value(&users, "allowed_catalogs").as_deref(),
+        Some("warehouse"),
+        "revoke removes from allow-list"
+    );
+
+    // Dynamic auth: users now exist, so a NEW connection must authenticate.
+    let unauthed = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=nobody dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await;
+    assert!(unauthed.is_err(), "auth must be live once users exist");
+
+    let (tenant, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=sql_tenant password=t3nant dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("tenant authenticates with CREATE USER password");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // A restricted user cannot manage users.
+    assert!(
+        tenant
+            .simple_query("CREATE USER sneaky WITH properties(password=\"x\")")
+            .await
+            .is_err(),
+        "restricted user must not manage users"
+    );
+    assert!(
+        tenant.simple_query("SHOW USERS").await.is_err(),
+        "restricted user must not list users"
+    );
+
+    // DROP USER via the (still-unrestricted) bootstrap session; IF EXISTS is
+    // idempotent.
+    boot.simple_query("DROP USER sql_tenant").await.expect("DROP USER");
+    boot.simple_query("DROP USER IF EXISTS sql_tenant")
+        .await
+        .expect("DROP USER IF EXISTS is idempotent");
+    assert!(
+        boot.simple_query("DROP USER sql_tenant").await.is_err(),
+        "dropping a missing user without IF EXISTS errors"
+    );
+    boot.simple_query("DROP USER sql_admin").await.expect("DROP USER admin");
+
+    // Password must never be persisted into SQL history.
+    let leaked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM system.sql_stats WHERE sql_text ILIKE '%CREATE USER%'",
+    )
+    .fetch_one(&meta)
+    .await
+    .unwrap_or(0);
+    assert_eq!(leaked, 0, "CREATE USER statements must not be stored in sql history");
+
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('sql_admin','sql_tenant')")
+        .execute(&meta)
+        .await;
 }

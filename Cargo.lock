@@ -3453,9 +3453,12 @@ dependencies = [
  "kokedb-query",
  "log",
  "pgwire",
+ "rustls-pemfile",
+ "rustls-pki-types",
  "sqlx",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls 0.26.2",
 ]
 
 [[package]]
@@ -3556,6 +3559,7 @@ dependencies = [
  "kokedb-sql-analyzer",
  "kokedb-task-manager",
  "log",
+ "lru",
  "serde_json",
  "sqlx",
  "thiserror 2.0.16",
@@ -3864,6 +3868,15 @@ name = "log"
 version = "0.4.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13dc2df351e3202783a1fe0d44375f7295ffb4049267b0f3018346dc122a1d94"
+
+[[package]]
+name = "lru"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "234cf4f4a04dc1f57e24b96cc0cd600cf2af460d4161ac5ecdd0af8e1f3b2a38"
+dependencies = [
+ "hashbrown 0.15.5",
+]
 
 [[package]]
 name = "lru-slab"

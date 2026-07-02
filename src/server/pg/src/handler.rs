@@ -72,7 +72,7 @@ impl Clone for KokedbHandlers {
 }
 
 impl KokedbHandlers {
-    pub fn new(shared: SharedServices, auth_enabled: bool) -> Self {
+    pub fn new(shared: SharedServices) -> Self {
         Self {
             handler: Arc::new(KokedbQueryHandler {
                 shared: shared.clone(),
@@ -80,7 +80,7 @@ impl KokedbHandlers {
                 sf: Singleflight::new(),
                 session: Mutex::new(None),
             }),
-            startup: Arc::new(KokedbStartupHandler::new(shared, auth_enabled)),
+            startup: Arc::new(KokedbStartupHandler::new(shared)),
         }
     }
 }
