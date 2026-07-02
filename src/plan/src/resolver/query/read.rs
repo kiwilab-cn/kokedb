@@ -71,9 +71,10 @@ impl PlanResolver<'_> {
             .extension::<CatalogManager>()?
             .get_table_or_view(&reference)
             .await?;
+        let table_name_for_policy = status.name.clone();
         let plan = match status.kind {
             TableKind::Table {
-                catalog: _,
+                catalog,
                 database,
                 columns,
                 comment: _,
@@ -174,13 +175,44 @@ impl PlanResolver<'_> {
 
                 let names = state.register_fields(table_provider.schema().fields());
                 let table_provider = RenameTableProvider::try_new(table_provider, names)?;
-                LogicalPlan::TableScan(TableScan::try_new(
+                let scan = LogicalPlan::TableScan(TableScan::try_new(
                     table_reference,
                     provider_as_source(Arc::new(table_provider)),
                     None,
                     vec![],
                     None,
-                )?)
+                )?);
+
+                // Row-level security: AND the session's policy predicate into
+                // the scan. This wraps the scan itself, so it applies to both
+                // cached-snapshot and live-source routing. A policy whose
+                // stored predicate failed to parse denies the table outright
+                // (fail-closed) — it must never be served unfiltered.
+                let schema_for_policy = database.first().map(String::as_str).unwrap_or("");
+                let policy = self
+                    .ctx
+                    .extension::<CatalogManager>()?
+                    .row_policy_expr(&catalog, schema_for_policy, &table_name_for_policy);
+                match policy {
+                    None => scan,
+                    Some(Some(filter_expr)) => {
+                        let schema = scan.schema().clone();
+                        let predicate = self
+                            .resolve_expression(filter_expr, &schema, state)
+                            .await?;
+                        LogicalPlan::Filter(datafusion::logical_expr::Filter::try_new(
+                            predicate,
+                            Arc::new(scan),
+                        )?)
+                    }
+                    Some(None) => {
+                        return Err(PlanError::AnalysisError(format!(
+                            "permission denied: row policy on {catalog}.{schema_for_policy}.\
+                             {table_name_for_policy} could not be applied (invalid predicate; \
+                             access is denied fail-closed)"
+                        )))
+                    }
+                }
             }
             TableKind::View { .. } => return Err(PlanError::todo("read view")),
             TableKind::TemporaryView { plan, .. } | TableKind::GlobalTemporaryView { plan, .. } => {

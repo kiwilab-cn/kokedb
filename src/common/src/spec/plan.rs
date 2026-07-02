@@ -575,6 +575,18 @@ pub enum CommandNode {
         scope: ObjectName,
         username: Identifier,
     },
+    /// Row-level security: attach a filter predicate (SQL text, validated at
+    /// analysis time) to `(username, table)` reads.
+    CreateRowPolicy {
+        table: ObjectName,
+        username: Identifier,
+        filter: String,
+    },
+    DropRowPolicy {
+        table: ObjectName,
+        username: Identifier,
+    },
+    ListRowPolicies,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

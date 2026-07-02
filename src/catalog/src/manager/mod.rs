@@ -95,15 +95,36 @@ impl CatalogManager {
         })
     }
 
-    /// Scopes this session to a set of grant scopes (set after
-    /// authentication). Each scope is `catalog`, `catalog.schema`, or
-    /// `catalog.schema.table` — see [`crate::acl::CatalogAcl`]. `None` leaves
-    /// the session unrestricted (superuser / auth disabled).
-    pub fn set_acl(&self, scopes: Option<Arc<std::collections::HashSet<String>>>) {
-        let acl = scopes.map(|s| Arc::new(crate::acl::CatalogAcl::from_scopes(s.iter())));
+    /// Scopes this session to a set of grant scopes and row-level security
+    /// policies (set after authentication). Each scope is `catalog`,
+    /// `catalog.schema`, or `catalog.schema.table` — see
+    /// [`crate::acl::CatalogAcl`]. `None` scopes leave the session
+    /// unrestricted (superuser / auth disabled); row policies then never apply.
+    pub fn set_acl(
+        &self,
+        scopes: Option<Arc<std::collections::HashSet<String>>>,
+        policies: Vec<crate::acl::RowPolicy>,
+    ) {
+        let acl = scopes.map(|s| {
+            Arc::new(crate::acl::CatalogAcl::from_scopes(s.iter()).with_policies(policies))
+        });
         if let Ok(mut state) = self.state.lock() {
             state.acl = acl;
         }
+    }
+
+    /// The session's row filter for a table, if any. Outer `None` = no policy;
+    /// `Some(None)` = policy exists but its predicate failed to parse — the
+    /// read must be denied (fail-closed).
+    pub fn row_policy_expr(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Option<Option<kokedb_common::spec::Expr>> {
+        let state = self.state.lock().ok()?;
+        let acl = state.acl.as_ref()?;
+        acl.row_policy(catalog, schema, table).cloned()
     }
 
     /// Whether this session has an authorization scope applied. Restricted

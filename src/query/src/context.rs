@@ -240,17 +240,47 @@ pub fn use_database(ctx: &SessionContext, name: &str) -> Result<(), String> {
     manager.set_default_catalog(name).map_err(|e| e.to_string())
 }
 
-/// Scopes a connection's session to a catalog allow-list (after authentication).
-/// `None` leaves it unrestricted (superuser or authentication disabled).
+/// Scopes a connection's session to grant scopes and row-level security
+/// policies (after authentication). `None` scopes leave it unrestricted
+/// (superuser or authentication disabled).
 pub fn set_session_acl(
     ctx: &SessionContext,
     allowed_catalogs: Option<Arc<std::collections::HashSet<String>>>,
+    policies: Vec<kokedb_catalog::acl::RowPolicy>,
 ) -> Result<(), String> {
     let manager = ctx
         .extension::<CatalogManager>()
         .map_err(|e| format!("catalog manager unavailable: {e}"))?;
-    manager.set_acl(allowed_catalogs);
+    manager.set_acl(allowed_catalogs, policies);
     Ok(())
+}
+
+/// Parses the raw row-policy rows loaded at authentication time —
+/// `(catalog, schema, table, filter_sql)` — into session policies. A filter
+/// that fails to parse yields `filter: None`, which the read path treats as
+/// "deny the table" (fail-closed): a corrupt policy must never widen access.
+pub fn parse_row_policies(
+    rows: Vec<(String, String, String, String)>,
+) -> Vec<kokedb_catalog::acl::RowPolicy> {
+    rows.into_iter()
+        .map(|(catalog, schema, table, filter_sql)| {
+            let filter = kokedb_sql_analyzer::parser::parse_expression(&filter_sql)
+                .ok()
+                .and_then(|ast| kokedb_sql_analyzer::expression::from_ast_expression(ast).ok());
+            if filter.is_none() {
+                log::error!(
+                    "Row policy on {catalog}.{schema}.{table} failed to parse; \
+                     the table will be DENIED for this session (fail-closed)"
+                );
+            }
+            kokedb_catalog::acl::RowPolicy {
+                catalog,
+                schema,
+                table,
+                filter,
+            }
+        })
+        .collect()
 }
 
 /// Whether the connection's session is scoped to a catalog allow-list. Used to

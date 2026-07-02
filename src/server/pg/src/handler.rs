@@ -35,11 +35,11 @@ use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
-use crate::auth::{acl_from_client, KokedbStartupHandler};
+use crate::auth::{AuthSlot, KokedbStartupHandler, SessionAuth};
 use crate::encode::{encode_batch, fields_for_schema, fields_with_format};
 
-/// Catalog allow-list for a session (`None` = unrestricted).
-type Acl = Option<Arc<std::collections::HashSet<String>>>;
+/// The session's authorization, read from the connection's auth slot.
+type Acl = SessionAuth;
 
 /// How long a singleflight waiter sleeps before re-checking the cache, as a
 /// safety net against a lost wakeup (mirrors the MySQL server).
@@ -48,10 +48,11 @@ const SINGLEFLIGHT_WAIT_SECS: u64 = 10;
 /// Bundles the handlers for one server.
 ///
 /// IMPORTANT: `clone()` is a *per-connection* operation, not a shallow copy —
-/// it shares the process-wide services (meta, caches, singleflight, startup
-/// handler) but gives the connection a fresh query handler with its own lazy
-/// [`SessionContext`], so per-session state (catalog ACL, default catalog)
-/// never leaks between connections. Hand every `process_socket` its own clone.
+/// it shares the process-wide services (meta, caches, singleflight) but gives
+/// the connection a fresh query handler + startup handler pair joined by a
+/// fresh [`AuthSlot`], so per-session state (identity, catalog ACL, row
+/// policies, default catalog) never leaks between connections. Hand every
+/// `process_socket` its own clone.
 pub struct KokedbHandlers {
     handler: Arc<KokedbQueryHandler>,
     startup: Arc<KokedbStartupHandler>,
@@ -59,28 +60,35 @@ pub struct KokedbHandlers {
 
 impl Clone for KokedbHandlers {
     fn clone(&self) -> Self {
+        let slot: AuthSlot = Arc::new(Mutex::new(None));
         Self {
             handler: Arc::new(KokedbQueryHandler {
                 shared: self.handler.shared.clone(),
                 parser: self.handler.parser.clone(),
                 sf: self.handler.sf.clone(),
                 session: Mutex::new(None),
+                auth: slot.clone(),
             }),
-            startup: self.startup.clone(),
+            startup: Arc::new(KokedbStartupHandler::new(
+                self.handler.shared.clone(),
+                slot,
+            )),
         }
     }
 }
 
 impl KokedbHandlers {
     pub fn new(shared: SharedServices) -> Self {
+        let slot: AuthSlot = Arc::new(Mutex::new(None));
         Self {
             handler: Arc::new(KokedbQueryHandler {
                 shared: shared.clone(),
                 parser: Arc::new(NoopQueryParser::new()),
                 sf: Singleflight::new(),
                 session: Mutex::new(None),
+                auth: slot.clone(),
             }),
-            startup: Arc::new(KokedbStartupHandler::new(shared)),
+            startup: Arc::new(KokedbStartupHandler::new(shared, slot)),
         }
     }
 }
@@ -110,6 +118,20 @@ pub struct KokedbQueryHandler {
     /// (`SessionStateBuilder::with_default_features` registers every UDF), so
     /// it must not happen per query.
     session: Mutex<Option<Arc<SessionContext>>>,
+    /// This connection's authorization, written once by the startup handler
+    /// on successful authentication. Empty = unrestricted (auth disabled).
+    auth: AuthSlot,
+}
+
+impl KokedbQueryHandler {
+    /// The session's authorization as published at authentication time.
+    fn current_acl(&self) -> Acl {
+        self.auth
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default()
+    }
 }
 
 fn pg_err(msg: impl std::fmt::Display) -> PgWireError {
@@ -292,7 +314,7 @@ impl KokedbQueryHandler {
                 }
             }
         };
-        set_session_acl(&ctx, acl.clone()).map_err(pg_err)?;
+        set_session_acl(&ctx, acl.scopes.clone(), acl.policies.clone()).map_err(pg_err)?;
         Ok(ctx)
     }
 
@@ -312,7 +334,7 @@ impl KokedbQueryHandler {
         let (plan, cache_key) = (&entry.0, entry.1);
 
         let cacheable =
-            matches!(plan, Plan::Query(_)) && max_staleness.is_none() && acl.is_none();
+            matches!(plan, Plan::Query(_)) && max_staleness.is_none() && acl.scopes.is_none();
         let cache = self.shared.result_cache();
 
         if !cacheable {
@@ -470,14 +492,14 @@ fn split_statements(sql: &str) -> Vec<&str> {
 
 #[async_trait]
 impl SimpleQueryHandler for KokedbQueryHandler {
-    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let acl = acl_from_client(client);
+        let acl = self.current_acl();
         // The simple protocol allows several `;`-separated statements in one
         // message, each answered with its own response; an empty payload gets
         // the dedicated EmptyQueryResponse.
@@ -507,7 +529,7 @@ impl ExtendedQueryHandler for KokedbQueryHandler {
 
     async fn do_query<C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
@@ -517,7 +539,7 @@ impl ExtendedQueryHandler for KokedbQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let acl = acl_from_client(client);
+        let acl = self.current_acl();
         let sql = substitute_placeholders(&portal.statement.statement, |idx| {
             param_literal(portal, idx)
         })?;
@@ -527,7 +549,7 @@ impl ExtendedQueryHandler for KokedbQueryHandler {
 
     async fn do_describe_statement<C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         target: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
@@ -557,7 +579,7 @@ impl ExtendedQueryHandler for KokedbQueryHandler {
                 param_types.get(idx).unwrap_or(&Type::UNKNOWN),
             ))
         })?;
-        let acl = acl_from_client(client);
+        let acl = self.current_acl();
         let schema = self.output_schema(&sql, &acl).await?;
         let fields = fields_for_schema(&schema);
         Ok(DescribeStatementResponse::new(
@@ -568,7 +590,7 @@ impl ExtendedQueryHandler for KokedbQueryHandler {
 
     async fn do_describe_portal<C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         portal: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
@@ -577,7 +599,7 @@ impl ExtendedQueryHandler for KokedbQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let acl = acl_from_client(client);
+        let acl = self.current_acl();
         let sql = substitute_placeholders(&portal.statement.statement, |idx| {
             param_literal(portal, idx)
         })?;

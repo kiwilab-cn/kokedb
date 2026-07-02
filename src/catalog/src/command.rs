@@ -11,7 +11,8 @@ use serde_arrow::to_arrow;
 
 use crate::display::{
     CacheJobDisplay, CachePolicyDisplay, CacheScheduleDisplay, CatalogDisplay, DiagnoseDisplay,
-    EmptyDisplay, RefreshCacheDisplay, SingleValueDisplay, TableMetadataDisplay, UserDisplay,
+    EmptyDisplay, RefreshCacheDisplay, RowPolicyDisplay, SingleValueDisplay,
+    TableMetadataDisplay, UserDisplay,
 };
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
@@ -95,6 +96,16 @@ pub enum CatalogCommand {
         scope: Vec<String>,
         username: String,
     },
+    CreateRowPolicy {
+        table: Vec<String>,
+        username: String,
+        filter: String,
+    },
+    DropRowPolicy {
+        table: Vec<String>,
+        username: String,
+    },
+    ListRowPolicies,
     CurrentDatabase,
     SetCurrentDatabase {
         database: Vec<String>,
@@ -216,6 +227,9 @@ impl CatalogCommand {
             CatalogCommand::ListUsers { .. } => "ListUsers",
             CatalogCommand::GrantScope { .. } => "GrantScope",
             CatalogCommand::RevokeScope { .. } => "RevokeScope",
+            CatalogCommand::CreateRowPolicy { .. } => "CreateRowPolicy",
+            CatalogCommand::DropRowPolicy { .. } => "DropRowPolicy",
+            CatalogCommand::ListRowPolicies => "ListRowPolicies",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
@@ -311,11 +325,16 @@ impl CatalogCommand {
             | CatalogCommand::DropUser { .. }
             | CatalogCommand::GrantScope { .. }
             | CatalogCommand::RevokeScope { .. }
+            | CatalogCommand::CreateRowPolicy { .. }
+            | CatalogCommand::DropRowPolicy { .. }
             | CatalogCommand::DropCatalog { .. } => {
                 Vec::<FieldRef>::from_type::<SingleValueDisplay<bool>>(TracingOptions::default())
             }
             CatalogCommand::ListUsers { .. } => {
                 Vec::<FieldRef>::from_type::<UserDisplay>(TracingOptions::default())
+            }
+            CatalogCommand::ListRowPolicies => {
+                Vec::<FieldRef>::from_type::<RowPolicyDisplay>(TracingOptions::default())
             }
         }
         .map_err(|e| {
@@ -435,6 +454,24 @@ impl CatalogCommand {
             CatalogCommand::RevokeScope { scope, username } => {
                 manager.revoke_scope(&scope, &username).await?;
                 let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::CreateRowPolicy {
+                table,
+                username,
+                filter,
+            } => {
+                manager.create_row_policy(&table, &username, &filter).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::DropRowPolicy { table, username } => {
+                manager.drop_row_policy(&table, &username).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::ListRowPolicies => {
+                let rows = manager.list_row_policies().await?;
                 build_record_batch(schema, &rows)
             }
             CatalogCommand::CurrentDatabase => {

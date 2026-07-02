@@ -252,6 +252,64 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
             };
             Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
         }
+        Statement::CreateRowPolicy {
+            create: _,
+            row: _,
+            policy: _,
+            on: _,
+            table,
+            r#for: _,
+            user,
+            using: _,
+            filter,
+        } => {
+            let username = match user {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let filter = from_ast_string(filter)?;
+            // Reject an invalid predicate at CREATE time, not at first read.
+            // (The read path stays fail-closed should a stored policy rot.)
+            let ast = crate::parser::parse_expression(&filter).map_err(|e| {
+                SqlError::invalid(format!("row policy predicate does not parse: {e}"))
+            })?;
+            from_ast_expression(ast).map_err(|e| {
+                SqlError::invalid(format!("row policy predicate is unsupported: {e}"))
+            })?;
+            let node = spec::CommandNode::CreateRowPolicy {
+                table: from_ast_object_name(table)?,
+                username: username.into(),
+                filter,
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::DropRowPolicy {
+            drop: _,
+            row: _,
+            policy: _,
+            on: _,
+            table,
+            r#for: _,
+            user,
+        } => {
+            let username = match user {
+                Either::Left(x) => x.value,
+                Either::Right(x) => from_ast_string(x)?,
+            };
+            let node = spec::CommandNode::DropRowPolicy {
+                table: from_ast_object_name(table)?,
+                username: username.into(),
+            };
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
+        Statement::ShowRowPolicies {
+            show: _,
+            row: _,
+            policies: _,
+        } => {
+            let node = spec::CommandNode::ListRowPolicies;
+            Ok(spec::Plan::Command(spec::CommandPlan::new(node)))
+        }
         Statement::UseDatabase {
             r#use: _,
             database: _,

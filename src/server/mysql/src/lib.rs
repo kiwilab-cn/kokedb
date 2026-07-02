@@ -125,9 +125,24 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
             warn!("Auth failed: bad password for user '{username}'");
             return false;
         }
-        // Scope the connection to the user's catalogs (None = unrestricted).
+        // Scope the connection to the user's grants (None = unrestricted).
+        // Row policies only apply to restricted sessions, so they are loaded
+        // only when the user carries an allow-list.
         let acl = user.allowed_catalogs.map(Arc::new);
-        if let Err(e) = set_session_acl(&self.ctx, acl) {
+        let policies = if acl.is_some() {
+            match self.meta.list_row_policies(username).await {
+                Ok(rows) => kokedb_query::context::parse_row_policies(rows),
+                Err(e) => {
+                    // Fail-closed: rejecting the login is safer than admitting
+                    // a session whose row filters could not be loaded.
+                    error!("Auth failed: could not load row policies for '{username}': {e}");
+                    return false;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if let Err(e) = set_session_acl(&self.ctx, acl, policies) {
             error!("Failed to apply catalog ACL for '{username}': {e}");
             return false;
         }
