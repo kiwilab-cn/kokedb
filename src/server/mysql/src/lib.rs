@@ -49,6 +49,12 @@ struct CoreContex {
     prepared: HashMap<u32, PreparedStatement>,
     /// Monotonic statement id generator for this connection.
     next_stmt_id: u32,
+    /// Shared audit trail (non-blocking).
+    audit: kokedb_query::audit::AuditLogger,
+    /// Client peer address, captured at accept time.
+    peer: String,
+    /// The authenticated username (set once in `authenticate`).
+    user: std::sync::OnceLock<String>,
 }
 
 impl CoreContex {
@@ -58,6 +64,8 @@ impl CoreContex {
         sf: Arc<singleflight::Singleflight>,
         meta: Arc<PostgreSQLMetaCatalogProviderList>,
         plan_cache: PlanCache,
+        audit: kokedb_query::audit::AuditLogger,
+        peer: String,
     ) -> Self {
         Self {
             ctx,
@@ -68,7 +76,66 @@ impl CoreContex {
             session_max_staleness: None,
             prepared: HashMap::new(),
             next_stmt_id: 1,
+            audit,
+            peer,
+            user: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Audit-context bundle for this connection's statements.
+    fn audit_ctx(&self) -> AuditCtx {
+        AuditCtx {
+            audit: self.audit.clone(),
+            user: self.user.get().cloned().unwrap_or_default(),
+            peer: self.peer.clone(),
+        }
+    }
+
+    fn audit_auth(&self, username: &str, success: bool, error: Option<String>) {
+        self.audit.log(kokedb_meta::catalog_list::AuditEvent {
+            event_time: chrono::Utc::now(),
+            username: username.to_string(),
+            client_addr: self.peer.clone(),
+            protocol: "mysql",
+            event_type: "auth",
+            statement: String::new(),
+            success,
+            error,
+            duration_ms: None,
+        });
+    }
+}
+
+/// Everything a statement audit entry needs, detached from the connection.
+#[derive(Clone)]
+struct AuditCtx {
+    audit: kokedb_query::audit::AuditLogger,
+    user: String,
+    peer: String,
+}
+
+impl AuditCtx {
+    /// Records one statement outcome. `is_command` reduces the statement to a
+    /// redacted keyword prefix (command text can carry secrets).
+    fn log(
+        &self,
+        sql: &str,
+        is_command: bool,
+        success: bool,
+        error: Option<String>,
+        started: std::time::Instant,
+    ) {
+        self.audit.log(kokedb_meta::catalog_list::AuditEvent {
+            event_time: chrono::Utc::now(),
+            username: self.user.clone(),
+            client_addr: self.peer.clone(),
+            protocol: "mysql",
+            event_type: if is_command { "command" } else { "query" },
+            statement: kokedb_query::audit::AuditLogger::statement_for(sql, is_command),
+            success,
+            error,
+            duration_ms: Some(started.elapsed().as_millis() as i64),
+        });
     }
 }
 
@@ -105,13 +172,19 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
                 // Unknown user: allowed only while authentication is disabled
                 // (no accounts defined at all).
                 return match self.meta.count_app_users().await {
-                    Ok(0) => true,
+                    Ok(0) => {
+                        let _ = self.user.set(username.to_string());
+                        self.audit_auth(username, true, None);
+                        true
+                    }
                     Ok(_) => {
                         warn!("Auth failed: unknown user '{username}'");
+                        self.audit_auth(username, false, Some("unknown user".to_string()));
                         false
                     }
                     Err(e) => {
                         error!("Auth failed: meta lookup error: {e}");
+                        self.audit_auth(username, false, Some(e.to_string()));
                         false
                     }
                 };
@@ -123,6 +196,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         };
         if !kokedb_common::auth::verify_mysql_native(&user.auth_digest, salt, auth_data) {
             warn!("Auth failed: bad password for user '{username}'");
+            self.audit_auth(username, false, Some("bad password".to_string()));
             return false;
         }
         // Scope the connection to the user's grants (None = unrestricted).
@@ -155,8 +229,11 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         };
         if let Err(e) = set_session_acl(&self.ctx, acl, policies, column_policies) {
             error!("Failed to apply catalog ACL for '{username}': {e}");
+            self.audit_auth(username, false, Some(e.to_string()));
             return false;
         }
+        let _ = self.user.set(username.to_string());
+        self.audit_auth(username, true, None);
         true
     }
 
@@ -234,6 +311,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
             self.session_max_staleness,
             &sql,
             results,
+            self.audit_ctx(),
         )
         .await
     }
@@ -298,6 +376,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
             self.session_max_staleness,
             sql,
             results,
+            self.audit_ctx(),
         )
         .await
     }
@@ -314,6 +393,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     session_max_staleness: Option<u64>,
     sql: &str,
     results: QueryResultWriter<'_, W>,
+    audit: AuditCtx,
 ) -> Result<(), MysqlServerError> {
     let instant = std::time::Instant::now();
     metrics::inc_queries();
@@ -328,10 +408,14 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     let plan_entry = match parse_sql_and_get_plan(&plan_cache, sql) {
         Ok(result) => result,
         Err((error_kind, error_msg)) => {
+            // Parse failures are audited with the redacted prefix only: the
+            // raw text of a malformed command could still carry secrets.
+            audit.log(sql, true, false, Some(error_msg.clone()), instant);
             return send_error_to_client(results, error_kind, error_msg).await;
         }
     };
     let (plan, cache_key) = (&plan_entry.0, plan_entry.1);
+    let is_command = !matches!(plan, Plan::Query(_));
 
     // Steps 2+3: produce the stream and pull its first batch, bounded by the
     // optional query timeout. Both happen before we start writing to the client
@@ -347,15 +431,15 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     let (mut batch_stream, first) = match apply_query_timeout(produce_first).await {
         Ok(Ok(pair)) => pair,
         Ok(Err(error_msg)) => {
+            audit.log(sql, is_command, false, Some(error_msg.clone()), instant);
             return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
         }
         Err(secs) => {
-            return send_error_to_client(
-                results,
-                ErrorKind::ER_QUERY_INTERRUPTED,
-                format!("query exceeded the {secs}s timeout (KOKEDB_QUERY_TIMEOUT_SECS)"),
-            )
-            .await;
+            let error_msg =
+                format!("query exceeded the {secs}s timeout (KOKEDB_QUERY_TIMEOUT_SECS)");
+            audit.log(sql, is_command, false, Some(error_msg.clone()), instant);
+            return send_error_to_client(results, ErrorKind::ER_QUERY_INTERRUPTED, error_msg)
+                .await;
         }
     };
 
@@ -363,10 +447,12 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
         Some(Ok(batch)) => batch,
         Some(Err(e)) => {
             let error_msg = format!("Error reading first batch: {}", e);
+            audit.log(sql, is_command, false, Some(error_msg.clone()), instant);
             return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
         }
         None => {
             // Empty result set
+            audit.log(sql, is_command, true, None, instant);
             return handle_empty_result(results, meta, sql, plan_entry.clone(), instant).await;
         }
     };
@@ -375,6 +461,7 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     let columns = match prepare_columns_from_batch(&first_batch) {
         Ok(cols) => cols,
         Err(error_msg) => {
+            audit.log(sql, is_command, false, Some(error_msg.clone()), instant);
             return send_error_to_client(results, ErrorKind::ER_UNKNOWN_ERROR, error_msg).await;
         }
     };
@@ -389,9 +476,13 @@ async fn run_query<W: AsyncWrite + Send + Unpin>(
     })?;
 
     // Step 6: Write all batches to client
-    write_batches_to_client(&mut writer, &first_batch, &mut batch_stream).await?;
+    if let Err(e) = write_batches_to_client(&mut writer, &first_batch, &mut batch_stream).await {
+        audit.log(sql, is_command, false, Some(e.to_string()), instant);
+        return Err(e);
+    }
 
     // Step 7: Finalize query execution
+    audit.log(sql, is_command, true, None, instant);
     finalize_query(writer, meta, sql, plan_entry.clone(), instant).await?;
 
     Ok(())
@@ -1044,11 +1135,18 @@ pub async fn serve(shared: SharedServices, bind_addr: String) -> Result<(), Mysq
     let result_cache = shared.result_cache();
     let singleflight = singleflight::Singleflight::new();
 
+    let audit = shared.audit();
+
     loop {
         let (stream, _) = listener.accept().await?;
+        let peer = stream
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
         let (r, w) = stream.into_split();
         let cache = result_cache.clone();
         let sf = singleflight.clone();
+        let audit = audit.clone();
         let ctx = match create_session_context(&shared) {
             Ok(ctx) => Arc::new(ctx),
             Err(e) => {
@@ -1063,7 +1161,7 @@ pub async fn serve(shared: SharedServices, bind_addr: String) -> Result<(), Mysq
                 .active_connections
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let _ = AsyncMysqlIntermediary::run_on(
-                CoreContex::new(ctx, cache, sf, meta, plan_cache),
+                CoreContex::new(ctx, cache, sf, meta, plan_cache, audit, peer),
                 r,
                 w,
             )

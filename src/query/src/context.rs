@@ -40,6 +40,7 @@ pub struct SharedServices {
     scheduler_jobs: Arc<Mutex<HashMap<String, uuid::Uuid>>>,
     result_cache: ResultCache,
     plan_cache: PlanCache,
+    audit: crate::audit::AuditLogger,
 }
 
 impl SharedServices {
@@ -58,6 +59,11 @@ impl SharedServices {
     /// The shared result cache (process-wide; local or Redis-backed).
     pub fn result_cache(&self) -> ResultCache {
         self.result_cache.clone()
+    }
+
+    /// The shared audit logger (process-wide, non-blocking).
+    pub fn audit(&self) -> crate::audit::AuditLogger {
+        self.audit.clone()
     }
 }
 
@@ -108,6 +114,7 @@ pub async fn init_shared_services(
 
     let plan_cache = PlanCache::new(get_env_as("KOKEDB_PLAN_CACHE_SIZE", 2000usize));
 
+    let audit = crate::audit::AuditLogger::new(catalog_list.clone());
     let shared = SharedServices {
         runtime,
         catalog_list,
@@ -116,6 +123,7 @@ pub async fn init_shared_services(
         scheduler_jobs: Arc::new(Mutex::new(HashMap::new())),
         result_cache,
         plan_cache,
+        audit,
     };
 
     // Register the periodic per-catalog sync jobs once, using a throwaway

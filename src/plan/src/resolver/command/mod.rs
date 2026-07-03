@@ -398,6 +398,9 @@ impl PlanResolver<'_> {
             CommandNode::ListColumnPolicies => {
                 self.resolve_catalog_command(CatalogCommand::ListColumnPolicies)
             }
+            CommandNode::ListAuditLog => {
+                self.resolve_catalog_command(CatalogCommand::ListAuditLog)
+            }
         }
     }
 

@@ -8,7 +8,7 @@
 
 use kokedb_common::auth::password_digest;
 
-use crate::display::{ColumnPolicyDisplay, RowPolicyDisplay, UserDisplay};
+use crate::display::{AuditLogDisplay, ColumnPolicyDisplay, RowPolicyDisplay, UserDisplay};
 use crate::error::{CatalogError, CatalogResult};
 use crate::manager::CatalogManager;
 use crate::utils::match_pattern;
@@ -293,6 +293,42 @@ impl CatalogManager {
             ));
         }
         Ok(())
+    }
+
+    /// Backs `SHOW AUDIT LOG`: the 200 most recent audit entries.
+    pub async fn list_audit_log(&self) -> CatalogResult<Vec<AuditLogDisplay>> {
+        self.require_admin()?;
+        let meta = self.state()?.dynamic_catalog_list.clone();
+        let rows = meta
+            .list_audit_log(200)
+            .await
+            .map_err(|e| CatalogError::External(format!("Failed to list audit log: {e}")))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    event_time,
+                    username,
+                    client_addr,
+                    protocol,
+                    event_type,
+                    statement,
+                    success,
+                    error,
+                    duration_ms,
+                )| AuditLogDisplay {
+                    event_time: event_time.to_rfc3339(),
+                    username,
+                    client_addr,
+                    protocol,
+                    event_type,
+                    statement,
+                    success,
+                    error,
+                    duration_ms,
+                },
+            )
+            .collect())
     }
 
     /// Backs `SHOW COLUMN POLICIES`.

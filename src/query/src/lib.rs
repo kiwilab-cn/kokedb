@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod binder;
 pub mod context;
 pub mod error;

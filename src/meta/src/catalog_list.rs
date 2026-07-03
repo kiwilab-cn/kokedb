@@ -25,6 +25,24 @@ pub struct CatalogInfo {
     pub dsn: String,
 }
 
+/// One audit-trail entry: an authentication attempt or a statement execution.
+#[derive(Debug, Clone)]
+pub struct AuditEvent {
+    pub event_time: chrono::DateTime<chrono::Utc>,
+    pub username: String,
+    pub client_addr: String,
+    /// `mysql` | `postgresql`.
+    pub protocol: &'static str,
+    /// `auth` | `query` | `command`.
+    pub event_type: &'static str,
+    /// Statement text for queries; a redacted keyword prefix for commands
+    /// (command text can carry secrets: passwords, DSNs).
+    pub statement: String,
+    pub success: bool,
+    pub error: Option<String>,
+    pub duration_ms: Option<i64>,
+}
+
 /// An application account used to authenticate wire-protocol clients and scope
 /// which catalogs they may access.
 #[derive(Debug, Clone)]
@@ -442,6 +460,27 @@ impl PostgreSQLMetaCatalogProviderList {
                 PRIMARY KEY (username, catalog, schema_name, table_name)
             );
             "#,
+            // Audit trail: authentication attempts and statement executions
+            // from both wire front-ends. Written in batches by a background
+            // flusher; pruned by KOKEDB_AUDIT_RETENTION_DAYS.
+            r#"
+            CREATE TABLE IF NOT EXISTS system.audit_log (
+                id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                event_time TIMESTAMPTZ NOT NULL,
+                username VARCHAR(255) NOT NULL DEFAULT '',
+                client_addr VARCHAR(64) NOT NULL DEFAULT '',
+                protocol VARCHAR(16) NOT NULL,
+                event_type VARCHAR(16) NOT NULL,
+                statement TEXT NOT NULL DEFAULT '',
+                success BOOLEAN NOT NULL,
+                error TEXT,
+                duration_ms BIGINT
+            );
+            "#,
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_time \
+             ON system.audit_log (event_time DESC);",
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_user_time \
+             ON system.audit_log (username, event_time DESC);",
         ];
 
         for sql in sql_statements {
@@ -889,6 +928,93 @@ impl PostgreSQLMetaCatalogProviderList {
                     r.get("schema_name"),
                     r.get("table_name"),
                     r.get("masked_columns"),
+                )
+            })
+            .collect())
+    }
+
+    /// Inserts a batch of audit events in one round-trip.
+    pub async fn insert_audit_events(&self, events: &[AuditEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let mut builder: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
+            "INSERT INTO system.audit_log \
+             (event_time, username, client_addr, protocol, event_type, statement, \
+              success, error, duration_ms) ",
+        );
+        builder.push_values(events, |mut b, e| {
+            b.push_bind(e.event_time)
+                .push_bind(&e.username)
+                .push_bind(&e.client_addr)
+                .push_bind(e.protocol)
+                .push_bind(e.event_type)
+                .push_bind(&e.statement)
+                .push_bind(e.success)
+                .push_bind(&e.error)
+                .push_bind(e.duration_ms);
+        });
+        builder
+            .build()
+            .execute(&self.local_pool)
+            .await
+            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(())
+    }
+
+    /// Deletes audit entries older than `days`. Returns the number removed.
+    pub async fn purge_audit_log(&self, days: u64) -> Result<u64> {
+        let ret = sqlx::query(
+            "DELETE FROM system.audit_log \
+             WHERE event_time < CURRENT_TIMESTAMP - make_interval(days => $1)",
+        )
+        .bind(days as i32)
+        .execute(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(ret.rows_affected())
+    }
+
+    /// The most recent audit entries (newest first), for `SHOW AUDIT LOG`.
+    #[allow(clippy::type_complexity)]
+    pub async fn list_audit_log(
+        &self,
+        limit: i64,
+    ) -> Result<
+        Vec<(
+            chrono::DateTime<chrono::Utc>,
+            String,
+            String,
+            String,
+            String,
+            String,
+            bool,
+            Option<String>,
+            Option<i64>,
+        )>,
+    > {
+        let rows = sqlx::query(
+            "SELECT event_time, username, client_addr, protocol, event_type, statement, \
+             success, error, duration_ms \
+             FROM system.audit_log ORDER BY event_time DESC, id DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.local_pool)
+        .await
+        .map_err(|e| DataFusionError::External(Box::new(e)))?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get("event_time"),
+                    r.get("username"),
+                    r.get("client_addr"),
+                    r.get("protocol"),
+                    r.get("event_type"),
+                    r.get("statement"),
+                    r.get("success"),
+                    r.try_get("error").ok(),
+                    r.try_get("duration_ms").ok(),
                 )
             })
             .collect())
