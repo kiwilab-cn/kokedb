@@ -11,7 +11,7 @@ use serde_arrow::to_arrow;
 
 use crate::display::{
     CacheJobDisplay, CachePolicyDisplay, CacheScheduleDisplay, CatalogDisplay, DiagnoseDisplay,
-    EmptyDisplay, RefreshCacheDisplay, RowPolicyDisplay, SingleValueDisplay,
+    ColumnPolicyDisplay, EmptyDisplay, RefreshCacheDisplay, RowPolicyDisplay, SingleValueDisplay,
     TableMetadataDisplay, UserDisplay,
 };
 use crate::error::{CatalogError, CatalogResult};
@@ -106,6 +106,16 @@ pub enum CatalogCommand {
         username: String,
     },
     ListRowPolicies,
+    CreateColumnPolicy {
+        table: Vec<String>,
+        username: String,
+        columns: String,
+    },
+    DropColumnPolicy {
+        table: Vec<String>,
+        username: String,
+    },
+    ListColumnPolicies,
     CurrentDatabase,
     SetCurrentDatabase {
         database: Vec<String>,
@@ -230,6 +240,9 @@ impl CatalogCommand {
             CatalogCommand::CreateRowPolicy { .. } => "CreateRowPolicy",
             CatalogCommand::DropRowPolicy { .. } => "DropRowPolicy",
             CatalogCommand::ListRowPolicies => "ListRowPolicies",
+            CatalogCommand::CreateColumnPolicy { .. } => "CreateColumnPolicy",
+            CatalogCommand::DropColumnPolicy { .. } => "DropColumnPolicy",
+            CatalogCommand::ListColumnPolicies => "ListColumnPolicies",
             CatalogCommand::CurrentDatabase => "CurrentDatabase",
             CatalogCommand::CreateCatalog { .. } => "CreateCatalog",
             CatalogCommand::SetCurrentDatabase { .. } => "SetCurrentDatabase",
@@ -327,6 +340,8 @@ impl CatalogCommand {
             | CatalogCommand::RevokeScope { .. }
             | CatalogCommand::CreateRowPolicy { .. }
             | CatalogCommand::DropRowPolicy { .. }
+            | CatalogCommand::CreateColumnPolicy { .. }
+            | CatalogCommand::DropColumnPolicy { .. }
             | CatalogCommand::DropCatalog { .. } => {
                 Vec::<FieldRef>::from_type::<SingleValueDisplay<bool>>(TracingOptions::default())
             }
@@ -335,6 +350,9 @@ impl CatalogCommand {
             }
             CatalogCommand::ListRowPolicies => {
                 Vec::<FieldRef>::from_type::<RowPolicyDisplay>(TracingOptions::default())
+            }
+            CatalogCommand::ListColumnPolicies => {
+                Vec::<FieldRef>::from_type::<ColumnPolicyDisplay>(TracingOptions::default())
             }
         }
         .map_err(|e| {
@@ -472,6 +490,24 @@ impl CatalogCommand {
             }
             CatalogCommand::ListRowPolicies => {
                 let rows = manager.list_row_policies().await?;
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::CreateColumnPolicy {
+                table,
+                username,
+                columns,
+            } => {
+                manager.create_column_policy(&table, &username, &columns).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::DropColumnPolicy { table, username } => {
+                manager.drop_column_policy(&table, &username).await?;
+                let rows = vec![SingleValueDisplay { value: true }];
+                build_record_batch(schema, &rows)
+            }
+            CatalogCommand::ListColumnPolicies => {
+                let rows = manager.list_column_policies().await?;
                 build_record_batch(schema, &rows)
             }
             CatalogCommand::CurrentDatabase => {

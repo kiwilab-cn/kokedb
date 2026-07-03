@@ -159,6 +159,33 @@ pub enum Statement {
         row: Row,
         policies: Policies,
     },
+    /// `CREATE COLUMN POLICY ON cat.schema.table FOR user USING 'a,b'` —
+    /// column-level security: the listed columns read as NULL for that user.
+    CreateColumnPolicy {
+        create: Create,
+        column: Column,
+        policy: Policy,
+        on: On,
+        table: ObjectName,
+        r#for: For,
+        user: Either<Ident, StringLiteral>,
+        using: Using,
+        columns: StringLiteral,
+    },
+    DropColumnPolicy {
+        drop: Drop,
+        column: Column,
+        policy: Policy,
+        on: On,
+        table: ObjectName,
+        r#for: For,
+        user: Either<Ident, StringLiteral>,
+    },
+    ShowColumnPolicies {
+        show: Show,
+        column: Column,
+        policies: Policies,
+    },
     UseDatabase {
         r#use: Use,
         database: Either<Database, Schema>,

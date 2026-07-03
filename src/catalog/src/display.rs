@@ -29,6 +29,16 @@ pub struct RowPolicyDisplay {
     pub filter: String,
 }
 
+/// One row of `SHOW COLUMN POLICIES` output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnPolicyDisplay {
+    pub username: String,
+    /// Fully-qualified `catalog.schema.table`.
+    pub table: String,
+    /// Comma-separated masked columns.
+    pub masked_columns: String,
+}
+
 /// One row of `SHOW USERS` output. The password digest is deliberately not
 /// exposed.
 #[derive(Debug, Clone, Serialize, Deserialize)]

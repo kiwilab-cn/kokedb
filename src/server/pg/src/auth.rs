@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::sink::{Sink, SinkExt};
-use kokedb_catalog::acl::RowPolicy;
-use kokedb_query::context::{parse_row_policies, SharedServices};
+use kokedb_catalog::acl::{ColumnPolicy, RowPolicy};
+use kokedb_query::context::{parse_column_policies, parse_row_policies, SharedServices};
 use pgwire::api::auth::{
     finish_authentication, protocol_negotiation, save_startup_parameters_to_metadata,
     DefaultServerParameterProvider, LoginInfo, StartupHandler,
@@ -32,6 +32,8 @@ pub struct SessionAuth {
     pub scopes: Option<Arc<std::collections::HashSet<String>>>,
     /// Parsed row-level security policies (empty for unrestricted sessions).
     pub policies: Vec<RowPolicy>,
+    /// Column-masking policies (empty for unrestricted sessions).
+    pub column_policies: Vec<ColumnPolicy>,
 }
 
 /// Shared between one connection's startup handler and query handler: the
@@ -123,17 +125,27 @@ impl StartupHandler for KokedbStartupHandler {
                 // Row policies only apply to restricted sessions; failing to
                 // load them rejects the login (fail-closed).
                 let scopes = app_user.allowed_catalogs.map(Arc::new);
-                let policies = if scopes.is_some() {
+                let (policies, column_policies) = if scopes.is_some() {
                     let rows = self.shared.meta().list_row_policies(&user).await.map_err(|e| {
                         PgWireError::ApiError(Box::new(std::io::Error::other(format!(
                             "failed to load row policies: {e}"
                         ))))
                     })?;
-                    parse_row_policies(rows)
+                    let cols =
+                        self.shared.meta().list_column_policies(&user).await.map_err(|e| {
+                            PgWireError::ApiError(Box::new(std::io::Error::other(format!(
+                                "failed to load column policies: {e}"
+                            ))))
+                        })?;
+                    (parse_row_policies(rows), parse_column_policies(cols))
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
-                self.publish(SessionAuth { scopes, policies });
+                self.publish(SessionAuth {
+                    scopes,
+                    policies,
+                    column_policies,
+                });
 
                 let (pid, secret_key) = RandomPidSecretKeyGenerator::default().generate(client);
                 client.set_pid_and_secret_key(pid, secret_key);

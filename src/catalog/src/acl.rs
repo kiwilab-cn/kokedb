@@ -28,6 +28,17 @@ pub struct RowPolicy {
     pub filter: Option<spec::Expr>,
 }
 
+/// A column-level security (masking) policy attached to the session: reads of
+/// `table` return NULL in the `masked` columns, and the session's predicates
+/// can never probe the real values.
+#[derive(Debug, Clone)]
+pub struct ColumnPolicy {
+    pub catalog: String,
+    pub schema: String,
+    pub table: String,
+    pub masked: Vec<String>,
+}
+
 /// Parsed grant scopes for one session. Construct via [`CatalogAcl::from_scopes`].
 #[derive(Debug, Default)]
 pub struct CatalogAcl {
@@ -44,6 +55,8 @@ pub struct CatalogAcl {
     visible_databases: HashSet<(String, String)>,
     /// Row-level security filters, keyed by `(catalog, schema, table)`.
     policies: HashMap<(String, String, String), Option<spec::Expr>>,
+    /// Column-masking policies, keyed by `(catalog, schema, table)`.
+    column_policies: HashMap<(String, String, String), Vec<String>>,
 }
 
 impl CatalogAcl {
@@ -120,6 +133,21 @@ impl CatalogAcl {
     /// (fail-closed), never serve the table unfiltered.
     pub fn row_policy(&self, catalog: &str, schema: &str, table: &str) -> Option<&Option<spec::Expr>> {
         self.policies
+            .get(&(catalog.to_string(), schema.to_string(), table.to_string()))
+    }
+
+    /// Attaches the session's column-masking policies.
+    pub fn with_column_policies(mut self, policies: Vec<ColumnPolicy>) -> Self {
+        for p in policies {
+            self.column_policies
+                .insert((p.catalog, p.schema, p.table), p.masked);
+        }
+        self
+    }
+
+    /// The masked columns for a table, if a column policy applies.
+    pub fn masked_columns(&self, catalog: &str, schema: &str, table: &str) -> Option<&Vec<String>> {
+        self.column_policies
             .get(&(catalog.to_string(), schema.to_string(), table.to_string()))
     }
 }

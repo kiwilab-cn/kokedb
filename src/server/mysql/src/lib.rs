@@ -129,20 +129,31 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for CoreContex {
         // Row policies only apply to restricted sessions, so they are loaded
         // only when the user carries an allow-list.
         let acl = user.allowed_catalogs.map(Arc::new);
-        let policies = if acl.is_some() {
-            match self.meta.list_row_policies(username).await {
-                Ok(rows) => kokedb_query::context::parse_row_policies(rows),
+        let (policies, column_policies) = if acl.is_some() {
+            let rows = match self.meta.list_row_policies(username).await {
+                Ok(rows) => rows,
                 Err(e) => {
                     // Fail-closed: rejecting the login is safer than admitting
                     // a session whose row filters could not be loaded.
                     error!("Auth failed: could not load row policies for '{username}': {e}");
                     return false;
                 }
-            }
+            };
+            let cols = match self.meta.list_column_policies(username).await {
+                Ok(cols) => cols,
+                Err(e) => {
+                    error!("Auth failed: could not load column policies for '{username}': {e}");
+                    return false;
+                }
+            };
+            (
+                kokedb_query::context::parse_row_policies(rows),
+                kokedb_query::context::parse_column_policies(cols),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
-        if let Err(e) = set_session_acl(&self.ctx, acl, policies) {
+        if let Err(e) = set_session_acl(&self.ctx, acl, policies, column_policies) {
             error!("Failed to apply catalog ACL for '{username}': {e}");
             return false;
         }

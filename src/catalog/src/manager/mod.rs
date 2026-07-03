@@ -104,9 +104,14 @@ impl CatalogManager {
         &self,
         scopes: Option<Arc<std::collections::HashSet<String>>>,
         policies: Vec<crate::acl::RowPolicy>,
+        column_policies: Vec<crate::acl::ColumnPolicy>,
     ) {
         let acl = scopes.map(|s| {
-            Arc::new(crate::acl::CatalogAcl::from_scopes(s.iter()).with_policies(policies))
+            Arc::new(
+                crate::acl::CatalogAcl::from_scopes(s.iter())
+                    .with_policies(policies)
+                    .with_column_policies(column_policies),
+            )
         });
         if let Ok(mut state) = self.state.lock() {
             state.acl = acl;
@@ -125,6 +130,13 @@ impl CatalogManager {
         let state = self.state.lock().ok()?;
         let acl = state.acl.as_ref()?;
         acl.row_policy(catalog, schema, table).cloned()
+    }
+
+    /// The session's masked columns for a table, if a column policy applies.
+    pub fn masked_columns(&self, catalog: &str, schema: &str, table: &str) -> Option<Vec<String>> {
+        let state = self.state.lock().ok()?;
+        let acl = state.acl.as_ref()?;
+        acl.masked_columns(catalog, schema, table).cloned()
     }
 
     /// Whether this session has an authorization scope applied. Restricted
