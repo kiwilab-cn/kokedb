@@ -1342,3 +1342,188 @@ async fn pg_wire_audit_log() {
     clean_meta(&meta, catalog).await;
     let _ = sqlx::query("DROP TABLE IF EXISTS adt_t").execute(&source).await;
 }
+
+/// Custom masking functions: `hash` (deterministic SHA-256 hex), `partial`
+/// (length-preserving prefix/suffix reveal), `redact` (fixed ***), and the
+/// NULL fallback for non-string columns; invalid specs rejected at CREATE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL (source + meta)"]
+async fn pg_wire_custom_mask_functions() {
+    let catalog = "msk_cat";
+    std::env::set_var("PG_META_DSN", meta_dsn());
+    std::env::set_var("KOKEDB_REEVALUATE_INTERVAL_MIN", "60");
+
+    let source = PgPool::connect(&source_dsn()).await.unwrap();
+    for stmt in [
+        "DROP TABLE IF EXISTS msk_people",
+        "CREATE TABLE msk_people (id int PRIMARY KEY, name text, ssn text, email text)",
+        "INSERT INTO msk_people VALUES \
+         (1,'ann','111-22-6789','ann@x.io'),(2,'bob','333-44-1234','bob@x.io')",
+    ] {
+        sqlx::query(stmt).execute(&source).await.unwrap();
+    }
+    let meta = PgPool::connect(&meta_dsn()).await.unwrap();
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('msk_admin','msk_user')")
+        .execute(&meta)
+        .await;
+    let _ = sqlx::query(
+        "DELETE FROM system.column_policy WHERE username IN ('msk_admin','msk_user')",
+    )
+    .execute(&meta)
+    .await;
+
+    let result_cache = ResultCache::local(64, 64).await.unwrap();
+    let shared = init_shared_services(result_cache).await.unwrap();
+    let handlers = KokedbHandlers::new(shared);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (sock, _) = listener.accept().await.unwrap();
+            let h = handlers.clone();
+            tokio::spawn(async move {
+                let _ = process_socket(sock, None, h).await;
+            });
+        }
+    });
+    let port = addr.port();
+
+    let (boot, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=postgres dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("bootstrap connection");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    boot.simple_query(&format!(
+        "CREATE CATALOG {catalog} USING '{}' WITH properties(cache_policy=\"select\", \
+         table_set=\"public.msk_people\")",
+        source_dsn()
+    ))
+    .await
+    .expect("CREATE CATALOG");
+    assert!(wait_until_cached(&meta, catalog, "msk_people", Duration::from_secs(60)).await);
+
+    boot.simple_query(
+        "CREATE USER msk_admin WITH properties(password=\"adm\", superuser=\"true\")",
+    )
+    .await
+    .expect("create admin");
+    boot.simple_query(&format!(
+        "CREATE USER msk_user WITH properties(password=\"pw\", catalogs=\"{catalog}\")"
+    ))
+    .await
+    .expect("create user");
+
+    // Unknown functions and malformed partial() are rejected at CREATE.
+    assert!(
+        boot.simple_query(&format!(
+            "CREATE COLUMN POLICY ON {catalog}.public.msk_people FOR msk_user \
+             USING \"ssn=frobnicate\""
+        ))
+        .await
+        .is_err(),
+        "unknown mask function must be rejected"
+    );
+    assert!(
+        boot.simple_query(&format!(
+            "CREATE COLUMN POLICY ON {catalog}.public.msk_people FOR msk_user \
+             USING \"ssn=partial(1)\""
+        ))
+        .await
+        .is_err(),
+        "malformed partial() must be rejected"
+    );
+
+    boot.simple_query(&format!(
+        "CREATE COLUMN POLICY ON {catalog}.public.msk_people FOR msk_user \
+         USING \"ssn=partial(0,4), email=hash, name=redact, id=hash\""
+    ))
+    .await
+    .expect("CREATE COLUMN POLICY with functions");
+
+    let (user, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=msk_user password=pw dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("mask user authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // partial(0,4): length-preserving, last 4 revealed.
+    let row = user
+        .simple_query(&format!(
+            "SELECT ssn FROM {catalog}.public.msk_people WHERE name = '***' AND email <> '' \
+             ORDER BY ssn LIMIT 1"
+        ))
+        .await
+        .expect("partial masked query");
+    assert_eq!(
+        first_value(&row, "ssn").as_deref(),
+        Some("*******1234"),
+        "partial(0,4) keeps the last 4 chars and the length"
+    );
+
+    // hash: deterministic 64-char hex, groupable, not the original.
+    let row = user
+        .simple_query(&format!(
+            "SELECT email, count(*) AS c FROM {catalog}.public.msk_people \
+             GROUP BY email ORDER BY email LIMIT 1"
+        ))
+        .await
+        .expect("hash masked group by");
+    let hashed = first_value(&row, "email").expect("hashed email");
+    assert_eq!(hashed.len(), 64, "hash mask is sha256 hex");
+    assert!(!hashed.contains("@"), "hash mask hides the original");
+
+    // redact: fixed *** (already exercised via the WHERE name = '***' above).
+    // Non-string column with hash: falls back to NULL (fail-safe).
+    let row = user
+        .simple_query(&format!(
+            "SELECT count(*) AS total, count(id) AS ids FROM {catalog}.public.msk_people"
+        ))
+        .await
+        .expect("null fallback");
+    assert_eq!(first_value(&row, "total").as_deref(), Some("2"));
+    assert_eq!(
+        first_value(&row, "ids").as_deref(),
+        Some("0"),
+        "hash on a non-string column must fall back to NULL"
+    );
+
+    // Admin sees the real values.
+    let (admin, conn) = tokio_postgres::connect(
+        &format!("host=127.0.0.1 port={port} user=msk_admin password=adm dbname=kokedb"),
+        tokio_postgres::NoTls,
+    )
+    .await
+    .expect("admin authenticates");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let row = admin
+        .simple_query(&format!(
+            "SELECT ssn FROM {catalog}.public.msk_people WHERE id = 2"
+        ))
+        .await
+        .expect("admin unmasked");
+    assert_eq!(first_value(&row, "ssn").as_deref(), Some("333-44-1234"));
+
+    // Cleanup.
+    let _ = sqlx::query("DELETE FROM system.app_user WHERE username IN ('msk_admin','msk_user')")
+        .execute(&meta)
+        .await;
+    let _ = sqlx::query(
+        "DELETE FROM system.column_policy WHERE username IN ('msk_admin','msk_user')",
+    )
+    .execute(&meta)
+    .await;
+    clean_meta(&meta, catalog).await;
+    let _ = sqlx::query("DROP TABLE IF EXISTS msk_people").execute(&source).await;
+}

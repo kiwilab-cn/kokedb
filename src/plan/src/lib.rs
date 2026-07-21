@@ -22,6 +22,7 @@ pub mod extension;
 pub mod formatter;
 pub mod function;
 pub mod literal;
+pub mod masking;
 pub mod resolver;
 mod utils;
 

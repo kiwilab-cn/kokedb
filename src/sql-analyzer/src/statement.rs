@@ -326,16 +326,11 @@ pub fn from_ast_statement(statement: Statement) -> SqlResult<spec::Plan> {
                 Either::Right(x) => from_ast_string(x)?,
             };
             let columns = from_ast_string(columns)?;
-            // Reject an empty or malformed column list at CREATE time.
-            if !columns
-                .split(',')
-                .map(str::trim)
-                .any(|c| !c.is_empty())
-            {
-                return Err(SqlError::invalid(
-                    "column policy needs at least one column name",
-                ));
-            }
+            // Validate the whole mask spec at CREATE time — column names plus
+            // functions (null, hash, partial(p,s), redact). (The read path is
+            // still fail-safe if a stored spec rots: it falls back to NULL.)
+            kokedb_common::masking::parse_mask_list(&columns)
+                .map_err(|e| SqlError::invalid(format!("invalid column policy: {e}")))?;
             let node = spec::CommandNode::CreateColumnPolicy {
                 table: from_ast_object_name(table)?,
                 username: username.into(),

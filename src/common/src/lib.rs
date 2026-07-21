@@ -6,6 +6,7 @@ pub mod env;
 pub mod error;
 pub mod file;
 pub mod hash;
+pub mod masking;
 pub mod object;
 pub mod opentelemetry;
 pub mod redact;

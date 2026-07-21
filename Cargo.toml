@@ -162,6 +162,7 @@ rand_distr = "0.5.1"
 aes = "0.8.4"
 aes-gcm = "0.10.3"
 sha1 = "0.10.6"
+sha2 = "0.10"
 twox-hash = "2.1.1"
 cbc = { version = "0.1.2", features = ["std"] }
 base64 = "0.22.1"
