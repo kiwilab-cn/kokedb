@@ -265,21 +265,44 @@ pub fn set_session_acl(
 }
 
 /// Converts raw column-policy rows loaded at authentication time —
-/// `(catalog, schema, table, masked_columns_csv)` — into session policies.
+/// `(catalog, schema, table, mask_spec)` — into session policies. A stored
+/// entry that no longer parses falls back to NULL masking for that column
+/// (fail-safe: a corrupt spec must narrow, never widen, visibility).
 pub fn parse_column_policies(
     rows: Vec<(String, String, String, String)>,
 ) -> Vec<kokedb_catalog::acl::ColumnPolicy> {
+    use kokedb_common::masking::{parse_mask_entry, ColumnMask, MaskFunction};
     rows.into_iter()
-        .map(|(catalog, schema, table, masked)| kokedb_catalog::acl::ColumnPolicy {
-            catalog,
-            schema,
-            table,
-            masked: masked
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect(),
+        .map(|(catalog, schema, table, spec)| {
+            let masks = match kokedb_common::masking::parse_mask_list(&spec) {
+                Ok(masks) => masks,
+                Err(e) => {
+                    log::error!(
+                        "Column policy on {catalog}.{schema}.{table} has an invalid mask                          spec ({e}); falling back to NULL masking per column"
+                    );
+                    spec.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|entry| {
+                            parse_mask_entry(entry).unwrap_or_else(|_| ColumnMask {
+                                column: entry
+                                    .split('=')
+                                    .next()
+                                    .unwrap_or(entry)
+                                    .trim()
+                                    .to_string(),
+                                func: MaskFunction::Null,
+                            })
+                        })
+                        .collect()
+                }
+            };
+            kokedb_catalog::acl::ColumnPolicy {
+                catalog,
+                schema,
+                table,
+                masks,
+            }
         })
         .collect()
 }

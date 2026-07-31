@@ -29,14 +29,14 @@ pub struct RowPolicy {
 }
 
 /// A column-level security (masking) policy attached to the session: reads of
-/// `table` return NULL in the `masked` columns, and the session's predicates
-/// can never probe the real values.
+/// `table` transform the listed columns with their mask functions, and the
+/// session's predicates only ever observe the masked values.
 #[derive(Debug, Clone)]
 pub struct ColumnPolicy {
     pub catalog: String,
     pub schema: String,
     pub table: String,
-    pub masked: Vec<String>,
+    pub masks: Vec<kokedb_common::masking::ColumnMask>,
 }
 
 /// Parsed grant scopes for one session. Construct via [`CatalogAcl::from_scopes`].
@@ -56,7 +56,7 @@ pub struct CatalogAcl {
     /// Row-level security filters, keyed by `(catalog, schema, table)`.
     policies: HashMap<(String, String, String), Option<spec::Expr>>,
     /// Column-masking policies, keyed by `(catalog, schema, table)`.
-    column_policies: HashMap<(String, String, String), Vec<String>>,
+    column_policies: HashMap<(String, String, String), Vec<kokedb_common::masking::ColumnMask>>,
 }
 
 impl CatalogAcl {
@@ -140,13 +140,18 @@ impl CatalogAcl {
     pub fn with_column_policies(mut self, policies: Vec<ColumnPolicy>) -> Self {
         for p in policies {
             self.column_policies
-                .insert((p.catalog, p.schema, p.table), p.masked);
+                .insert((p.catalog, p.schema, p.table), p.masks);
         }
         self
     }
 
-    /// The masked columns for a table, if a column policy applies.
-    pub fn masked_columns(&self, catalog: &str, schema: &str, table: &str) -> Option<&Vec<String>> {
+    /// The column masks for a table, if a column policy applies.
+    pub fn masked_columns(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Option<&Vec<kokedb_common::masking::ColumnMask>> {
         self.column_policies
             .get(&(catalog.to_string(), schema.to_string(), table.to_string()))
     }

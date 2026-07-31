@@ -132,8 +132,13 @@ impl CatalogManager {
         acl.row_policy(catalog, schema, table).cloned()
     }
 
-    /// The session's masked columns for a table, if a column policy applies.
-    pub fn masked_columns(&self, catalog: &str, schema: &str, table: &str) -> Option<Vec<String>> {
+    /// The session's column masks for a table, if a column policy applies.
+    pub fn masked_columns(
+        &self,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Option<Vec<kokedb_common::masking::ColumnMask>> {
         let state = self.state.lock().ok()?;
         let acl = state.acl.as_ref()?;
         acl.masked_columns(catalog, schema, table).cloned()

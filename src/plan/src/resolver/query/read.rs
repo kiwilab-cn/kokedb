@@ -236,29 +236,71 @@ impl PlanResolver<'_> {
                     .masked_columns(&catalog, schema_for_policy, &table_name_for_policy);
                 match masked {
                     None => plan,
-                    Some(masked) => {
-                        let masked: std::collections::HashSet<&str> =
-                            masked.iter().map(String::as_str).collect();
+                    Some(masks) => {
+                        use kokedb_common::masking::MaskFunction;
+                        let mask_for: std::collections::HashMap<&str, &MaskFunction> = masks
+                            .iter()
+                            .map(|m| (m.column.as_str(), &m.func))
+                            .collect();
                         let exprs = original_fields
                             .iter()
                             .zip(internal_names.iter())
                             .map(|((orig, data_type), internal)| {
-                                if masked.contains(orig.as_str()) {
-                                    // Typed NULL keeps the column's schema
-                                    // (name + type) intact for downstream.
-                                    let null = datafusion_common::ScalarValue::try_from(data_type)
-                                        .map_err(|e| {
+                                let Some(func) = mask_for.get(orig.as_str()) else {
+                                    return Ok(datafusion_expr::Expr::Column(
+                                        datafusion_common::Column::new_unqualified(internal),
+                                    ));
+                                };
+                                // A typed NULL keeps the column's schema
+                                // (name + type) intact for downstream.
+                                let typed_null = || {
+                                    datafusion_common::ScalarValue::try_from(data_type).map_err(
+                                        |e| {
                                             PlanError::AnalysisError(format!(
                                                 "column policy: cannot mask {orig}: {e}"
                                             ))
-                                        })?;
-                                    Ok(datafusion_expr::lit(null)
-                                        .alias(internal.clone()))
-                                } else {
-                                    Ok(datafusion_expr::Expr::Column(
-                                        datafusion_common::Column::new_unqualified(internal),
-                                    ))
-                                }
+                                        },
+                                    )
+                                };
+                                let is_string = matches!(
+                                    data_type,
+                                    datafusion::arrow::datatypes::DataType::Utf8
+                                        | datafusion::arrow::datatypes::DataType::LargeUtf8
+                                        | datafusion::arrow::datatypes::DataType::Utf8View
+                                );
+                                let expr = match func {
+                                    MaskFunction::Null => datafusion_expr::lit(typed_null()?),
+                                    // String transforms only apply to string
+                                    // columns; any other type falls back to a
+                                    // typed NULL (fail-safe: a mismatched mask
+                                    // must narrow, never widen, visibility).
+                                    _ if !is_string => {
+                                        log::warn!(
+                                            "column policy: mask on non-string column                                              {orig} falls back to NULL"
+                                        );
+                                        datafusion_expr::lit(typed_null()?)
+                                    }
+                                    func => {
+                                        let udf = Arc::new(crate::masking::mask_udf(func));
+                                        let input = datafusion_expr::Expr::Cast(
+                                            datafusion_expr::Cast::new(
+                                                Box::new(datafusion_expr::Expr::Column(
+                                                    datafusion_common::Column::new_unqualified(
+                                                        internal,
+                                                    ),
+                                                )),
+                                                datafusion::arrow::datatypes::DataType::Utf8,
+                                            ),
+                                        );
+                                        datafusion_expr::Expr::ScalarFunction(
+                                            datafusion_expr::expr::ScalarFunction::new_udf(
+                                                udf,
+                                                vec![input],
+                                            ),
+                                        )
+                                    }
+                                };
+                                Ok(expr.alias(internal.clone()))
                             })
                             .collect::<PlanResult<Vec<_>>>()?;
                         datafusion_expr::LogicalPlanBuilder::from(plan)
